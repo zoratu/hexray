@@ -224,6 +224,15 @@ pub struct SignatureRecovery {
     /// `fp_offset` store was observed (e.g. the structurer already collapsed
     /// the `va_arg` diamond), so callers fall back to the integer prefix.
     variadic_fixed_float_count: Option<usize>,
+    /// Frame offsets of observed `gp_offset`-field stores. Used to confirm an
+    /// `fp_offset`-pattern store really is the va_list `fp_offset` field (which
+    /// sits 4 bytes after the `gp_offset` field in `__va_list_tag`) and not an
+    /// unrelated stack constant that merely matches the value range.
+    sysv_va_list_gp_field_offsets: HashSet<i64>,
+    /// Pending `fp_offset`-pattern stores keyed by frame offset → named-float
+    /// count, resolved against [`Self::sysv_va_list_gp_field_offsets`] (whose
+    /// store may arrive before or after) to set `variadic_fixed_float_count`.
+    sysv_va_list_fp_field_candidates: HashMap<i64, usize>,
 }
 
 /// One observation of an argument register being spilled to a
@@ -999,6 +1008,8 @@ impl SignatureRecovery {
             sysv_va_start_seen: false,
             variadic_fixed_param_count: None,
             variadic_fixed_float_count: None,
+            sysv_va_list_gp_field_offsets: HashSet::new(),
+            sysv_va_list_fp_field_candidates: HashMap::new(),
         }
     }
 
@@ -1112,6 +1123,8 @@ impl SignatureRecovery {
         self.sysv_va_start_seen = false;
         self.variadic_fixed_param_count = None;
         self.variadic_fixed_float_count = None;
+        self.sysv_va_list_gp_field_offsets.clear();
+        self.sysv_va_list_fp_field_candidates.clear();
 
         // Seed float argument registers detected from the raw instruction stream
         // (the `-O0` spill of an xmm arg is pruned before this structured form,
@@ -5267,6 +5280,7 @@ impl SignatureRecovery {
         if lhs_is_stack_slot {
             match &rhs.kind {
                 ExprKind::IntLit(value) => {
+                    let slot_off = self.sysv_stack_slot_offset(lhs);
                     if let Some(fixed_count) =
                         Self::sysv_va_list_named_param_count_from_gp_offset(*value)
                     {
@@ -5276,17 +5290,36 @@ impl SignatureRecovery {
                                 .unwrap_or(0)
                                 .max(fixed_count),
                         );
+                        // Record the gp_offset field's frame offset and resolve
+                        // any fp_offset candidate sitting 4 bytes later.
+                        if let Some(off) = slot_off {
+                            self.sysv_va_list_gp_field_offsets.insert(off);
+                            if let Some(&float_count) =
+                                self.sysv_va_list_fp_field_candidates.get(&(off + 4))
+                            {
+                                self.record_variadic_fixed_float_count(float_count);
+                            }
+                        }
                     }
                     if Self::is_sysv_va_list_fp_offset(*value) {
                         self.sysv_va_list_fp_offset_slots.insert(lhs_name.clone());
                         if let Some(float_count) =
                             Self::sysv_va_list_named_float_count_from_fp_offset(*value)
                         {
-                            self.variadic_fixed_float_count = Some(
-                                self.variadic_fixed_float_count
-                                    .unwrap_or(0)
-                                    .max(float_count),
-                            );
+                            // Only trust this as the va_list `fp_offset` field
+                            // — and let it shape the float-param cutoff — when
+                            // the `gp_offset` field (4 bytes earlier) is also
+                            // present; otherwise an unrelated stack local in
+                            // 48..=176 would poison the count (codex P2 on PR
+                            // #46). The gp store may arrive after this one, so
+                            // also stash a pending candidate.
+                            if let Some(off) = slot_off {
+                                self.sysv_va_list_fp_field_candidates
+                                    .insert(off, float_count);
+                                if self.sysv_va_list_gp_field_offsets.contains(&(off - 4)) {
+                                    self.record_variadic_fixed_float_count(float_count);
+                                }
+                            }
                         }
                     }
                 }
@@ -5738,6 +5771,25 @@ impl SignatureRecovery {
             return usize::try_from((value - 48) / 16).ok();
         }
         None
+    }
+
+    /// Frame offset of a stack slot expression, accepting both the bare
+    /// `Var(Stack(off))` form and the deref-of-frame-base form
+    /// [`Self::extract_stack_offset`] handles. Used to locate the va_list
+    /// `gp_offset`/`fp_offset` fields by their layout positions.
+    fn sysv_stack_slot_offset(&self, expr: &Expr) -> Option<i64> {
+        if let ExprKind::Var(v) = &expr.kind {
+            if let VarKind::Stack(off) = v.kind {
+                return Some(off);
+            }
+        }
+        self.extract_stack_offset(expr)
+            .and_then(|off| i64::try_from(off).ok())
+    }
+
+    fn record_variadic_fixed_float_count(&mut self, count: usize) {
+        self.variadic_fixed_float_count =
+            Some(self.variadic_fixed_float_count.unwrap_or(0).max(count));
     }
 
     fn expr_looks_like_sysv_va_list_arg(&self, expr: &Expr) -> bool {
@@ -7777,6 +7829,56 @@ mod tests {
                 .any(|p| matches!(p.param_type, ParamType::Float(_))),
             "fp_offset=64 must keep the one named float param, got: {}",
             sig1.to_c_declaration("scaled")
+        );
+    }
+
+    /// Codex P2 on PR #46: an unrelated stack local initialized to a value in
+    /// 48..=176 must NOT be mistaken for the `fp_offset` field. Only the slot
+    /// 4 bytes after the `gp_offset` field is the real `fp_offset`; here the
+    /// real one is 48 (zero named floats) and a decoy local is 64, so the
+    /// FP register-save area must still be suppressed.
+    #[test]
+    fn test_variadic_float_count_ignores_unrelated_stack_constant() {
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let xmm0 = Expr::var(Variable::reg("xmm0", 8));
+        let gp_offset = Expr::var(Variable::stack(-0x10, 4));
+        let fp_offset = Expr::var(Variable::stack(-0xc, 4)); // gp + 4 = the real field
+        let decoy = Expr::var(Variable::stack(-0x60, 4)); // unrelated local = 64
+        let overflow = Expr::var(Variable::stack(-0x8, 8));
+        let reg_save = Expr::var(Variable::stack(-0x18, 8));
+        let sum = Expr::var(Variable::stack(-0x58, 8));
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(decoy, Expr::int(64)), // poison attempt
+                    Expr::assign(gp_offset, Expr::int(8)),
+                    Expr::assign(fp_offset, Expr::int(48)), // real fp_offset: 0 named floats
+                    Expr::assign(
+                        overflow,
+                        Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(16)),
+                    ),
+                    Expr::assign(
+                        reg_save,
+                        Expr::binop(BinOpKind::Sub, rbp.clone(), Expr::int(176)),
+                    ),
+                    Expr::assign(sum, Expr::binop(BinOpKind::Add, xmm0, rdi)),
+                ],
+                address_range: (0x1000, 0x1030),
+            }],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        assert!(sig.is_variadic);
+        assert!(
+            !sig.parameters
+                .iter()
+                .any(|p| matches!(p.param_type, ParamType::Float(_))),
+            "decoy constant 64 must not reintroduce a float param, got: {}",
+            sig.to_c_declaration("sum_ints")
         );
     }
 
