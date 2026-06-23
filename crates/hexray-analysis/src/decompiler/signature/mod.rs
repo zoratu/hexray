@@ -5275,7 +5275,12 @@ impl SignatureRecovery {
             // never from an isolated value match (codex P2 on PR #46).
             if let Some(off) = self.sysv_stack_slot_offset(lhs) {
                 if let ExprKind::IntLit(value) = &rhs.kind {
-                    self.sysv_stack_const_stores.insert(off, *value);
+                    // First write wins: the `va_start` initializer is the first
+                    // store to the `gp_offset`/`fp_offset` slot. Later `va_arg`
+                    // accesses mutate the same slot (e.g. `fp_offset += 16`),
+                    // and keeping the last store would misread that runtime
+                    // state as a named-float count (codex P2 on PR #46).
+                    self.sysv_stack_const_stores.entry(off).or_insert(*value);
                 }
                 if Self::expr_is_stack_base_with_const_offset(rhs) {
                     self.sysv_stack_pointer_stores.insert(off);
@@ -7884,6 +7889,57 @@ mod tests {
                 .any(|p| matches!(p.param_type, ParamType::Float(_))),
             "decoy constant 64 must not reintroduce a float param, got: {}",
             sig.to_c_declaration("sum_ints")
+        );
+    }
+
+    /// Codex P2 on PR #46: the `fp_offset` field is mutated at runtime — a
+    /// `va_arg(ap, double)` increments it (48 -> 64 -> ...). The recovered
+    /// named-float count must come from the `va_start` initializer (the FIRST
+    /// store), not a later `va_arg` state update, so `int sum(int n, ...)` that
+    /// merely *consumes* a double vararg still suppresses `farg0`.
+    #[test]
+    fn test_variadic_float_count_uses_va_start_init_not_later_va_arg_update() {
+        let rbp = Expr::var(Variable::reg("rbp", 8));
+        let rdi = Expr::var(Variable::reg("rdi", 8));
+        let xmm0 = Expr::var(Variable::reg("xmm0", 8));
+        let gp_offset = Expr::var(Variable::stack(-0x18, 4));
+        let fp_offset = Expr::var(Variable::stack(-0x14, 4));
+        let fp_offset_again = Expr::var(Variable::stack(-0x14, 4)); // same slot
+        let overflow = Expr::var(Variable::stack(-0x10, 8));
+        let reg_save = Expr::var(Variable::stack(-0x8, 8));
+        let sum = Expr::var(Variable::stack(-0x58, 8));
+
+        let cfg = StructuredCfg {
+            body: vec![StructuredNode::Block {
+                id: BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(gp_offset, Expr::int(8)),
+                    Expr::assign(fp_offset, Expr::int(48)), // va_start init: 0 named floats
+                    Expr::assign(
+                        overflow,
+                        Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(16)),
+                    ),
+                    Expr::assign(
+                        reg_save,
+                        Expr::binop(BinOpKind::Sub, rbp.clone(), Expr::int(176)),
+                    ),
+                    Expr::assign(sum, Expr::binop(BinOpKind::Add, xmm0, rdi)),
+                    // Later va_arg(double) bumps the SAME fp_offset slot to 64.
+                    Expr::assign(fp_offset_again, Expr::int(64)),
+                ],
+                address_range: (0x1000, 0x1030),
+            }],
+            cfg_entry: BasicBlockId::new(0),
+        };
+        let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+        let sig = recovery.analyze(&cfg);
+        assert!(sig.is_variadic);
+        assert!(
+            !sig.parameters
+                .iter()
+                .any(|p| matches!(p.param_type, ParamType::Float(_))),
+            "later fp_offset=64 update must not be read as a named float, got: {}",
+            sig.to_c_declaration("sum")
         );
     }
 
