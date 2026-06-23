@@ -216,6 +216,14 @@ pub struct SignatureRecovery {
     sysv_va_start_seen: bool,
     /// Fixed non-variadic prefix inferred for the current function.
     variadic_fixed_param_count: Option<usize>,
+    /// Number of named (non-variadic) FLOAT parameters, recovered from the
+    /// `va_start` `fp_offset` initialiser (`fp_offset = 48 + 16 * named_floats`
+    /// under SysV). `Some(0)` for the common integer-named variadic
+    /// (`printf`-style) case, where every float arg register is the variadic
+    /// FP register-save area rather than a parameter. `None` when no
+    /// `fp_offset` store was observed (e.g. the structurer already collapsed
+    /// the `va_arg` diamond), so callers fall back to the integer prefix.
+    variadic_fixed_float_count: Option<usize>,
 }
 
 /// One observation of an argument register being spilled to a
@@ -990,6 +998,7 @@ impl SignatureRecovery {
             sysv_va_list_pointer_slots: HashSet::new(),
             sysv_va_start_seen: false,
             variadic_fixed_param_count: None,
+            variadic_fixed_float_count: None,
         }
     }
 
@@ -1102,6 +1111,7 @@ impl SignatureRecovery {
         self.sysv_va_list_pointer_slots.clear();
         self.sysv_va_start_seen = false;
         self.variadic_fixed_param_count = None;
+        self.variadic_fixed_float_count = None;
 
         // Seed float argument registers detected from the raw instruction stream
         // (the `-O0` spill of an xmm arg is pruned before this structured form,
@@ -4937,8 +4947,18 @@ impl SignatureRecovery {
         let float_regs = self.convention.float_arg_registers();
         let integer_simd_signature =
             self.integer_simd_ops_observed && self.return_from_integer_simd_lane;
+        // For a variadic function, only the first `named_float_count` float
+        // arg registers are real parameters; the rest are the variadic FP
+        // register-save area spilled in the prologue. The count comes from the
+        // `va_start` `fp_offset` initialiser when observed (so an integer-named
+        // variadic like `printf`/`sum_ints` correctly drops `farg0`), falling
+        // back to the integer fixed-count only when `fp_offset` wasn't seen
+        // (e.g. the structurer already collapsed the diamond) to avoid
+        // regressing the pre-existing behaviour there.
+        let float_param_cutoff = variadic_fixed_param_count
+            .map(|int_fixed| self.variadic_fixed_float_count.unwrap_or(int_fixed));
         for (idx, reg) in float_regs.iter().enumerate() {
-            if variadic_fixed_param_count.is_some_and(|fixed_count| idx >= fixed_count) {
+            if float_param_cutoff.is_some_and(|cutoff| idx >= cutoff) {
                 continue;
             }
             let reg_lower = reg.to_lowercase();
@@ -5259,6 +5279,15 @@ impl SignatureRecovery {
                     }
                     if Self::is_sysv_va_list_fp_offset(*value) {
                         self.sysv_va_list_fp_offset_slots.insert(lhs_name.clone());
+                        if let Some(float_count) =
+                            Self::sysv_va_list_named_float_count_from_fp_offset(*value)
+                        {
+                            self.variadic_fixed_float_count = Some(
+                                self.variadic_fixed_float_count
+                                    .unwrap_or(0)
+                                    .max(float_count),
+                            );
+                        }
                     }
                 }
                 ExprKind::Var(var) => self.observe_sysv_va_list_alias(&lhs_name, &var.name),
@@ -5696,6 +5725,19 @@ impl SignatureRecovery {
 
     fn is_sysv_va_list_fp_offset(value: i128) -> bool {
         (48..=176).contains(&value) && value % 16 == 0
+    }
+
+    /// Number of named float/SSE parameters encoded by a SysV `va_start`
+    /// `fp_offset` initialiser. The FP register-save area sits after the 6
+    /// general-purpose slots (6 * 8 = 48 bytes), and each named float param
+    /// consumes one 16-byte SSE slot, so `fp_offset = 48 + 16 * named_floats`.
+    /// `fp_offset == 48` therefore means zero named floats (the common
+    /// integer-named variadic case).
+    fn sysv_va_list_named_float_count_from_fp_offset(value: i128) -> Option<usize> {
+        if (48..=176).contains(&value) && value % 16 == 0 {
+            return usize::try_from((value - 48) / 16).ok();
+        }
+        None
     }
 
     fn expr_looks_like_sysv_va_list_arg(&self, expr: &Expr) -> bool {
@@ -7640,6 +7682,102 @@ mod tests {
         assert!(sig.is_variadic);
         assert_eq!(sig.parameters.len(), 1);
         assert!(sig.to_c_declaration("my_sum").contains("..."));
+    }
+
+    #[test]
+    fn test_sysv_va_list_named_float_count_from_fp_offset() {
+        // fp_offset = 48 + 16 * named_floats.
+        assert_eq!(
+            SignatureRecovery::sysv_va_list_named_float_count_from_fp_offset(48),
+            Some(0)
+        );
+        assert_eq!(
+            SignatureRecovery::sysv_va_list_named_float_count_from_fp_offset(64),
+            Some(1)
+        );
+        assert_eq!(
+            SignatureRecovery::sysv_va_list_named_float_count_from_fp_offset(176),
+            Some(8)
+        );
+        // Out of range / unaligned -> not an fp_offset initialiser.
+        assert_eq!(
+            SignatureRecovery::sysv_va_list_named_float_count_from_fp_offset(40),
+            None
+        );
+        assert_eq!(
+            SignatureRecovery::sysv_va_list_named_float_count_from_fp_offset(56),
+            None
+        );
+    }
+
+    /// A `va_start` `fp_offset` of 48 means zero named float params, so a float
+    /// arg register observed in the body is the variadic FP register-save area,
+    /// NOT a parameter (`int sum_ints(int n, ...)` must not surface
+    /// `double farg0`). An `fp_offset` of 64 means one named float, kept
+    /// (`double scaled(double factor, int n, ...)`).
+    #[test]
+    fn test_variadic_suppresses_unnamed_float_register_save_area() {
+        let build = |fp_offset_value: i128| -> FunctionSignature {
+            let rbp = Expr::var(Variable::reg("rbp", 8));
+            let rdi = Expr::var(Variable::reg("rdi", 8));
+            let xmm0 = Expr::var(Variable::reg("xmm0", 8));
+            let gp_offset = Expr::var(Variable::stack(-0x10, 4));
+            let fp_offset = Expr::var(Variable::stack(-0xc, 4));
+            let overflow = Expr::var(Variable::stack(-0x8, 8));
+            let reg_save = Expr::var(Variable::stack(-0x18, 8));
+            let sum = Expr::var(Variable::stack(-0x58, 8));
+
+            let cfg = StructuredCfg {
+                body: vec![StructuredNode::Block {
+                    id: BasicBlockId::new(0),
+                    statements: vec![
+                        // va_list materialization: gp_offset=8 (1 named int),
+                        // fp_offset = 48 + 16*named_floats, two pointer slots.
+                        Expr::assign(gp_offset, Expr::int(8)),
+                        Expr::assign(fp_offset, Expr::int(fp_offset_value)),
+                        Expr::assign(
+                            overflow,
+                            Expr::binop(BinOpKind::Add, rbp.clone(), Expr::int(16)),
+                        ),
+                        Expr::assign(
+                            reg_save,
+                            Expr::binop(BinOpKind::Sub, rbp.clone(), Expr::int(176)),
+                        ),
+                        // Body references the named int (rdi) and a float reg
+                        // (xmm0) — so xmm0 would surface as `farg0` unless it is
+                        // recognized as the FP register-save area.
+                        Expr::assign(sum, Expr::binop(BinOpKind::Add, xmm0, rdi)),
+                    ],
+                    address_range: (0x1000, 0x1030),
+                }],
+                cfg_entry: BasicBlockId::new(0),
+            };
+            let mut recovery = SignatureRecovery::new(CallingConvention::SystemV);
+            recovery.analyze(&cfg)
+        };
+
+        // fp_offset = 48 -> zero named floats -> no float parameters.
+        let sig0 = build(48);
+        assert!(sig0.is_variadic, "fp=48 case should be variadic");
+        assert!(
+            !sig0
+                .parameters
+                .iter()
+                .any(|p| matches!(p.param_type, ParamType::Float(_))),
+            "fp_offset=48 must suppress the FP register-save area, got: {}",
+            sig0.to_c_declaration("sum_ints")
+        );
+
+        // fp_offset = 64 -> one named float -> `double farg0` retained.
+        let sig1 = build(64);
+        assert!(sig1.is_variadic, "fp=64 case should be variadic");
+        assert!(
+            sig1.parameters
+                .iter()
+                .any(|p| matches!(p.param_type, ParamType::Float(_))),
+            "fp_offset=64 must keep the one named float param, got: {}",
+            sig1.to_c_declaration("scaled")
+        );
     }
 
     #[test]
