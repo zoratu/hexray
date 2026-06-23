@@ -5446,6 +5446,16 @@ impl PseudoCodeEmitter {
         if !class_base.is_empty() && method_base == class_base {
             return None;
         }
+        // Optional members that return an object by value use a hidden sret
+        // buffer: under the SysV / Itanium ABI `args[0]` is that buffer and the
+        // real `this` is `args[1]` — not the shape this sugar assumes. The
+        // monadic ops return another `std::optional<U>`, whose buffer type can
+        // even match this qualifier (when U == T) and slip past the type gate,
+        // so sugaring would mislabel both receiver and args. Mirrors the
+        // binding pass's sret exclusion; leave these qualified (codex P2).
+        if matches!(method_base, "value_or" | "transform" | "and_then" | "or_else") {
+            return None;
+        }
         let recv_str = self.format_expr_with_strings(recv, table);
         // Unary operator forms.
         if method == "operator*" {
@@ -14573,5 +14583,30 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Codex P2 on this PR: optional members returning an object by value
+    /// (`value_or`, and the C++23 monadic `transform`/`and_then`/`or_else`) use
+    /// a hidden sret buffer in `args[0]` with the receiver in `args[1]`. The
+    /// monadic ones return `std::optional<U>`, whose buffer can match this
+    /// qualifier and slip past the type gate, so they must not be sugared.
+    #[test]
+    fn sugar_declines_sret_returning_optional_methods() {
+        let e = sugar_emitter("o", "std::optional<int>");
+        let t = StringTable::new();
+        // `or_else` returns std::optional<int> by value — args[0] is the sret
+        // buffer (also an optional<int>), which would otherwise match.
+        let buf_then_this = vec![
+            Expr::address_of(Expr::var(super::super::expression::Variable::reg("o", 8))),
+            Expr::address_of(Expr::var(super::super::expression::Variable::reg("this_o", 8))),
+        ];
+        for method in ["or_else<F>", "transform<F>", "and_then<F>", "value_or"] {
+            let name = format!("std::optional<int>::{method}");
+            assert_eq!(
+                e.try_format_optional_variant_method_sugar(&name, &buf_then_this, &t),
+                None,
+                "must not sugar sret-returning {method}"
+            );
+        }
     }
 }
