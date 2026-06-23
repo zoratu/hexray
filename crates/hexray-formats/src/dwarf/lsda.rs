@@ -105,7 +105,11 @@ impl Lsda {
                 });
             }
 
-            // Follow the chain
+            // Follow the chain. GCC measures `next_action` from the `ar_disp`
+            // field's own position (`disp_offset`), NOT the record start — so
+            // anchoring on `action.offset` would land short by the `ar_filter`
+            // width and miss every record after the first (collapsing a
+            // multi-catch ladder to a single catch).
             if action.next_action == 0 {
                 break;
             }
@@ -113,7 +117,7 @@ impl Lsda {
                 let Ok(delta) = usize::try_from(action.next_action) else {
                     break;
                 };
-                let Some(next) = action.offset.checked_add(delta) else {
+                let Some(next) = action.disp_offset.checked_add(delta) else {
                     break;
                 };
                 next
@@ -121,7 +125,7 @@ impl Lsda {
                 let Ok(delta) = usize::try_from(action.next_action.wrapping_neg()) else {
                     break;
                 };
-                let Some(next) = action.offset.checked_sub(delta) else {
+                let Some(next) = action.disp_offset.checked_sub(delta) else {
                     break;
                 };
                 next
@@ -165,14 +169,22 @@ impl CallSite {
 /// An action record in the action table.
 #[derive(Debug, Clone)]
 pub struct ActionRecord {
-    /// Byte offset of this record from the start of the action table.
+    /// Byte offset of this record (its `ar_filter` field) from the start of the
+    /// action table.
     pub offset: usize,
+    /// Byte offset of this record's `ar_disp` (next-action displacement) field
+    /// from the start of the action table. GCC encodes `next_action` as a
+    /// displacement **self-relative to this field's position**, not to the
+    /// record start — so the next record is at `disp_offset + next_action`
+    /// (see [`Lsda::get_catch_types`]). Equals `offset + width(ar_filter)`.
+    pub disp_offset: usize,
     /// Type filter:
     /// - Positive: index into type table (1-based)
     /// - Zero: cleanup (finally)
     /// - Negative: exception specification filter
     pub type_filter: i64,
-    /// Offset to next action record, or 0 if end of chain.
+    /// Displacement to the next action record (self-relative to `disp_offset`),
+    /// or 0 if end of chain.
     pub next_action: i64,
 }
 
@@ -341,10 +353,14 @@ impl<'a> LsdaParser<'a> {
                 break;
             }
 
+            // `offset` now sits at the `ar_disp` field, which is the anchor the
+            // self-relative `next_action` displacement is measured from.
+            let disp_offset = offset.saturating_sub(action_table_start);
             let next_action = self.read_sleb(&mut offset)?;
 
             actions.push(ActionRecord {
                 offset: record_offset,
+                disp_offset,
                 type_filter,
                 next_action,
             });
@@ -733,6 +749,7 @@ mod tests {
             ],
             actions: vec![ActionRecord {
                 offset: 0,
+                disp_offset: 1,
                 type_filter: 1,
                 next_action: 0,
             }],
@@ -747,6 +764,10 @@ mod tests {
 
     #[test]
     fn test_get_catch_types_follows_action_byte_offsets() {
+        // Two single-byte-field records laid out as GCC encodes them: record 0
+        // is `ar_filter`@0 + `ar_disp`@1, record 1 starts at byte 2. The
+        // `ar_disp` of record 0 is self-relative to byte 1, so reaching record
+        // 1 (byte 2) takes `next_action = 1`, not 2.
         let lsda = Lsda {
             landing_pad_base: 0x1000,
             type_table_encoding: 0,
@@ -754,11 +775,13 @@ mod tests {
             actions: vec![
                 ActionRecord {
                     offset: 0,
+                    disp_offset: 1,
                     type_filter: 1,
-                    next_action: 2,
+                    next_action: 1,
                 },
                 ActionRecord {
                     offset: 2,
+                    disp_offset: 3,
                     type_filter: 0,
                     next_action: 0,
                 },
@@ -778,6 +801,52 @@ mod tests {
     }
 
     #[test]
+    fn test_get_catch_types_walks_full_multi_catch_ladder() {
+        // `catch (A&) catch (B&) catch (...)` — three chained single-byte-field
+        // records (filter@even byte, disp@odd byte). Anchoring the chain on the
+        // record start instead of the `ar_disp` field would stop after `A` and
+        // drop `B` / the catch-all (the real multi-catch-ladder bug).
+        let lsda = Lsda {
+            landing_pad_base: 0x1000,
+            type_table_encoding: 0,
+            call_sites: Vec::new(),
+            actions: vec![
+                ActionRecord {
+                    offset: 0,
+                    disp_offset: 1,
+                    type_filter: 1, // type_table[0] -> A
+                    next_action: 1, // -> byte 2
+                },
+                ActionRecord {
+                    offset: 2,
+                    disp_offset: 3,
+                    type_filter: 2, // type_table[1] -> B
+                    next_action: 1, // -> byte 4
+                },
+                ActionRecord {
+                    offset: 4,
+                    disp_offset: 5,
+                    type_filter: 3, // type_table[2] is None -> catch-all
+                    next_action: 0,
+                },
+            ],
+            type_table: vec![Some(0xA), Some(0xB), None],
+        };
+
+        let catch_types = lsda.get_catch_types(1);
+        assert_eq!(catch_types.len(), 3, "must walk the whole ladder: {catch_types:?}");
+        assert!(matches!(
+            catch_types[0],
+            CatchType::Specific { type_info: Some(0xA) }
+        ));
+        assert!(matches!(
+            catch_types[1],
+            CatchType::Specific { type_info: Some(0xB) }
+        ));
+        assert!(matches!(catch_types[2], CatchType::CatchAll));
+    }
+
+    #[test]
     fn test_get_catch_types_treats_null_type_entry_as_catch_all() {
         let lsda = Lsda {
             landing_pad_base: 0x1000,
@@ -785,6 +854,7 @@ mod tests {
             call_sites: Vec::new(),
             actions: vec![ActionRecord {
                 offset: 0,
+                disp_offset: 1,
                 type_filter: 1,
                 next_action: 0,
             }],
