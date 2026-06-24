@@ -1238,6 +1238,98 @@ impl PseudoCodeEmitter {
         lines.join("\n")
     }
 
+    /// Drop declaration lines for locals that no longer appear anywhere in the
+    /// function body. Declarations are computed against the body buffer *before*
+    /// the later text rewrites run (notably
+    /// [`Self::repair_packed_small_aggregate_output`] and the variadic
+    /// register-save-area spill removal), so a pass that deletes the only
+    /// statement referencing a local leaves an orphaned `TYPE name;` line — e.g.
+    /// a SysV variadic function's `farg0..7` / save-area `argN` register names,
+    /// whose `local_… = farg0` spill stores are stripped as dead. Run as the
+    /// final emission step, this prunes those orphans by re-checking each
+    /// declared name against the post-rewrite body.
+    ///
+    /// The declaration block is the contiguous run of lines between the
+    /// function's opening `{` and the blank line that separates declarations
+    /// from the body (matching how declarations are emitted); only lines in
+    /// that block are considered, so body statements are never mistaken for
+    /// declarations.
+    fn prune_dead_local_declarations(output: String) -> String {
+        let lines: Vec<&str> = output.lines().collect();
+        let Some(brace_idx) = lines.iter().position(|l| l.trim() == "{") else {
+            return output;
+        };
+        let mut decl_end = brace_idx + 1;
+        while decl_end < lines.len() && !lines[decl_end].trim().is_empty() {
+            decl_end += 1;
+        }
+        // Need a blank separator with a body after it; otherwise there is no
+        // declaration block to prune.
+        if decl_end >= lines.len() {
+            return output;
+        }
+        let body_tokens: HashSet<&str> = lines[decl_end + 1..]
+            .iter()
+            .flat_map(|line| line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')))
+            .filter(|t| !t.is_empty())
+            .collect();
+
+        let mut removed_any = false;
+        let mut kept: Vec<&str> = Vec::with_capacity(lines.len());
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > brace_idx && idx < decl_end {
+                if let Some(name) = Self::declaration_local_name(line) {
+                    if !body_tokens.contains(name.as_str()) {
+                        removed_any = true;
+                        continue;
+                    }
+                }
+            }
+            kept.push(line);
+        }
+        if !removed_any {
+            return output;
+        }
+        let mut result = kept.join("\n");
+        if output.ends_with('\n') {
+            result.push('\n');
+        }
+        result
+    }
+
+    /// The declared local's name from a C89-style declaration line
+    /// (`TYPE name;` or a loop-init `TYPE name = 0;`), or `None` if the line is
+    /// not a plain local declaration (a call, a non-`= 0` assignment, or a bare
+    /// statement without a type). The name is the last whitespace-separated
+    /// token; the preceding type may contain `*`, `::`, `<...>`, or spaces.
+    fn declaration_local_name(line: &str) -> Option<String> {
+        let trimmed = line.trim().strip_suffix(';')?;
+        let decl_part = trimmed.strip_suffix(" = 0").unwrap_or(trimmed);
+        if decl_part.contains('=') || decl_part.contains('(') {
+            return None;
+        }
+        // `return x;` / `goto label;` are statements, not declarations.
+        let first_token = decl_part.split_whitespace().next()?;
+        if matches!(first_token, "return" | "goto" | "break" | "continue") {
+            return None;
+        }
+        let name = decl_part.rsplit(char::is_whitespace).next()?;
+        // Require a type segment before the name, so a single-token line is not
+        // treated as a declaration.
+        if name.is_empty() || decl_part.trim_end().len() <= name.len() {
+            return None;
+        }
+        let mut chars = name.chars();
+        let first = chars.next()?;
+        if !(first == '_' || first.is_ascii_alphabetic()) {
+            return None;
+        }
+        if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return None;
+        }
+        Some(name.to_string())
+    }
+
     fn rewrite_tail_call_returns_for_emission(
         nodes: &[StructuredNode],
         in_tail_return_path: bool,
@@ -6672,7 +6764,7 @@ impl PseudoCodeEmitter {
         writeln!(output, "}}").unwrap();
         self.clear_return_fallback_expr();
         self.register_snapshot_mode.set(previous_snapshot_mode);
-        Self::repair_packed_small_aggregate_output(output)
+        Self::prune_dead_local_declarations(Self::repair_packed_small_aggregate_output(output))
     }
 
     /// Emits pseudo-code with a specific function signature.
@@ -6905,7 +6997,7 @@ impl PseudoCodeEmitter {
         writeln!(output, "}}").unwrap();
         self.clear_return_fallback_expr();
         self.register_snapshot_mode.set(previous_snapshot_mode);
-        Self::repair_packed_small_aggregate_output(output)
+        Self::prune_dead_local_declarations(Self::repair_packed_small_aggregate_output(output))
     }
 
     /// Recovers the function signature for the given CFG.
@@ -14442,6 +14534,70 @@ mod tests {
             emitter.format_call_target_name("__cxa_throw"),
             "__cxa_throw"
         );
+    }
+
+    // ----- dead local-declaration pruning ------------------------------
+
+    #[test]
+    fn declaration_local_name_parses_decls_and_rejects_statements() {
+        let name = |s: &str| PseudoCodeEmitter::declaration_local_name(s);
+        assert_eq!(name("    int farg0;").as_deref(), Some("farg0"));
+        assert_eq!(name("    int* local_d8;").as_deref(), Some("local_d8"));
+        assert_eq!(name("    unsigned long long y;").as_deref(), Some("y"));
+        assert_eq!(
+            name("    std::optional<int> int_optional_18;").as_deref(),
+            Some("int_optional_18")
+        );
+        assert_eq!(name("    int i = 0;").as_deref(), Some("i")); // loop-init form
+        assert_eq!(name("    va_list ap;").as_deref(), Some("ap"));
+        // Statements / non-declarations.
+        assert_eq!(name("    x = 5;"), None);
+        assert_eq!(name("    foo(a, b);"), None);
+        assert_eq!(name("    return x;"), None);
+        assert_eq!(name("    total += va_arg(ap, int);"), None);
+    }
+
+    #[test]
+    fn prune_dead_local_declarations_drops_unused_and_keeps_used() {
+        let input = "\
+int f(int arg0)
+{
+    int used;
+    int dead;
+    int* dead_ptr;
+
+    used = arg0;
+    return used;
+}
+";
+        let pruned = PseudoCodeEmitter::prune_dead_local_declarations(input.to_string());
+        assert!(pruned.contains("    int used;"), "used decl kept:\n{pruned}");
+        assert!(!pruned.contains("int dead;"), "dead decl dropped:\n{pruned}");
+        assert!(
+            !pruned.contains("dead_ptr"),
+            "dead pointer decl dropped:\n{pruned}"
+        );
+        // Body and signature untouched.
+        assert!(pruned.contains("    used = arg0;"));
+        assert!(pruned.contains("    return used;"));
+    }
+
+    #[test]
+    fn prune_dead_local_declarations_keeps_va_list_referenced_in_body() {
+        let input = "\
+int sum(int n, ...)
+{
+    va_list ap;
+    int total;
+
+    va_start(ap, n);
+    total = va_arg(ap, int);
+    return total;
+}
+";
+        let pruned = PseudoCodeEmitter::prune_dead_local_declarations(input.to_string());
+        assert!(pruned.contains("va_list ap;"), "va_list kept:\n{pruned}");
+        assert!(pruned.contains("    int total;"));
     }
 
     // ----- optional/variant member-call sugar --------------------------
