@@ -5,6 +5,31 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.12] - 2026-06-24
+
+### Decompiler — C++ readability & variadic signatures
+
+- **`std::optional` / `std::variant` member-call sugar.** A bound optional/variant
+  member call now renders as receiver syntax — `o.has_value()`, `*o`,
+  `(bool)o`, `v.index()` — instead of the verbose
+  `std::optional<int>::has_value(&o)`. Gated on the call's class qualifier
+  matching the receiver local's recovered type, so a free function such as
+  `std::get<int, int, double>(&v)` is never mis-sugared. Constructors/destructors
+  and sret-returning members (`value_or`, the C++23 monadic
+  `transform`/`and_then`/`or_else`) are left in qualified form.
+- **Full multi-catch ladder recovery.** `try { } catch (A&) catch (B&) catch (...)`
+  now recovers every handler instead of only the first. The LSDA action-chain
+  walk anchored the `next_action` displacement on the record start, but GCC
+  measures it from the record's `ar_disp` field — so the walk fell short by the
+  `ar_filter` width and stopped after the first catch.
+- **Variadic FP register-save area no longer leaks into the signature.** An
+  integer-named variadic such as `int sum_ints(int n, ...)` recovered a spurious
+  `double farg0` (the `xmm0` vararg-save spill). The named-float count is now
+  read from the `va_start` `fp_offset` initialiser via the full `__va_list_tag`
+  shape, so `(int n, ...)` is recovered cleanly while a genuinely float-named
+  variadic (`double scaled(double factor, int n, ...)`) keeps its `double`
+  parameter.
+
 ## [1.3.11] - 2026-06-21
 
 ### Decompiler — C++ `std::optional` / `std::variant` stack locals
