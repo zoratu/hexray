@@ -502,34 +502,61 @@ pub fn scan_sysv_va_list_named_float_count(
     }
     // Scan every block, not just the entry: a stack-protector or other early
     // branch splits the prologue, so the va_list-tag initializer stores can
-    // land in a successor block rather than the entry. The adjacent
-    // `gp_offset`/`fp_offset` value pattern below is specific enough that
-    // scanning the whole function doesn't introduce false matches.
-    let mut consts: HashMap<i64, i128> = HashMap::new();
+    // land in a successor block rather than the entry.
+    //
+    // Collect, by frame offset, the immediate stores (the `gp_offset`/
+    // `fp_offset` fields) and the register stores (the `overflow_arg_area` /
+    // `reg_save_area` pointer fields — written from a register after a `lea`).
+    let mut const_stores: HashMap<i64, i128> = HashMap::new();
+    let mut pointer_offsets: HashSet<i64> = HashSet::new();
     for block in cfg.blocks() {
         for inst in &block.instructions {
             if !matches!(inst.operation, Operation::Store | Operation::Move) {
                 continue;
             }
-            if let (Some(Operand::Memory(mem)), Some(Operand::Immediate(imm))) =
+            let (Some(Operand::Memory(mem)), Some(src)) =
                 (inst.operands.first(), inst.operands.get(1))
-            {
-                if is_frame_base_memory(mem) {
-                    // First write wins: the `va_start` initialiser precedes any
-                    // later `va_arg` update of the same field.
-                    consts.entry(mem.displacement).or_insert(imm.value);
+            else {
+                continue;
+            };
+            if !is_frame_base_memory(mem) {
+                continue;
+            }
+            match src {
+                // First write wins: the `va_start` initialiser precedes any
+                // later `va_arg` mutation of the same field.
+                Operand::Immediate(imm) => {
+                    const_stores.entry(mem.displacement).or_insert(imm.value);
                 }
+                Operand::Register(_) => {
+                    pointer_offsets.insert(mem.displacement);
+                }
+                _ => {}
             }
         }
     }
-    for (&base, &gp) in &consts {
+    // Require the full 24-byte `__va_list_tag` shape — `gp_offset` (8*k) at base
+    // `b`, `fp_offset` (48+16*f) at `b+4`, and pointer fields at `b+8`/`b+16` —
+    // so an unrelated adjacent constant pair like `{8, 48}` can't be mistaken
+    // for the tag (codex P2 on PR #48). Scan bases in sorted order so the
+    // recovered count is deterministic.
+    let mut bases: Vec<i64> = const_stores.keys().copied().collect();
+    bases.sort_unstable();
+    for base in bases {
+        let Some(&gp) = const_stores.get(&base) else {
+            continue;
+        };
         if !(0..48).contains(&gp) || gp % 8 != 0 {
             continue;
         }
-        if let Some(&fp) = consts.get(&(base + 4)) {
-            if (48..=176).contains(&fp) && fp % 16 == 0 {
-                return usize::try_from((fp - 48) / 16).ok();
-            }
+        let Some(&fp) = const_stores.get(&(base + 4)) else {
+            continue;
+        };
+        if !((48..=176).contains(&fp) && fp % 16 == 0) {
+            continue;
+        }
+        if pointer_offsets.contains(&(base + 8)) && pointer_offsets.contains(&(base + 16)) {
+            return usize::try_from((fp - 48) / 16).ok();
         }
     }
     None
@@ -8048,27 +8075,57 @@ mod tests {
                 ],
             )
         };
-        // __va_list_tag: gp_offset=8 @ -208, fp_offset=48 @ -204 -> 0 floats.
-        let cfg = single_block_cfg(vec![store_imm(-208, 8), store_imm(-204, 48)]);
+        // Pointer-field stores (`overflow_arg_area` / `reg_save_area`): a
+        // register written into the slot.
+        let store_ptr = |disp: i64| {
+            (
+                "mov",
+                Operation::Move,
+                vec![
+                    Operand::Memory(MemoryRef::base_disp(gpr(5, 64), disp, 8)),
+                    Operand::Register(gpr(0, 64)), // rax
+                ],
+            )
+        };
+        // Full __va_list_tag at base -208: gp@-208, fp@-204, ptr@-200, ptr@-192.
+        let tag = |fp: i128| {
+            single_block_cfg(vec![
+                store_imm(-208, 8),
+                store_imm(-204, fp),
+                store_ptr(-200),
+                store_ptr(-192),
+            ])
+        };
+        // fp_offset = 48 -> 0 named floats.
         assert_eq!(
-            scan_sysv_va_list_named_float_count(&cfg, CallingConvention::SystemV),
+            scan_sysv_va_list_named_float_count(&tag(48), CallingConvention::SystemV),
             Some(0)
         );
         // fp_offset = 80 -> (80-48)/16 = 2 named floats.
-        let cfg2 = single_block_cfg(vec![store_imm(-208, 8), store_imm(-204, 80)]);
         assert_eq!(
-            scan_sysv_va_list_named_float_count(&cfg2, CallingConvention::SystemV),
+            scan_sysv_va_list_named_float_count(&tag(80), CallingConvention::SystemV),
             Some(2)
         );
-        // A gp_offset value with no fp_offset 4 bytes later isn't a tag.
-        let cfg3 = single_block_cfg(vec![store_imm(-208, 8), store_imm(-100, 48)]);
+        // Decoy: gp/fp constants present but NO pointer fields at +8/+16.
+        let decoy = single_block_cfg(vec![store_imm(-208, 8), store_imm(-204, 48)]);
         assert_eq!(
-            scan_sysv_va_list_named_float_count(&cfg3, CallingConvention::SystemV),
+            scan_sysv_va_list_named_float_count(&decoy, CallingConvention::SystemV),
+            None
+        );
+        // A gp_offset value with no fp_offset 4 bytes later isn't a tag.
+        let no_fp = single_block_cfg(vec![
+            store_imm(-208, 8),
+            store_imm(-100, 48),
+            store_ptr(-200),
+            store_ptr(-192),
+        ]);
+        assert_eq!(
+            scan_sysv_va_list_named_float_count(&no_fp, CallingConvention::SystemV),
             None
         );
         // Non-SysV target: declined.
         assert_eq!(
-            scan_sysv_va_list_named_float_count(&cfg, CallingConvention::Win64),
+            scan_sysv_va_list_named_float_count(&tag(48), CallingConvention::Win64),
             None
         );
     }
