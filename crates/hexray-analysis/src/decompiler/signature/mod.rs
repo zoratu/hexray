@@ -168,6 +168,12 @@ pub struct SignatureRecovery {
     /// [`Self::with_param_spill_order`] before [`Self::analyze`].
     /// See [`scan_param_spill_order`] for the producer.
     param_spill_order: Vec<ParamSpillObservation>,
+    /// Named-float count read from the raw `__va_list_tag` `fp_offset`
+    /// initialiser, seeded via [`Self::with_va_list_float_count_seed`]. Used as
+    /// a fallback when the structurer has already collapsed the `va_arg`
+    /// diamonds (deleting the `fp_offset` store the structured-body resolver
+    /// reads). See [`scan_sysv_va_list_named_float_count`].
+    va_list_float_count_seed: Option<usize>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -470,6 +476,63 @@ fn is_frame_setup_or_sp_adjust(inst: &hexray_core::Instruction) -> bool {
         }
         _ => false,
     }
+}
+
+/// Scan the entry block's prologue for the SysV `__va_list_tag` initializer and
+/// return the named-float parameter count encoded in its `fp_offset` field
+/// (`fp_offset = 48 + 16 * named_floats`).
+///
+/// This reads the RAW instructions so the count survives even after the
+/// structurer collapses the `va_arg` diamonds — that collapse deletes the
+/// `fp_offset` store the structured-body resolver
+/// ([`SignatureRecovery::resolve_sysv_named_float_count`]) relies on, which
+/// would otherwise let the variadic FP register-save area leak back into the
+/// signature (`int sum_ints(int n, ...)` regaining a spurious `double farg0`).
+///
+/// The tag is identified by an adjacent immediate-store pair in the prologue:
+/// `gp_offset = 8*k` at frame slot `b` and `fp_offset = 48 + 16*f` at `b + 4`.
+/// First-write-wins per slot, so a later `va_arg` mutation of the same field is
+/// ignored. Returns `None` on non-SysV targets or when no tag is found.
+pub fn scan_sysv_va_list_named_float_count(
+    cfg: &ControlFlowGraph,
+    convention: CallingConvention,
+) -> Option<usize> {
+    if !matches!(convention, CallingConvention::SystemV) {
+        return None;
+    }
+    // Scan every block, not just the entry: a stack-protector or other early
+    // branch splits the prologue, so the va_list-tag initializer stores can
+    // land in a successor block rather than the entry. The adjacent
+    // `gp_offset`/`fp_offset` value pattern below is specific enough that
+    // scanning the whole function doesn't introduce false matches.
+    let mut consts: HashMap<i64, i128> = HashMap::new();
+    for block in cfg.blocks() {
+        for inst in &block.instructions {
+            if !matches!(inst.operation, Operation::Store | Operation::Move) {
+                continue;
+            }
+            if let (Some(Operand::Memory(mem)), Some(Operand::Immediate(imm))) =
+                (inst.operands.first(), inst.operands.get(1))
+            {
+                if is_frame_base_memory(mem) {
+                    // First write wins: the `va_start` initialiser precedes any
+                    // later `va_arg` update of the same field.
+                    consts.entry(mem.displacement).or_insert(imm.value);
+                }
+            }
+        }
+    }
+    for (&base, &gp) in &consts {
+        if !(0..48).contains(&gp) || gp % 8 != 0 {
+            continue;
+        }
+        if let Some(&fp) = consts.get(&(base + 4)) {
+            if (48..=176).contains(&fp) && fp % 16 == 0 {
+                return usize::try_from((fp - 48) / 16).ok();
+            }
+        }
+    }
+    None
 }
 
 /// Scan the raw instruction stream for floating-point argument registers.
@@ -979,6 +1042,7 @@ impl SignatureRecovery {
             arg_spill_offsets: HashMap::new(),
             invalidated_spill_offsets: HashSet::new(),
             param_spill_order: Vec::new(),
+            va_list_float_count_seed: None,
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -1036,6 +1100,15 @@ impl SignatureRecovery {
     /// source-declaration order across the int/float bank split.
     pub fn with_param_spill_order(mut self, order: Vec<ParamSpillObservation>) -> Self {
         self.param_spill_order = order;
+        self
+    }
+
+    /// Seeds the named-float count read from the raw `__va_list_tag`
+    /// initialiser (see [`scan_sysv_va_list_named_float_count`]), used as a
+    /// fallback when the `va_arg` diamonds were collapsed before signature
+    /// recovery ran.
+    pub fn with_va_list_float_count_seed(mut self, count: Option<usize>) -> Self {
+        self.va_list_float_count_seed = count;
         self
     }
 
@@ -4959,8 +5032,15 @@ impl SignatureRecovery {
         // back to the integer fixed-count only when `fp_offset` wasn't seen
         // (e.g. the structurer already collapsed the diamond) to avoid
         // regressing the pre-existing behaviour there.
-        let float_param_cutoff = variadic_fixed_param_count
-            .map(|int_fixed| self.resolve_sysv_named_float_count().unwrap_or(int_fixed));
+        let float_param_cutoff = variadic_fixed_param_count.map(|int_fixed| {
+            // Prefer the structured-body __va_list_tag resolver; fall back to
+            // the raw-prologue seed when the va_arg diamonds were already
+            // collapsed (which deletes the fp_offset store the resolver reads);
+            // only then fall back to the integer prefix.
+            self.resolve_sysv_named_float_count()
+                .or(self.va_list_float_count_seed)
+                .unwrap_or(int_fixed)
+        });
         for (idx, reg) in float_regs.iter().enumerate() {
             if float_param_cutoff.is_some_and(|cutoff| idx >= cutoff) {
                 continue;
@@ -7952,6 +8032,44 @@ mod tests {
                 .any(|p| matches!(p.param_type, ParamType::Float(_))),
             "later fp_offset=64 update must not be read as a named float, got: {}",
             sig.to_c_declaration("sum")
+        );
+    }
+
+    #[test]
+    fn scan_sysv_va_list_named_float_count_reads_fp_offset_from_prologue() {
+        use hexray_core::MemoryRef;
+        let store_imm = |disp: i64, val: i128| {
+            (
+                "mov",
+                Operation::Move,
+                vec![
+                    Operand::Memory(MemoryRef::base_disp(gpr(5, 64), disp, 4)), // [rbp+disp]
+                    Operand::imm(val, 32),
+                ],
+            )
+        };
+        // __va_list_tag: gp_offset=8 @ -208, fp_offset=48 @ -204 -> 0 floats.
+        let cfg = single_block_cfg(vec![store_imm(-208, 8), store_imm(-204, 48)]);
+        assert_eq!(
+            scan_sysv_va_list_named_float_count(&cfg, CallingConvention::SystemV),
+            Some(0)
+        );
+        // fp_offset = 80 -> (80-48)/16 = 2 named floats.
+        let cfg2 = single_block_cfg(vec![store_imm(-208, 8), store_imm(-204, 80)]);
+        assert_eq!(
+            scan_sysv_va_list_named_float_count(&cfg2, CallingConvention::SystemV),
+            Some(2)
+        );
+        // A gp_offset value with no fp_offset 4 bytes later isn't a tag.
+        let cfg3 = single_block_cfg(vec![store_imm(-208, 8), store_imm(-100, 48)]);
+        assert_eq!(
+            scan_sysv_va_list_named_float_count(&cfg3, CallingConvention::SystemV),
+            None
+        );
+        // Non-SysV target: declined.
+        assert_eq!(
+            scan_sysv_va_list_named_float_count(&cfg, CallingConvention::Win64),
+            None
         );
     }
 
