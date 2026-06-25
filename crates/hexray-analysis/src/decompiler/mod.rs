@@ -1394,6 +1394,10 @@ impl Decompiler {
                     cfg,
                     self.calling_convention,
                 ))
+                .with_va_list_float_count_seed(signature::scan_sysv_va_list_named_float_count(
+                    cfg,
+                    self.calling_convention,
+                ))
                 .analyze(&structured);
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else {
@@ -2321,6 +2325,10 @@ impl Decompiler {
             ))
             .with_float_return_seed(signature::scan_float_return(cfg, self.calling_convention))
             .with_param_spill_order(signature::scan_param_spill_order(
+                cfg,
+                self.calling_convention,
+            ))
+            .with_va_list_float_count_seed(signature::scan_sysv_va_list_named_float_count(
                 cfg,
                 self.calling_convention,
             ));

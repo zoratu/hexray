@@ -148,7 +148,11 @@ fn collapse_in_list(nodes: &mut Vec<StructuredNode>) {
     let mut i = 0;
     while i + 1 < nodes.len() {
         if let Some(m) = match_va_arg_diamond(&nodes[i]) {
-            if let Some(ty) = following_load_type(&nodes[i + 1], &m.dest) {
+            if let Some(ty) = m
+                .dests
+                .iter()
+                .find_map(|dest| following_load_type(&nodes[i + 1], dest))
+            {
                 // Replace the load's right-hand side with `va_arg(ap, T)`,
                 // preserving the value receiver, and drop the diamond `If`.
                 if let StructuredNode::Block { statements, .. } = &mut nodes[i + 1] {
@@ -447,9 +451,11 @@ fn expr_contains_va_arg(expr: &Expr) -> bool {
 
 /// A matched `va_arg` diamond.
 struct VaArgMatch {
-    /// Register/temp variable holding the loaded value's address in both
-    /// branches.
-    dest: Variable,
+    /// Candidate register/temp variables holding the loaded value's address.
+    /// Usually one (both branches assign the same dest); two when hexray's
+    /// copy-prop renamed the two paths' machine-identical destination apart —
+    /// the immediately-following load disambiguates which one it dereferences.
+    dests: Vec<Variable>,
 }
 
 /// Match the `If` node against the SysV `va_arg` diamond shape.
@@ -479,16 +485,19 @@ fn match_va_arg_diamond(node: &StructuredNode) -> Option<VaArgMatch> {
         (&then_ops, &else_ops)
     };
 
-    // Both branches must assign the same destination address register.
+    // Each branch assigns an address register. They are machine-identical
+    // (both `addr`, dereferenced right after the diamond), but hexray's
+    // copy-prop sometimes renames the two paths' destination apart; accept
+    // divergent names and let the following load pick which one it
+    // dereferences. Collapsing to `va_arg` is semantically correct either way.
     let reg_dest = branch_dest_var(reg_ops)?;
     let overflow_dest = branch_dest_var(overflow_ops)?;
-    if reg_dest.name != overflow_dest.name {
-        return None;
-    }
 
-    // The register branch must reassign the tested offset slot (the `+= 8`,
-    // folded to a constant store after propagation).
-    if !branch_assigns_lvalue(reg_ops, &offset_slot) {
+    // The register branch must advance the tested offset slot by 8 — the
+    // va_arg register-path bookkeeping. Accept both a direct slot increment and
+    // the common `-O0`/`-O2` copy-then-increment shape (see
+    // `branch_advances_offset`).
+    if !branch_advances_offset(reg_ops, &offset_slot) {
         return None;
     }
 
@@ -498,9 +507,11 @@ fn match_va_arg_diamond(node: &StructuredNode) -> Option<VaArgMatch> {
         return None;
     }
 
-    Some(VaArgMatch {
-        dest: reg_dest.clone(),
-    })
+    let mut dests = vec![reg_dest.clone()];
+    if overflow_dest.name != reg_dest.name {
+        dests.push(overflow_dest.clone());
+    }
+    Some(VaArgMatch { dests })
 }
 
 /// Recognize `slot <cmp> threshold`, returning the slot lvalue and whether the
@@ -580,6 +591,70 @@ fn branch_dest_var(ops: &[Expr]) -> Option<&Variable> {
 fn branch_assigns_lvalue(ops: &[Expr], slot: &Expr) -> bool {
     ops.iter()
         .any(|e| matches!(&e.kind, ExprKind::Assign { lhs, .. } if lvalue_eq(lhs, slot)))
+}
+
+/// True if the register branch advances the tested `gp_offset` slot by 8 — the
+/// va_arg register-path bookkeeping. Accepts two shapes:
+///   1. a direct increment of the slot (`gp_offset += 8`, folded to a constant
+///      store after propagation), and
+///   2. the common `-O0`/`-O2` copy-then-increment: GCC spills the slot into a
+///      scratch register, indexes the save area with it, and increments the
+///      SCRATCH (`scratch = gp_offset; …; scratch += 8`) — the store-back to the
+///      slot having been recovered onto that register rather than the slot
+///      itself. (The diamond is already heavily constrained by the threshold
+///      test, the shared destination register, and the overflow branch bumping
+///      a *different* frame slot, so accepting the copy form is safe.)
+fn branch_advances_offset(ops: &[Expr], offset_slot: &Expr) -> bool {
+    if branch_assigns_lvalue(ops, offset_slot) {
+        return true;
+    }
+    for e in ops {
+        let ExprKind::Assign { lhs, rhs } = &e.kind else {
+            continue;
+        };
+        let ExprKind::Var(scratch) = &lhs.kind else {
+            continue;
+        };
+        // The scratch must be a register/temp, not another frame slot.
+        if matches!(scratch.kind, VarKind::Stack(_)) {
+            continue;
+        }
+        if !lvalue_eq(strip_casts(rhs), offset_slot) {
+            continue;
+        }
+        if ops.iter().any(|inc| increments_var_by_eight(inc, scratch)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// True if `expr` is `v += 8` or `v = v + 8` for variable `v`.
+fn increments_var_by_eight(expr: &Expr, v: &Variable) -> bool {
+    let is_v = |e: &Expr| matches!(&e.kind, ExprKind::Var(x) if x == v);
+    let is_eight = |e: &Expr| matches!(strip_casts(e).kind, ExprKind::IntLit(n) if n == 8);
+    match &expr.kind {
+        ExprKind::CompoundAssign {
+            op: BinOpKind::Add,
+            lhs,
+            rhs,
+        } => is_v(lhs) && is_eight(rhs),
+        ExprKind::Assign { lhs, rhs } => {
+            if !is_v(lhs) {
+                return false;
+            }
+            let ExprKind::BinOp {
+                op: BinOpKind::Add,
+                left,
+                right,
+            } = &strip_casts(rhs).kind
+            else {
+                return false;
+            };
+            (is_v(left) && is_eight(right)) || (is_v(right) && is_eight(left))
+        }
+        _ => false,
+    }
 }
 
 /// True if the overflow branch bumps a frame slot other than the tested offset
@@ -920,6 +995,88 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], StructuredNode::If { .. }));
         assert!(first_rhs_is_va_arg(&out[1]).is_none());
+    }
+
+    #[test]
+    fn branch_advances_offset_accepts_copy_then_increment() {
+        // `-O0` register path: spill gp_offset into a scratch register, index
+        // the save area with it, and increment the SCRATCH (`arg2 += 8`) — the
+        // store-back to the slot recovered onto the register, not the slot.
+        let scratch = || Expr::var(Variable::reg("arg2", 4));
+        let ops = vec![
+            Expr::assign(scratch(), gp_slot()),
+            Expr::assign(
+                rax(8),
+                Expr::binop(
+                    BinOpKind::Add,
+                    Expr::binop(BinOpKind::Add, rbp(), Expr::int(-176)),
+                    scratch(),
+                ),
+            ),
+            Expr {
+                kind: ExprKind::CompoundAssign {
+                    op: BinOpKind::Add,
+                    lhs: Box::new(scratch()),
+                    rhs: Box::new(Expr::int(8)),
+                },
+            },
+        ];
+        assert!(branch_advances_offset(&ops, &gp_slot()));
+
+        // Copy without the matching increment must NOT count as an advance.
+        let ops_no_inc = vec![
+            Expr::assign(scratch(), gp_slot()),
+            Expr::assign(rax(8), Expr::binop(BinOpKind::Add, rbp(), scratch())),
+        ];
+        assert!(!branch_advances_offset(&ops_no_inc, &gp_slot()));
+    }
+
+    #[test]
+    fn collapses_va_arg_diamond_with_divergent_destination_registers() {
+        // hexray's copy-prop sometimes names the two paths' machine-identical
+        // address register apart (register path -> rdx, overflow path -> rax).
+        // The diamond must still collapse, disambiguated by the following load.
+        let rdx = |size| Expr::var(Variable::reg("rdx", size));
+        let then_overflow = vec![block(
+            1,
+            vec![
+                Expr::assign(rax(8), Expr::binop(BinOpKind::Add, rbp(), Expr::int(16))),
+                Expr::assign(
+                    overflow_slot(),
+                    Expr::binop(
+                        BinOpKind::Add,
+                        Expr::binop(BinOpKind::Add, rbp(), Expr::int(16)),
+                        Expr::int(8),
+                    ),
+                ),
+            ],
+        )];
+        let else_register = vec![block(
+            2,
+            vec![
+                Expr::assign(
+                    rdx(8),
+                    Expr::binop(
+                        BinOpKind::Add,
+                        Expr::binop(BinOpKind::Add, rbp(), Expr::int(-176)),
+                        gp_slot(),
+                    ),
+                ),
+                Expr::assign(gp_slot(), Expr::int(16)),
+            ],
+        )];
+        let nodes = vec![
+            StructuredNode::If {
+                condition: Expr::binop(BinOpKind::UGt, gp_slot(), Expr::int(47)),
+                then_body: then_overflow,
+                else_body: Some(else_register),
+            },
+            // The load dereferences the register-path destination (rdx).
+            block(3, vec![Expr::assign(rdx(4), Expr::deref(rdx(8), 4))]),
+        ];
+        let out = recover_va_arg(nodes);
+        assert_eq!(out.len(), 1, "diamond should collapse: {out:#?}");
+        assert_eq!(first_rhs_is_va_arg(&out[0]).as_deref(), Some("int"));
     }
 
     /// `fp_offset` slot at `rbp[-48]`.
