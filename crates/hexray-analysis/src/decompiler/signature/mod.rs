@@ -681,7 +681,17 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize
                                   reg: &hexray_core::Register,
                                   consts: &mut HashMap<i64, i128>,
                                   ptrs: &mut HashSet<i64>| {
-                        match regs.get(&aarch64_canon_reg(reg.name())) {
+                        let canon = aarch64_canon_reg(reg.name());
+                        // The zero register (`wzr`/`xzr`) is never a `mov` target,
+                        // so it isn't in `regs`; treat it as a literal 0. gcc -O2
+                        // stores the compacted `__vr_offs == 0` directly with it
+                        // (`str wzr` / `stp …, wzr`).
+                        let value = if canon == "wzr" || canon == "xzr" {
+                            Some(RegVal::Imm(0))
+                        } else {
+                            regs.get(&canon).copied()
+                        };
+                        match value {
                             Some(RegVal::FrameAddr) => {
                                 ptrs.insert(off);
                             }
@@ -692,13 +702,13 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize
                                     // 64-bit store): low half at `off`, high half
                                     // at `off + 4`. (The tag-shape check below
                                     // discards an incidental split.)
-                                    let bits = *v as u64;
+                                    let bits = v as u64;
                                     consts.entry(off).or_insert((bits as u32) as i128);
                                     consts
                                         .entry(off + 4)
                                         .or_insert(((bits >> 32) as u32) as i128);
                                 } else {
-                                    consts.entry(off).or_insert(*v);
+                                    consts.entry(off).or_insert(v);
                                 }
                             }
                             None => {}
@@ -8493,14 +8503,19 @@ mod tests {
                 vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
             )
         };
-        let mov0 = |reg: u16| {
+        // wzr is the 32-bit zero register (id arm64::XZR = 32), never a `mov`
+        // target.
+        let str_wzr = |slot: i64| {
             (
-                "mov",
-                Operation::Move,
-                vec![Operand::Register(x(reg, 32)), Operand::imm(0, 32)],
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
             )
         };
-        // Full tag shape but __vr_offs = 0 (compact). Must decline.
+        // Full tag shape but __vr_offs written directly with `str wzr` (== 0).
         let cfg = aarch64_single_block_cfg(vec![
             add_sp(8, 0x110),
             add_sp(9, 0x110),
@@ -8509,8 +8524,7 @@ mod tests {
             str_reg(10, 64, 40),
             movn(0, 55), // __gr_offs = -56 (named_gp = 1)
             str_reg(0, 32, 48),
-            mov0(0), // __vr_offs = 0 (compact sentinel)
-            str_reg(0, 32, 52),
+            str_wzr(52), // __vr_offs = 0 via the zero register (compact)
         ]);
         // Variadic (named_gp = 1) with an unknown/uncapped float count.
         assert_eq!(scan_aapcs_va_list(&cfg), Some((1, None)));
