@@ -201,32 +201,96 @@ fn frame_offset(e: &Expr, frame: &Frame) -> Option<i64> {
     }
 }
 
+/// Two branch bodies are equivalent if they structure-print identically.
+fn bodies_equivalent(a: &[StructuredNode], b: &[StructuredNode]) -> bool {
+    format!("{a:?}") == format!("{b:?}")
+}
+
 /// Locate the resume-index field offset: the frame field compared (directly or
 /// through a `tmp = frame[off]` reload) against the most distinct small
-/// non-negative constants.
+/// non-negative constants. The `tmp -> offset` map is maintained in execution
+/// order and scoped per branch, so a temporary later reused for a different
+/// frame field doesn't retroactively re-attribute earlier comparisons.
 fn find_state_field(body: &[StructuredNode], frame: &Frame) -> Option<StateField> {
-    // temp name -> frame offset it was last loaded from (`tmp = frame[off]`).
-    let mut temp_offset: HashMap<String, i64> = HashMap::new();
-    visit_assignments(body, &mut |lhs, rhs| {
-        if let (ExprKind::Var(v), Some(off)) = (&lhs.kind, frame_offset(rhs, frame)) {
-            temp_offset.insert(v.name.clone(), off);
-        }
-    });
-
     let mut counts: HashMap<i64, HashSet<i128>> = HashMap::new();
-    visit_conditions(body, &mut |cond| {
-        if let Some((off, value)) = compare_to_frame_offset(cond, frame, &temp_offset) {
-            if (0..256).contains(&value) {
-                counts.entry(off).or_default().insert(value);
-            }
-        }
-    });
-
+    scan_state_compares(body, frame, &mut HashMap::new(), &mut counts);
     counts
         .into_iter()
         .filter(|(_, vals)| vals.len() >= 2)
         .max_by_key(|(_, vals)| vals.len())
         .map(|(offset, _)| StateField { offset })
+}
+
+/// Ordered walk maintaining `temp -> frame offset` bindings; counts each
+/// comparison's `(offset, const)` against the binding live at that point.
+fn scan_state_compares(
+    nodes: &[StructuredNode],
+    frame: &Frame,
+    temp_offset: &mut HashMap<String, i64>,
+    counts: &mut HashMap<i64, HashSet<i128>>,
+) {
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for stmt in statements {
+                    if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+                        if let ExprKind::Var(v) = &lhs.kind {
+                            match frame_offset(rhs, frame) {
+                                Some(off) => {
+                                    temp_offset.insert(v.name.clone(), off);
+                                }
+                                None => {
+                                    temp_offset.remove(&v.name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                note_state_compare(condition, frame, temp_offset, counts);
+                scan_state_compares(then_body, frame, &mut temp_offset.clone(), counts);
+                if let Some(b) = else_body {
+                    scan_state_compares(b, frame, &mut temp_offset.clone(), counts);
+                }
+            }
+            StructuredNode::While { condition, body, .. }
+            | StructuredNode::DoWhile { condition, body, .. } => {
+                note_state_compare(condition, frame, temp_offset, counts);
+                scan_state_compares(body, frame, &mut temp_offset.clone(), counts);
+            }
+            StructuredNode::For { body, .. } | StructuredNode::Loop { body, .. } => {
+                scan_state_compares(body, frame, &mut temp_offset.clone(), counts);
+            }
+            StructuredNode::Switch { cases, default, .. } => {
+                for (_, b) in cases {
+                    scan_state_compares(b, frame, &mut temp_offset.clone(), counts);
+                }
+                if let Some(b) = default {
+                    scan_state_compares(b, frame, &mut temp_offset.clone(), counts);
+                }
+            }
+            StructuredNode::Sequence(nodes) => scan_state_compares(nodes, frame, temp_offset, counts),
+            _ => {}
+        }
+    }
+}
+
+fn note_state_compare(
+    cond: &Expr,
+    frame: &Frame,
+    temp_offset: &HashMap<String, i64>,
+    counts: &mut HashMap<i64, HashSet<i128>>,
+) {
+    if let Some((off, value)) = compare_to_frame_offset(cond, frame, temp_offset) {
+        if (0..256).contains(&value) {
+            counts.entry(off).or_default().insert(value);
+        }
+    }
 }
 
 /// If `cond` is `<frame field or its temp> <cmp> <const>`, return (offset, const).
@@ -589,11 +653,21 @@ fn collect_branch(
                 }
             }
             acc.cases.extend(sub.cases);
-            // Adopt the nested (trap) default if we don't already have one; both
-            // branches' leaves are the same unreachable trap, so keeping one is
-            // correct.
-            if acc.default.is_none() {
-                acc.default = sub.default;
+            // Merge defaults. Two nested branches usually share the same
+            // unreachable trap leaf; keep one. But two *distinct, live* defaults
+            // mean states would reach different code than the original — abort the
+            // flatten rather than silently pick one.
+            match (acc.default.take(), sub.default) {
+                (None, d) | (d, None) => acc.default = d,
+                (Some(a), Some(b)) => {
+                    if bodies_equivalent(&a, &b)
+                        || (body_is_noreturn(&a) && body_is_noreturn(&b))
+                    {
+                        acc.default = Some(a);
+                    } else {
+                        return None;
+                    }
+                }
             }
             return Some(());
         }
@@ -743,42 +817,6 @@ fn visit_assignments(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr, &Expr))
             f(lhs, rhs);
         }
     });
-}
-
-fn visit_conditions(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr)) {
-    for node in nodes {
-        match node {
-            StructuredNode::If {
-                condition,
-                then_body,
-                else_body,
-            } => {
-                f(condition);
-                visit_conditions(then_body, f);
-                if let Some(b) = else_body {
-                    visit_conditions(b, f);
-                }
-            }
-            StructuredNode::While { condition, body, .. }
-            | StructuredNode::DoWhile { condition, body, .. } => {
-                f(condition);
-                visit_conditions(body, f);
-            }
-            StructuredNode::For { body, .. } | StructuredNode::Loop { body, .. } => {
-                visit_conditions(body, f)
-            }
-            StructuredNode::Switch { cases, default, .. } => {
-                for (_, b) in cases {
-                    visit_conditions(b, f);
-                }
-                if let Some(b) = default {
-                    visit_conditions(b, f);
-                }
-            }
-            StructuredNode::Sequence(nodes) => visit_conditions(nodes, f),
-            _ => {}
-        }
-    }
 }
 
 /// Walk every expression (and sub-expression) appearing in the body.
@@ -1109,6 +1147,31 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn temp_reused_for_another_field_does_not_misidentify_state() {
+        // tmp = arg0[18]; if (tmp==0) .. else if (tmp==1) ..   (real dispatch @36)
+        // tmp = arg0[50]; if (tmp==9) ..                       (reuse, offset 100)
+        // The ordered scan attributes 0/1 to offset 36, not the later 100.
+        let tmp = || Expr::var(Variable::reg("rax", 4));
+        let other = Expr::array_access(frame(), Expr::int(50), 2); // offset 100
+        let body = vec![
+            block(vec![Expr::assign(tmp(), state_access())]),
+            iff(
+                cmp(BinOpKind::Eq, tmp(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, tmp(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+            block(vec![Expr::assign(tmp(), other)]),
+            iff(cmp(BinOpKind::Eq, tmp(), 9), vec![block(vec![Expr::int(3)])], vec![]),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
     }
 
     #[test]
