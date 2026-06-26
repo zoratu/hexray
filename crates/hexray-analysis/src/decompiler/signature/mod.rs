@@ -5165,15 +5165,23 @@ impl SignatureRecovery {
         used_args.sort_unstable();
 
         let variadic_fixed_param_count = self.infer_variadic_fixed_param_count(&used_args);
+        // A compacted aarch64 GP save area (`__gr_offs == 0`) marks the function
+        // variadic but leaves the named integer count unknown — no GP varargs are
+        // consumed, so we can neither cap nor materialise a contiguous `0..N`
+        // prefix without fabricating bogus x0..x7 params. Mark variadic and keep
+        // exactly the observed int args.
+        let aapcs_uncapped_gp = matches!(self.aapcs_va_list_counts, Some((None, _)));
         if let Some(fixed_count) = variadic_fixed_param_count {
             sig.is_variadic = true;
-            used_args.retain(|idx| *idx < fixed_count);
-            for idx in 0..fixed_count.min(int_regs.len()) {
-                if !used_args.contains(&idx) {
-                    used_args.push(idx);
+            if !aapcs_uncapped_gp {
+                used_args.retain(|idx| *idx < fixed_count);
+                for idx in 0..fixed_count.min(int_regs.len()) {
+                    if !used_args.contains(&idx) {
+                        used_args.push(idx);
+                    }
                 }
+                used_args.sort_unstable();
             }
-            used_args.sort_unstable();
         }
 
         // Create parameters only for registers that were actually used
@@ -6023,11 +6031,15 @@ impl SignatureRecovery {
         // aarch64 AAPCS: the `__va_list` tag's `__gr_offs` directly encodes the
         // named integer-parameter prefix; the SysV materialization heuristics
         // below don't apply (different ABI / tag layout). A compacted GP save
-        // area (`named_gp == None`) still marks the function variadic but caps
-        // nothing — fall back to the max GP-arg count so no observed int arg is
-        // suppressed.
+        // area (`named_gp == None`) means no GP varargs are consumed, so every
+        // observed int-register arg is itself a named parameter (contiguous from
+        // x0) and there are no others — derive the prefix from observation. Using
+        // `max_int_args()` here would be wrong: `build_signature` materialises a
+        // contiguous `0..fixed_count` prefix, fabricating bogus x0..x7 params.
         if let Some((named_gp, _)) = self.aapcs_va_list_counts {
-            return Some(named_gp.unwrap_or_else(|| self.convention.max_int_args()));
+            return Some(named_gp.unwrap_or_else(|| {
+                used_args.iter().copied().max().map_or(0, |m| m + 1)
+            }));
         }
         if !self.has_sysv_va_list_materialization() {
             return None;
