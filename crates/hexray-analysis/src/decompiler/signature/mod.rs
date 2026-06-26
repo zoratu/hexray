@@ -992,7 +992,15 @@ pub fn scan_aapcs_va_list(
                     // reloaded/recomputed arg register (`ldr x7, …; str x7, …`)
                     // isn't later mistaken for an untouched incoming-argument spill.
                     if aarch64_op_writes_first_operand(other) {
-                        if let Some(Operand::Register(dst)) = inst.operands.first() {
+                        if matches!(other, Operation::Load | Operation::LoadExclusive) {
+                            // Multi-destination loads (`ldp x6, x7, [mem]`) write
+                            // every leading register operand; clobber them all up to
+                            // the address operand.
+                            for op in &inst.operands {
+                                let Operand::Register(dst) = op else { break };
+                                regs.insert(aarch64_canon_reg(dst.name()), RegVal::Clobbered);
+                            }
+                        } else if let Some(Operand::Register(dst)) = inst.operands.first() {
                             regs.insert(aarch64_canon_reg(dst.name()), RegVal::Clobbered);
                         }
                     }
@@ -9154,6 +9162,76 @@ mod tests {
         ]);
         // x7 was clobbered, so no full save and no in-area spill -> GP count
         // unknown; tag still valid (negative __gr_offs) -> Some((None, None)).
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_clobbers_both_ldp_destinations() {
+        // `ldp x6, x7, [sp, …]` writes BOTH x6 and x7; the second destination must
+        // also be clobbered so a later in-area `str x7` isn't read as an untouched
+        // incoming-arg spill that fakes a full save (compacted -8 -> bogus 7).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let ldp = |r1: u16, r2: u16, slot: i64| {
+            (
+                "ldp",
+                Operation::Load,
+                vec![
+                    Operand::Register(x(r1, 64)),
+                    Operand::Register(x(r2, 64)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            ldp(6, 7, 500),      // reloads x6 AND x7 (neither is an incoming arg)
+            str_reg(7, 64, 264), // in-area, but x7 was clobbered by the ldp
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32), // __gr_top = 272 (area [264,272))
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 7), // __gr_offs = -8
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0
+        ]);
+        // x7 clobbered by the ldp -> not a full save, no in-area spill -> unknown.
         assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
     }
 
