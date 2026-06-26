@@ -738,14 +738,14 @@ pub fn scan_aapcs_va_list(
             spills.push((base_class, slot, idx));
         }
     }
-    for (block_idx, block) in cfg.blocks().enumerate() {
-        // Incoming argument registers only hold their caller-passed values in the
-        // entry block's straight-line prologue (where va_start spills the
-        // register-save area). In any later block a register may have been
-        // redefined on some path, so the "untouched incoming arg" assumption — and
-        // thus arg-spill detection — is only valid in the first block.
-        let is_entry_block = block_idx == 0;
-        let mut regs: HashMap<String, RegVal> = HashMap::new();
+    // Register state is carried forward across blocks (in iteration order) rather
+    // than reset per block: a redefinition/clobber in a predecessor must persist so
+    // a later store of that register isn't mistaken for an untouched incoming-arg
+    // spill (a post-call/post-load store), while an incoming arg register that is
+    // never redefined stays trackable into a split-prologue successor (e.g. a
+    // stack-protector branch) where its genuine save-area spill still occurs.
+    let mut regs: HashMap<String, RegVal> = HashMap::new();
+    for block in cfg.blocks() {
         for inst in &block.instructions {
             match inst.operation {
                 Operation::Move => {
@@ -908,15 +908,13 @@ pub fn scan_aapcs_va_list(
                                     .base
                                     .as_ref()
                                     .and_then(|r| aarch64_frame_base_class(r.name()));
-                                if is_entry_block {
-                                    note_arg_spill(
-                                        src,
-                                        base_class,
-                                        mem.displacement,
-                                        &regs,
-                                        &mut save_area,
-                                    );
-                                }
+                                note_arg_spill(
+                                    src,
+                                    base_class,
+                                    mem.displacement,
+                                    &regs,
+                                    &mut save_area,
+                                );
                                 if let Some(bc) = base_class {
                                     record(
                                         bc,
@@ -944,16 +942,14 @@ pub fn scan_aapcs_va_list(
                                     .as_ref()
                                     .and_then(|r| aarch64_frame_base_class(r.name()));
                                 let stride = i64::from(r1.size / 8).max(1);
-                                if is_entry_block {
-                                    for (i, reg) in [r1, r2].into_iter().enumerate() {
-                                        note_arg_spill(
-                                            reg,
-                                            base_class,
-                                            mem.displacement + stride * i as i64,
-                                            &regs,
-                                            &mut save_area,
-                                        );
-                                    }
+                                for (i, reg) in [r1, r2].into_iter().enumerate() {
+                                    note_arg_spill(
+                                        reg,
+                                        base_class,
+                                        mem.displacement + stride * i as i64,
+                                        &regs,
+                                        &mut save_area,
+                                    );
                                 }
                                 if let Some(bc) = base_class {
                                     record(
@@ -6668,6 +6664,38 @@ mod tests {
         cfg
     }
 
+    /// Build a two-block aarch64 CFG (block 0 falls through to block 1), so tests
+    /// can model a prologue split across blocks (e.g. a stack-protector branch).
+    fn aarch64_two_block_cfg(
+        block0: Vec<(&str, Operation, Vec<Operand>)>,
+        block1: Vec<(&str, Operation, Vec<Operand>)>,
+    ) -> ControlFlowGraph {
+        use hexray_core::{BasicBlock, BlockTerminator, Instruction};
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut addr = 0x1000u64;
+        for (idx, insts) in [block0, block1].into_iter().enumerate() {
+            let idx = idx as u32;
+            let mut block = BasicBlock::new(BasicBlockId::new(idx), addr);
+            for (mnemonic, op, operands) in insts {
+                block.instructions.push(
+                    Instruction::new(addr, 4, vec![], mnemonic)
+                        .with_operation(op)
+                        .with_operands(operands),
+                );
+                addr += 4;
+            }
+            block.terminator = if idx == 0 {
+                BlockTerminator::Fallthrough {
+                    target: BasicBlockId::new(1),
+                }
+            } else {
+                BlockTerminator::Return
+            };
+            cfg.add_block(block);
+        }
+        cfg
+    }
+
     fn gpr(id: u16, bits: u16) -> hexray_core::Register {
         use hexray_core::{Architecture, RegisterClass};
         hexray_core::Register::new(Architecture::X86_64, RegisterClass::General, id, bits)
@@ -9296,6 +9324,73 @@ mod tests {
         ]);
         // No genuine in-area spill -> GP count unknown; tag valid -> (None, None).
         assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_collects_spills_from_split_prologue() {
+        // A stack-protector (or other early branch) can split the prologue: block 0
+        // does the guard, block 1 spills the register-save area and writes the tag.
+        // Register state carries forward, so the never-redefined incoming x7 spill
+        // in block 1 is still recognized -> full GP save -> named_gp recovered.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        // Block 0: stack-protector-style guard load (does NOT touch x7).
+        let block0 = vec![(
+            "ldr",
+            Operation::Load,
+            vec![Operand::Register(x(8, 64)), aarch64_mem(sp(), 504)],
+        )];
+        // Block 1: the actual va_list prologue (full GP save reaching x7 at 264).
+        let block1 = vec![
+            str_reg(7, 64, 264), // in-area (gr_top 272, area [216,272)) -> full GP save
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32), // __gr_top = 272
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 55), // __gr_offs = -56 -> named_gp = 1
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0 (FP unused)
+        ];
+        let cfg = aarch64_two_block_cfg(block0, block1);
+        // x7 (never redefined across the split) still counts -> named_gp = 1.
+        assert_eq!(scan_aapcs_va_list(&cfg).map(|(gp, _)| gp), Some(Some(1)));
     }
 
     #[test]
