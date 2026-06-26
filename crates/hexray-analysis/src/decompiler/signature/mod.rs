@@ -1009,11 +1009,12 @@ pub fn scan_aapcs_va_list(
         if !gr_is_offset || !vr_is_offset {
             continue;
         }
-        // At least one offset must be canonical (negative) so two zero-initialised
-        // words next to three pointers aren't mistaken for a `__va_list`.
-        if gr_offs >= 0 && vr_offs >= 0 {
-            continue;
-        }
+        // Both offsets may legitimately be `0`: a variadic with 8 named GP args
+        // (`__gr_offs = -(8-8)*8 = 0`) whose varargs all land on the stack and
+        // whose FP class is unused initialises both fields to 0. The three
+        // distinct frame-pointer fields below are va_list-specific enough to
+        // confirm the tag without requiring a negative anchor — in that case both
+        // counts are simply unknown (left to observation).
         // Recover the named count from the arg-register spills that land *inside*
         // the save area `[top + offs, top)` (`top` = `__gr_top`/`__vr_top`, `offs`
         // the negative offset). Bounding to that range excludes an address-taken
@@ -8898,7 +8899,9 @@ mod tests {
         ]);
         // Variadic (named_fp = 0) with an unknown/uncapped int count.
         assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
-        // Both offsets compacted to 0 -> no canonical anchor -> not a tag.
+        // Both offsets 0 is a legitimate tag (e.g. 8 named GP args + stack-only
+        // varargs, FP unused): the three frame-pointer fields confirm it, and both
+        // counts are unknown -> Some((None, None)).
         let both_zero = aarch64_single_block_cfg(vec![
             add_sp(8, 0x110),
             str_reg(8, 64, 24),
@@ -8909,7 +8912,7 @@ mod tests {
             str_wzr(48),
             str_wzr(52),
         ]);
-        assert_eq!(scan_aapcs_va_list(&both_zero), None);
+        assert_eq!(scan_aapcs_va_list(&both_zero), Some((None, None)));
     }
 
     #[test]
