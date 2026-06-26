@@ -479,25 +479,23 @@ fn try_flatten_switch(
         .default
         .map(|b| rewrite_nodes(b, frame, state, &mut env.clone()));
 
-    let mut out = vec![StructuredNode::Switch {
+    // Any code that follows this dispatch at the SAME sibling level (shared by
+    // every case) stays after the switch — `rewrite_nodes` keeps those siblings
+    // in place. Code local to one branch is appended to that branch's cases in
+    // `collect_branch`, never hoisted, so semantics are preserved.
+    Some(vec![StructuredNode::Switch {
         value: named_state_expr(frame, state),
         cases: switch_cases,
         default,
-    }];
-    // The shared fall-through epilogue runs after the dispatch for cases that
-    // didn't return/break, so it sits after the switch.
-    out.extend(rewrite_nodes(acc.trailing, frame, state, &mut env.clone()));
-    Some(out)
+    }])
 }
 
-/// Accumulator for a flattened dispatch: equality cases, the terminal default
-/// (a trap / unreachable / empty leaf), and the shared post-switch fall-through
-/// epilogue (sibling code after the dispatch subtree).
+/// Accumulator for a flattened dispatch: equality cases and the terminal default
+/// (a trap / unreachable / empty leaf).
 #[derive(Default)]
 struct Dispatch {
     cases: Vec<(i128, Vec<StructuredNode>)>,
     default: Option<Vec<StructuredNode>>,
-    trailing: Vec<StructuredNode>,
 }
 
 /// Recursively gather `(label, body)` cases from a state-dispatch if-tree.
@@ -571,12 +569,24 @@ fn collect_branch(
     }, rest @ ..] = nodes
     {
         if as_state_compare(condition, frame, state, env).is_some() {
-            collect_cases(condition, then_body, else_body, frame, state, env, acc)?;
+            // Flatten the nested dispatch into a private accumulator first.
+            let mut sub = Dispatch::default();
+            collect_cases(condition, then_body, else_body, frame, state, env, &mut sub)?;
+            // Sibling code after the nested dispatch is the fall-through for the
+            // cases IT introduced only — append it to those case bodies rather
+            // than hoisting it (it must not run for states handled elsewhere).
+            // The default leaf is a trap / unreachable, so nothing falls through.
             if !rest.is_empty() {
-                if !acc.trailing.is_empty() {
-                    return None;
+                for (_, body) in &mut sub.cases {
+                    body.extend(rest.iter().cloned());
                 }
-                acc.trailing = rest.to_vec();
+            }
+            acc.cases.extend(sub.cases);
+            // Adopt the nested (trap) default if we don't already have one; both
+            // branches' leaves are the same unreachable trap, so keeping one is
+            // correct.
+            if acc.default.is_none() {
+                acc.default = sub.default;
             }
             return Some(());
         }
