@@ -59,7 +59,39 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
         return body;
     };
     let mut env = BindingEnv::default();
-    rewrite_nodes(body, &frame, &state, &mut env)
+    let rewritten = rewrite_nodes(body.clone(), &frame, &state, &mut env);
+    // The rewrite also renames the state field to `frame->__resume_index`; only
+    // commit it when a dispatch actually flattened into a switch, so a field that
+    // merely happened to be the most-compared one is never renamed in isolation.
+    if contains_resume_switch(&rewritten) {
+        rewritten
+    } else {
+        body
+    }
+}
+
+/// True if the body contains a `switch` whose value is the recovered
+/// `frame->__resume_index` field (i.e. this pass flattened a dispatch).
+fn contains_resume_switch(nodes: &[StructuredNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        StructuredNode::Switch {
+            value, cases, default, ..
+        } => {
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME)
+                || cases.iter().any(|(_, b)| contains_resume_switch(b))
+                || default.as_ref().is_some_and(|b| contains_resume_switch(b))
+        }
+        StructuredNode::If { then_body, else_body, .. } => {
+            contains_resume_switch(then_body)
+                || else_body.as_ref().is_some_and(|b| contains_resume_switch(b))
+        }
+        StructuredNode::While { body, .. }
+        | StructuredNode::DoWhile { body, .. }
+        | StructuredNode::For { body, .. }
+        | StructuredNode::Loop { body, .. } => contains_resume_switch(body),
+        StructuredNode::Sequence(nodes) => contains_resume_switch(nodes),
+        _ => false,
+    })
 }
 
 /// Identify the frame pointer (the first parameter) and its stable aliases.
@@ -296,19 +328,23 @@ fn note_state_compare(
     temp_offset: &HashMap<String, i64>,
     counts: &mut HashMap<i64, HashSet<i128>>,
 ) {
-    if let Some((off, value)) = compare_to_frame_offset(cond, frame, temp_offset) {
-        if (0..256).contains(&value) {
+    if let Some((off, value, op)) = compare_to_frame_offset(cond, frame, temp_offset) {
+        // Only equality comparisons name an actual case; `<`/`<=` etc. are
+        // binary-search navigation, so a frame field range-checked but never
+        // switched on must not be mistaken for the resume index.
+        if matches!(op, BinOpKind::Eq | BinOpKind::Ne) && (0..256).contains(&value) {
             counts.entry(off).or_default().insert(value);
         }
     }
 }
 
-/// If `cond` is `<frame field or its temp> <cmp> <const>`, return (offset, const).
+/// If `cond` is `<frame field or its temp> <cmp> <const>`, return
+/// (offset, const, op) with `op` oriented so the field is the left operand.
 fn compare_to_frame_offset(
     cond: &Expr,
     frame: &Frame,
     temp_offset: &HashMap<String, i64>,
-) -> Option<(i64, i128)> {
+) -> Option<(i64, i128, BinOpKind)> {
     let ExprKind::BinOp { op, left, right } = &cond.kind else {
         return None;
     };
@@ -322,10 +358,10 @@ fn compare_to_frame_offset(
         })
     };
     if let (Some(off), Some(v)) = (resolve(left), int_lit(right)) {
-        return Some((off, v));
+        return Some((off, v, *op));
     }
     if let (Some(off), Some(v)) = (resolve(right), int_lit(left)) {
-        return Some((off, v));
+        return Some((off, v, flip_op(*op)));
     }
     None
 }
@@ -1267,6 +1303,39 @@ mod tests {
         ];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn range_checked_field_is_not_mistaken_for_resume_index() {
+        // A frame field compared only with inequalities (range checks) has no
+        // equality labels, so it must not be picked as the resume index, and with
+        // no switch recovered the body is returned unchanged (no rename).
+        let body = vec![iff(
+            cmp(BinOpKind::Lt, state_access(), 2),
+            vec![block(vec![Expr::int(1)])],
+            vec![iff(
+                cmp(BinOpKind::Lt, state_access(), 4),
+                vec![block(vec![Expr::int(2)])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
+        assert!(!format!("{out:?}").contains(RESUME_FIELD_NAME));
+    }
+
+    #[test]
+    fn does_not_rename_when_no_switch_recovered() {
+        // Two equality compares on the field but they never form a flattenable
+        // dispatch shape the pass recognizes... here a single case only.
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![block(vec![Expr::assign(state_access(), Expr::int(9))])],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        // One case -> no switch -> field left as-is (no `__resume_index`).
+        assert!(!format!("{out:?}").contains(RESUME_FIELD_NAME));
     }
 
     #[test]
