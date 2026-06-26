@@ -590,21 +590,25 @@ fn is_aarch64_frame_base_register(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "sp" | "x31" | "x29" | "fp")
 }
 
-/// If `name` is the top (index-7) argument register of its class, returns
-/// `Some(is_fp)`: `true` for the FP/SIMD `v7`/`q7`/`d7`/`s7`/`h7`, `false` for
-/// the GP `x7`/`w7`. Used to detect a *full* register-save area (the area spills
-/// the whole `[named..8)` run, so it reaches register 7); only then does the
-/// `8 - (-offset)/N` formula recover the named count. A gcc -O2 *compacted* save
-/// area stops short of register 7, so its offset must not be read as a count.
-fn aarch64_top_arg_register(name: &str) -> Option<bool> {
+/// If `name` is an argument register (index 0..=7) of its class, returns
+/// `Some((index, is_fp))`: `is_fp` is `true` for the FP/SIMD `v`/`q`/`d`/`s`/`h`
+/// bank, `false` for the GP `x`/`w` bank.
+///
+/// Used two ways when scanning a `va_start` register-save area: index 7 marks a
+/// *full* `[named..8)` save (the area reaches register 7), which validates the
+/// `8 - (-offset)/N` count formula; and the *lowest* incoming arg register
+/// spilled into a compacted save area equals the named count (gcc -O2 spills the
+/// consumed varargs starting at `x[named]`).
+fn aarch64_arg_register(name: &str) -> Option<(usize, bool)> {
     let lower = name.to_lowercase();
     let (class, num) = lower.split_at(1);
-    if num != "7" {
+    let idx: usize = num.parse().ok()?;
+    if idx > 7 {
         return None;
     }
     match class {
-        "x" | "w" => Some(false),
-        "v" | "q" | "d" | "s" | "h" => Some(true),
+        "x" | "w" => Some((idx, false)),
+        "v" | "q" | "d" | "s" | "h" => Some((idx, true)),
         _ => None,
     }
 }
@@ -647,6 +651,39 @@ pub fn scan_aapcs_va_list(
     // formula valid (gcc -O2 compacts to the consumed count and stops short).
     let mut gp_full_save = false;
     let mut fp_full_save = false;
+    // Lowest incoming arg register spilled into the save area, per class. For a
+    // compacted save (gcc -O2, which doesn't home-spill named params) this equals
+    // the named count: the consumed varargs are spilled starting at `x[named]`.
+    let mut gp_spill_min: Option<usize> = None;
+    let mut fp_spill_min: Option<usize> = None;
+    // Record a frame store of an argument register, updating the full-save flag
+    // (top register x7/q7 spilled) and the per-class lowest-spilled index. Only a
+    // register still holding its incoming caller value counts: a register reused
+    // to build a pointer field has been written (so it's in `regs`) and must be
+    // ignored, otherwise the `__gr_top`/`__vr_top` setup would skew the count.
+    fn note_arg_spill(
+        reg: &hexray_core::Register,
+        regs: &HashMap<String, RegVal>,
+        gp_full: &mut bool,
+        fp_full: &mut bool,
+        gp_min: &mut Option<usize>,
+        fp_min: &mut Option<usize>,
+    ) {
+        if regs.contains_key(&aarch64_canon_reg(reg.name())) {
+            return;
+        }
+        if let Some((idx, is_fp)) = aarch64_arg_register(reg.name()) {
+            if idx == 7 {
+                if is_fp {
+                    *fp_full = true;
+                } else {
+                    *gp_full = true;
+                }
+            }
+            let slot = if is_fp { fp_min } else { gp_min };
+            *slot = Some(slot.map_or(idx, |m| m.min(idx)));
+        }
+    }
     for block in cfg.blocks() {
         let mut regs: HashMap<String, RegVal> = HashMap::new();
         for inst in &block.instructions {
@@ -770,11 +807,14 @@ pub fn scan_aapcs_va_list(
                         // `str reg, [frame+disp]`.
                         (Some(Operand::Register(src)), Some(Operand::Memory(mem)), None) => {
                             if is_frame_base_memory(mem) {
-                                match aarch64_top_arg_register(src.name()) {
-                                    Some(true) => fp_full_save = true,
-                                    Some(false) => gp_full_save = true,
-                                    None => {}
-                                }
+                                note_arg_spill(
+                                    src,
+                                    &regs,
+                                    &mut gp_full_save,
+                                    &mut fp_full_save,
+                                    &mut gp_spill_min,
+                                    &mut fp_spill_min,
+                                );
                                 record(
                                     mem.displacement,
                                     src,
@@ -794,11 +834,14 @@ pub fn scan_aapcs_va_list(
                         ) => {
                             if is_frame_base_memory(mem) {
                                 for reg in [r1, r2] {
-                                    match aarch64_top_arg_register(reg.name()) {
-                                        Some(true) => fp_full_save = true,
-                                        Some(false) => gp_full_save = true,
-                                        None => {}
-                                    }
+                                    note_arg_spill(
+                                        reg,
+                                        &regs,
+                                        &mut gp_full_save,
+                                        &mut fp_full_save,
+                                        &mut gp_spill_min,
+                                        &mut fp_spill_min,
+                                    );
                                 }
                                 let stride = i64::from(r1.size / 8).max(1);
                                 record(
@@ -846,19 +889,29 @@ pub fn scan_aapcs_va_list(
         if gr_offs >= 0 && vr_offs >= 0 {
             continue;
         }
-        // `__gr_offs = -(area_size_in_regs) * 8` and the named count is
-        // `8 - area_size` ONLY when the save area is *full* (`[named..8)`, reaching
-        // x7). gcc -O2 compacts the area to the *consumed* vararg count, so a
-        // negative offset there encodes that, not the named count — in which case
-        // (or when compacted to `0`) record `None` and let observation decide,
-        // rather than mis-capping/fabricating parameters.
-        let named_gp = if gr_offs < 0 && gp_full_save {
-            Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
+        // `__gr_offs = -(area_size_in_regs) * 8`. For a *full* save (`[named..8)`,
+        // reaching x7) the named count inverts to `8 - area_size`. gcc -O2
+        // compacts the area to the *consumed* vararg count, so the offset no
+        // longer inverts — but the compacted area still spills the consumed
+        // varargs starting at `x[named]`, so the lowest spilled arg register
+        // (`*_spill_min`) gives the named count directly. When the area is
+        // compacted to `0` (class unused) there's nothing to spill and the count
+        // is left to observation (`None`).
+        let named_gp = if gr_offs < 0 {
+            if gp_full_save {
+                Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
+            } else {
+                gp_spill_min
+            }
         } else {
             None
         };
-        let named_fp = if vr_offs < 0 && fp_full_save {
-            Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
+        let named_fp = if vr_offs < 0 {
+            if fp_full_save {
+                Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
+            } else {
+                fp_spill_min
+            }
         } else {
             None
         };
@@ -8709,6 +8762,67 @@ mod tests {
             str_wzr(52),
         ]);
         assert_eq!(scan_aapcs_va_list(&both_zero), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_recovers_named_count_from_compacted_save_spill() {
+        // gcc -O2 compacts the save area to the *consumed* vararg count, so
+        // `__gr_offs` no longer inverts to the named count (here -8 ≠ a full
+        // save's -(8-named)*8). But the area still spills the consumed varargs
+        // starting at x[named], so the lowest *untouched* arg register spilled
+        // (here x1) gives named_gp = 1. The pointer-field setup reuses x9/x10
+        // (written first, so ignored) and x7 is NOT spilled (not a full save).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(1, 64, 72), // x1 (untouched) spilled into the compacted save area
+            add_sp(9, 0x110),
+            str_reg(9, 64, 24), // __stack (x9 written by add -> ignored as a spill)
+            add_sp(10, 0x110),
+            str_reg(10, 64, 32), // __gr_top
+            add_sp(11, 0xd0),
+            str_reg(11, 64, 40), // __vr_top
+            movn(0, 7),          // __gr_offs = -8 (1 reg saved, NOT a full save)
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0 (no FP varargs)
+        ]);
+        // named_gp from the spill (1), float count unknown/compact -> None.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
     }
 
     #[test]
