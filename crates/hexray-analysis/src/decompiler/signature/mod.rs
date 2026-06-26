@@ -616,15 +616,32 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                     if let Some(Operand::Register(dst)) = inst.operands.first() {
                         let name = aarch64_canon_reg(dst.name());
                         if let Some(Operand::Immediate(imm)) = inst.operands.get(1) {
-                            // aarch64 builds small negative immediates with MOVN
-                            // (`movn w, #k` -> `!k`); the disassembler surfaces
-                            // the raw MOVN operand, so resolve it here.
-                            let value = if inst.mnemonic.eq_ignore_ascii_case("movn") {
-                                !imm.value
+                            let mnemonic = inst.mnemonic.to_ascii_lowercase();
+                            if mnemonic == "movk" {
+                                // `movk reg, #k, lsl #s` overwrites the 16-bit
+                                // field at shift `s`, keeping the rest — used to
+                                // pack the two 32-bit offset fields into one
+                                // x register (`mov x8, #-56; movk x8, #.., lsl #32`).
+                                let shift = match inst.operands.get(2) {
+                                    Some(Operand::Immediate(s)) => (s.value as u32) & 63,
+                                    _ => 0,
+                                };
+                                let prev = match regs.get(&name) {
+                                    Some(RegVal::Imm(v)) => *v as u64,
+                                    _ => 0,
+                                };
+                                let field = (imm.value as u64 & 0xffff) << shift;
+                                let merged = (prev & !(0xffff_u64 << shift)) | field;
+                                regs.insert(name, RegVal::Imm(merged as i128));
                             } else {
-                                imm.value
-                            };
-                            regs.insert(name, RegVal::Imm(value));
+                                // `movn reg, #k` loads `!k`; `mov`/`movz` load `k`.
+                                let value = if mnemonic == "movn" {
+                                    !imm.value
+                                } else {
+                                    imm.value
+                                };
+                                regs.insert(name, RegVal::Imm(value));
+                            }
                         } else {
                             regs.remove(&name);
                         }
@@ -652,15 +669,28 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                 }
                 Operation::Store => {
                     let record = |off: i64,
-                                  reg: &str,
+                                  reg: &hexray_core::Register,
                                   consts: &mut HashMap<i64, i128>,
                                   ptrs: &mut HashSet<i64>| {
-                        match regs.get(&aarch64_canon_reg(reg)) {
-                            Some(RegVal::Imm(v)) => {
-                                consts.entry(off).or_insert(*v);
-                            }
+                        match regs.get(&aarch64_canon_reg(reg.name())) {
                             Some(RegVal::FrameAddr) => {
                                 ptrs.insert(off);
+                            }
+                            Some(RegVal::Imm(v)) => {
+                                if reg.size >= 64 {
+                                    // A 64-bit register may pack the two adjacent
+                                    // 32-bit offset fields (`mov`/`movk` then a
+                                    // 64-bit store): low half at `off`, high half
+                                    // at `off + 4`. (The tag-shape check below
+                                    // discards an incidental split.)
+                                    let bits = *v as u64;
+                                    consts.entry(off).or_insert((bits as u32) as i128);
+                                    consts
+                                        .entry(off + 4)
+                                        .or_insert(((bits >> 32) as u32) as i128);
+                                } else {
+                                    consts.entry(off).or_insert(*v);
+                                }
                             }
                             None => {}
                         }
@@ -675,7 +705,7 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                             if is_frame_base_memory(mem) {
                                 record(
                                     mem.displacement,
-                                    src.name(),
+                                    src,
                                     &mut const_stores,
                                     &mut pointer_offsets,
                                 );
@@ -684,8 +714,7 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                         // `stp r1, r2, [frame+disp]` — r1 at disp, r2 at the next
                         // element (optimized prologues initialise the tag this
                         // way). The element stride is the register width: 8 for
-                        // `stp x.., x..`, 4 for the 32-bit `stp w.., w..` that
-                        // packs the adjacent `__gr_offs`/`__vr_offs` fields.
+                        // `stp x.., x..`, 4 for the 32-bit `stp w.., w..`.
                         (
                             Some(Operand::Register(r1)),
                             Some(Operand::Register(r2)),
@@ -695,13 +724,13 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                                 let stride = i64::from(r1.size / 8).max(1);
                                 record(
                                     mem.displacement,
-                                    r1.name(),
+                                    r1,
                                     &mut const_stores,
                                     &mut pointer_offsets,
                                 );
                                 record(
                                     mem.displacement + stride,
-                                    r2.name(),
+                                    r2,
                                     &mut const_stores,
                                     &mut pointer_offsets,
                                 );
@@ -8485,6 +8514,41 @@ mod tests {
             stp_w(0, 1, 48),     // 32-bit pair: w0@48, w1@52
         ]);
         assert_eq!(scan_aapcs_va_list(&cfg2), Some((1, 0)));
+
+        // clang -O1/-O2 packs both 32-bit offset fields into one x register
+        // with `mov`+`movk` and stores it 64-bit wide.
+        let mov = |reg: u16, v: i128| {
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(aarch64_x(reg, 64)), Operand::imm(v, 64)],
+            )
+        };
+        let movk = |reg: u16, k: i128, shift: i128| {
+            (
+                "movk",
+                Operation::Move,
+                vec![
+                    Operand::Register(aarch64_x(reg, 64)),
+                    Operand::imm(k, 32),
+                    Operand::imm(shift, 8),
+                ],
+            )
+        };
+        // tag base 176: pointers@176/184/192, packed offsets in x11 stored at 200
+        // -> __gr_offs@200, __vr_offs@204. mov x11,#-56 then movk #0xff80,lsl#32
+        // gives 0xffffff80_ffffffc8 -> gr=-56 (named_gp=1), vr=-128 (named_fp=0).
+        let cfg3 = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x100),
+            add_sp(9, 0x100),
+            stp(8, 9, 176), // __stack@176, __gr_top@184
+            add_sp(10, 0x80),
+            str_reg(10, 64, 192), // __vr_top@192
+            mov(11, -56),
+            movk(11, 0xff80, 32),
+            str_reg(11, 64, 200), // packed -> gr@200, vr@204
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg3), Some((1, 0)));
     }
 
     #[test]
