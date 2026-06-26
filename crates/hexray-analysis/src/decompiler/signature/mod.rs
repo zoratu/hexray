@@ -585,6 +585,33 @@ fn aarch64_canon_reg(name: &str) -> String {
     lower
 }
 
+/// Whether `op` writes (defines) its first operand — used to conservatively
+/// clobber a register redefined by an operation the va_list scanner doesn't model
+/// (load, arithmetic, …), so a reloaded arg register isn't mistaken for an
+/// untouched incoming-argument spill. Read-only ops (compare/test/bit-test), ops
+/// whose first operand is a source (store/push), and control flow are excluded;
+/// everything else defaults to "writes" so unmodelled ops clobber conservatively.
+fn aarch64_op_writes_first_operand(op: Operation) -> bool {
+    !matches!(
+        op,
+        Operation::Store
+            | Operation::Push
+            | Operation::Compare
+            | Operation::Test
+            | Operation::BitTest
+            | Operation::Jump
+            | Operation::ConditionalJump
+            | Operation::Call
+            | Operation::Return
+            | Operation::Syscall
+            | Operation::Interrupt
+            | Operation::Nop
+            | Operation::Halt
+            | Operation::StoreExclusive
+            | Operation::SveStore
+    )
+}
+
 /// The frame-base class of `name`: `0` for the stack pointer (`sp`/`x31`), `1`
 /// for the frame pointer (`x29`/`fp`). These are distinct registers with
 /// distinct values, so displacements are only comparable within the same class.
@@ -652,6 +679,10 @@ pub fn scan_aapcs_va_list(
     enum RegVal {
         Imm(i128),
         FrameAddr { base: u8, disp: i64 },
+        // Written with an unknown/non-frame value (reg-to-reg move, load,
+        // arithmetic). Distinct from absent (untouched incoming arg) so a
+        // reloaded arg register isn't mistaken for a prologue spill.
+        Clobbered,
     }
     // Tag-field stores keyed by (base_class, slot) so a function mixing sp- and
     // x29-relative accesses can't assemble a spurious tag from stores against
@@ -761,7 +792,8 @@ pub fn scan_aapcs_va_list(
                                 regs.insert(name, RegVal::Imm(zext(raw)));
                             }
                         } else {
-                            regs.remove(&name);
+                            // Reg-to-reg move: written with an unknown value.
+                            regs.insert(name, RegVal::Clobbered);
                         }
                     }
                 }
@@ -790,7 +822,8 @@ pub fn scan_aapcs_va_list(
                         if let Some((base, disp)) = frame {
                             regs.insert(name, RegVal::FrameAddr { base, disp });
                         } else {
-                            regs.remove(&name);
+                            // Non-frame add result: written with an unknown value.
+                            regs.insert(name, RegVal::Clobbered);
                         }
                     }
                 }
@@ -832,7 +865,7 @@ pub fn scan_aapcs_va_list(
                                     consts.entry((store_base, off)).or_insert(v);
                                 }
                             }
-                            None => {}
+                            Some(RegVal::Clobbered) | None => {}
                         }
                     };
                     match (
@@ -913,7 +946,16 @@ pub fn scan_aapcs_va_list(
                         _ => {}
                     }
                 }
-                _ => {}
+                other => {
+                    // Any other operation that defines a register clobbers it, so a
+                    // reloaded/recomputed arg register (`ldr x7, …; str x7, …`)
+                    // isn't later mistaken for an untouched incoming-argument spill.
+                    if aarch64_op_writes_first_operand(other) {
+                        if let Some(Operand::Register(dst)) = inst.operands.first() {
+                            regs.insert(aarch64_canon_reg(dst.name()), RegVal::Clobbered);
+                        }
+                    }
+                }
             }
         }
     }
@@ -8972,6 +9014,75 @@ mod tests {
             str_at(1, 32, sp(), 52),
         ]);
         assert_eq!(scan_aapcs_va_list(&cfg), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_ignores_reloaded_arg_register_spill() {
+        // A reloaded arg register (`ldr x7, …; str x7, …`) must not be mistaken
+        // for an untouched incoming-argument spill: without clobbering, the x7
+        // store would set the full-save flag and invert __gr_offs = -8 to a bogus
+        // named_gp = 7 (codex P2). With clobbering it is ignored, so the compacted
+        // tag's GP count stays unknown (None).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let ldr = |reg: u16, slot: i64| {
+            (
+                "ldr",
+                Operation::Load,
+                vec![Operand::Register(x(reg, 64)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            ldr(7, 200),         // x7 reloaded from the stack (not an incoming arg)
+            str_reg(7, 64, 600), // ... then spilled — must NOT mark a full save
+            add_sp(9, 0x110),
+            str_reg(9, 64, 24),
+            add_sp(10, 0x110),
+            str_reg(10, 64, 32),
+            add_sp(11, 0xd0),
+            str_reg(11, 64, 40),
+            movn(0, 7), // __gr_offs = -8 (compacted, not a full save)
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0
+        ]);
+        // x7 was clobbered, so no full save and no in-area spill -> GP count
+        // unknown; tag still valid (negative __gr_offs) -> Some((None, None)).
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
     }
 
     #[test]
