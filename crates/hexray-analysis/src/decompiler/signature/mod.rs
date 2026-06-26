@@ -174,6 +174,16 @@ pub struct SignatureRecovery {
     /// diamonds (deleting the `fp_offset` store the structured-body resolver
     /// reads). See [`scan_sysv_va_list_named_float_count`].
     va_list_float_count_seed: Option<usize>,
+    /// aarch64 AAPCS variadic counts recovered from the `__va_list` tag in the
+    /// prologue (see [`scan_aapcs_va_list`]): `Some((named_gp, named_fp))` marks
+    /// the function variadic and caps the recovered integer/float parameters so
+    /// the GP/SIMD register-save area isn't surfaced. Each count is itself an
+    /// `Option`: `None` when gcc compacted that save area (the matching
+    /// `__gr_offs`/`__vr_offs` is `0` because that varargs class isn't
+    /// consumed), in which case those parameters are left to ordinary
+    /// observation rather than capped from a meaningless offset. `Some` overall
+    /// requires at least one canonical (negative) offset so the tag is genuine.
+    aapcs_va_list_counts: Option<(Option<usize>, Option<usize>)>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -557,6 +567,538 @@ pub fn scan_sysv_va_list_named_float_count(
         }
         if pointer_offsets.contains(&(base + 8)) && pointer_offsets.contains(&(base + 16)) {
             return usize::try_from((fp - 48) / 16).ok();
+        }
+    }
+    None
+}
+
+/// Canonicalize an aarch64 GP register name to its 64-bit form: `w{n}` and
+/// `x{n}` alias the same physical register, so the `mov w0, …; str x0, …`
+/// sequences that build the va_list tag must be tracked as one register.
+fn aarch64_canon_reg(name: &str) -> String {
+    let lower = name.to_lowercase();
+    // GP alias `w{n}` -> `x{n}`.
+    if let Some(num) = lower.strip_prefix('w') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            return format!("x{num}");
+        }
+    }
+    // FP/SIMD aliases `q/d/s/h/b{n}` all name the same physical register `v{n}`,
+    // so canonicalize them together (a `str q5` and a clobber of `v5` must match).
+    for prefix in ['q', 'd', 's', 'h', 'b'] {
+        if let Some(num) = lower.strip_prefix(prefix) {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                return format!("v{num}");
+            }
+        }
+    }
+    lower
+}
+
+/// Whether `op` writes (defines) its first operand — used to conservatively
+/// clobber a register redefined by an operation the va_list scanner doesn't model
+/// (load, arithmetic, …), so a reloaded arg register isn't mistaken for an
+/// untouched incoming-argument spill. Read-only ops (compare/test/bit-test), ops
+/// whose first operand is a source (store/push), and control flow are excluded;
+/// everything else defaults to "writes" so unmodelled ops clobber conservatively.
+fn aarch64_op_writes_first_operand(op: Operation) -> bool {
+    !matches!(
+        op,
+        Operation::Store
+            | Operation::Push
+            | Operation::Compare
+            | Operation::Test
+            | Operation::BitTest
+            | Operation::Jump
+            | Operation::ConditionalJump
+            | Operation::Call
+            | Operation::Return
+            | Operation::Syscall
+            | Operation::Interrupt
+            | Operation::Nop
+            | Operation::Halt
+            | Operation::StoreExclusive
+            | Operation::SveStore
+    )
+}
+
+/// The frame-base class of `name`: `0` for the stack pointer (`sp`/`x31`), `1`
+/// for the frame pointer (`x29`/`fp`). These are distinct registers with
+/// distinct values, so displacements are only comparable within the same class.
+fn aarch64_frame_base_class(name: &str) -> Option<u8> {
+    match name.to_lowercase().as_str() {
+        "sp" | "x31" => Some(0),
+        "x29" | "fp" => Some(1),
+        _ => None,
+    }
+}
+
+/// If `name` is an argument register (index 0..=7) of its class, returns
+/// `Some((index, is_fp))`: `is_fp` is `true` for the FP/SIMD `v`/`q`/`d`/`s`/`h`
+/// bank, `false` for the GP `x`/`w` bank.
+///
+/// Used two ways when scanning a `va_start` register-save area: index 7 marks a
+/// *full* `[named..8)` save (the area reaches register 7), which validates the
+/// `8 - (-offset)/N` count formula; and the *lowest* incoming arg register
+/// spilled into a compacted save area equals the named count (gcc -O2 spills the
+/// consumed varargs starting at `x[named]`).
+fn aarch64_arg_register(name: &str) -> Option<(usize, bool)> {
+    let lower = name.to_lowercase();
+    let (class, num) = lower.split_at(1);
+    let idx: usize = num.parse().ok()?;
+    if idx > 7 {
+        return None;
+    }
+    match class {
+        "x" | "w" => Some((idx, false)),
+        "v" | "q" | "d" | "s" | "h" => Some((idx, true)),
+        _ => None,
+    }
+}
+
+/// Scan the prologue for the aarch64 AAPCS `__va_list` tag and recover the
+/// named (non-variadic) GP and FP/SIMD parameter counts as `(named_gp,
+/// named_fp)`. Returns `None` for a non-variadic function (no tag found). Each
+/// count is itself an `Option`: `Some(n)` only when that register-save area is a
+/// *full* `[named..8)` save (its top register x7/q7 is spilled); `None` when the
+/// area is compacted — gcc compacts it either to `0` (class unused) or, at -O2,
+/// to the *consumed* vararg count (which the formula would misread). A compacted
+/// count is left to observation rather than capped/fabricated. `Some` overall
+/// requires at least one canonical (negative) offset.
+///
+/// The 32-byte tag is `{ void* __stack; void* __gr_top; void* __vr_top;
+/// int __gr_offs; int __vr_offs; }`. `va_start` initialises
+/// `__gr_offs = -(area_regs) * 8` and `__vr_offs = -(area_regs) * 16`. For a full
+/// save `area_regs = 8 - named`, so `named_gp = 8 - (-__gr_offs)/8` and
+/// `named_fp = 8 - (-__vr_offs)/16`; for a compacted save the offset encodes the
+/// consumed count instead, so it can't be inverted to a named count.
+///
+/// Unlike the SysV tag, the offset fields are materialised via a register
+/// (`movn w, #k` loads the negative `!k`; `str w, [slot]`) and the pointers via
+/// `add x, sp, #N; str x, [slot]`, so this tracks simple per-block register
+/// values. The full tag shape (three frame-pointer fields + the two offset
+/// fields at the right relative positions) is required so an unrelated constant
+/// can't be mistaken for the tag.
+pub fn scan_aapcs_va_list(
+    cfg: &ControlFlowGraph,
+) -> Option<(Option<usize>, Option<usize>)> {
+    // A frame address carries its base class (0 = sp/x31, 1 = x29/fp — distinct
+    // registers with distinct values) and displacement, so save-area spills and
+    // the `__gr_top`/`__vr_top` pointers can be compared in the same coordinate.
+    #[derive(Clone, Copy)]
+    enum RegVal {
+        Imm(i128),
+        FrameAddr { base: u8, disp: i64 },
+        // Written with an unknown/non-frame value (reg-to-reg move, load,
+        // arithmetic). Distinct from absent (untouched incoming arg) so a
+        // reloaded arg register isn't mistaken for a prologue spill.
+        Clobbered,
+    }
+    // Tag-field stores keyed by (base_class, slot) so a function mixing sp- and
+    // x29-relative accesses can't assemble a spurious tag from stores against
+    // different bases — all five tag fields must share one frame base.
+    let mut const_stores: HashMap<(u8, i64), i128> = HashMap::new();
+    let mut pointer_offsets: HashSet<(u8, i64)> = HashSet::new();
+    // Frame-pointer fields keyed by (base_class, slot) -> the (base, disp) they
+    // hold (e.g. `__gr_top`/`__vr_top` point just past their save areas).
+    let mut pointer_targets: HashMap<(u8, i64), (u8, i64)> = HashMap::new();
+    // Save-area observations accumulated across the prologue: (base_class, slot,
+    // arg_register_index) for each incoming arg register stored to a frame slot.
+    // Bounded to the actual save area in the decode (so an address-taken named
+    // param's home spill, or an unrelated x7/v7 spill, isn't counted). Within the
+    // bounded area the lowest index is the named count, and a present index 7
+    // means the save is full (`[named..8)`), validating the offset → count
+    // inversion.
+    #[derive(Default)]
+    struct SaveAreaScan {
+        gp_spills: Vec<(u8, i64, usize)>,
+        fp_spills: Vec<(u8, i64, usize)>,
+    }
+    let mut save_area = SaveAreaScan::default();
+    // Record a frame store of an argument register as a spill candidate. Only a
+    // register still holding its incoming caller value counts — a register reused
+    // to build a pointer field has been written (so it's in `regs`) and is ignored.
+    fn note_arg_spill(
+        reg: &hexray_core::Register,
+        base_class: Option<u8>,
+        slot: i64,
+        regs: &HashMap<String, RegVal>,
+        scan: &mut SaveAreaScan,
+    ) {
+        let Some(base_class) = base_class else { return };
+        if regs.contains_key(&aarch64_canon_reg(reg.name())) {
+            return;
+        }
+        if let Some((idx, is_fp)) = aarch64_arg_register(reg.name()) {
+            let spills = if is_fp {
+                &mut scan.fp_spills
+            } else {
+                &mut scan.gp_spills
+            };
+            spills.push((base_class, slot, idx));
+        }
+    }
+    // Register state is carried forward across blocks (in iteration order) rather
+    // than reset per block: a redefinition/clobber in a predecessor must persist so
+    // a later store of that register isn't mistaken for an untouched incoming-arg
+    // spill (a post-call/post-load store), while an incoming arg register that is
+    // never redefined stays trackable into a split-prologue successor (e.g. a
+    // stack-protector branch) where its genuine save-area spill still occurs.
+    let mut regs: HashMap<String, RegVal> = HashMap::new();
+    for block in cfg.blocks() {
+        for inst in &block.instructions {
+            match inst.operation {
+                Operation::Move => {
+                    if let Some(Operand::Register(dst)) = inst.operands.first() {
+                        let name = aarch64_canon_reg(dst.name());
+                        if let Some(Operand::Immediate(imm)) = inst.operands.get(1) {
+                            let mnemonic = inst.mnemonic.to_ascii_lowercase();
+                            // A 32-bit (`wN`) write zero-extends into the full X
+                            // register, so the high 32 bits become 0. Mask the
+                            // recorded value accordingly; otherwise a later 64-bit
+                            // `str xN` would split the high half as 0xffffffff
+                            // instead of 0 and reject valid packed forms such as
+                            // `movn w,#55` (gr_offs=-56) + `str x` (vr_offs=0).
+                            let zext = |raw: i128| -> i128 {
+                                if dst.size <= 32 {
+                                    (raw as u64 & 0xffff_ffff) as i128
+                                } else {
+                                    raw
+                                }
+                            };
+                            if mnemonic == "movk" {
+                                // `movk reg, #k, lsl #s` overwrites the 16-bit
+                                // field at shift `s`, keeping the rest — used to
+                                // pack the two 32-bit offset fields into one
+                                // x register (`mov x8, #-56; movk x8, #.., lsl #32`).
+                                // hexray decodes this as three operands —
+                                // `[dst, Immediate(k, 16), Immediate(s, 8)]` — so
+                                // the `lsl` amount is operand 2 (verified against
+                                // a real clang -O2 binary). There is no duplicated
+                                // immediate operand.
+                                let shift = match inst.operands.get(2) {
+                                    Some(Operand::Immediate(s)) => (s.value as u32) & 63,
+                                    _ => 0,
+                                };
+                                let prev = match regs.get(&name) {
+                                    Some(RegVal::Imm(v)) => *v as u64,
+                                    _ => 0,
+                                };
+                                let field = (imm.value as u64 & 0xffff) << shift;
+                                let merged = (prev & !(0xffff_u64 << shift)) | field;
+                                regs.insert(name, RegVal::Imm(zext(merged as i128)));
+                            } else {
+                                // `movn reg, #k` loads `!k`; `mov`/`movz` load `k`.
+                                let raw = if mnemonic == "movn" {
+                                    !imm.value
+                                } else {
+                                    imm.value
+                                };
+                                regs.insert(name, RegVal::Imm(zext(raw)));
+                            }
+                        } else if let Some(Operand::Register(src)) = inst.operands.get(1) {
+                            // Reg-to-reg move: `mov x9, sp` (clang materialises a
+                            // tag pointer this way before `add x9, x9, #imm`) copies
+                            // a frame address; propagate it. Otherwise the value is
+                            // unknown -> clobbered.
+                            let copied = if let Some(class) = aarch64_frame_base_class(src.name())
+                            {
+                                RegVal::FrameAddr {
+                                    base: class,
+                                    disp: 0,
+                                }
+                            } else {
+                                match regs.get(&aarch64_canon_reg(src.name())) {
+                                    Some(&fa @ RegVal::FrameAddr { .. }) => fa,
+                                    _ => RegVal::Clobbered,
+                                }
+                            };
+                            regs.insert(name, copied);
+                        } else {
+                            regs.insert(name, RegVal::Clobbered);
+                        }
+                    }
+                }
+                Operation::Add | Operation::Sub => {
+                    if let (Some(Operand::Register(dst)), Some(Operand::Register(base))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    {
+                        let name = aarch64_canon_reg(dst.name());
+                        // Only a `frame_base ± immediate` (or no offset) yields a
+                        // static frame address; a register-offset `add x8, sp, x0`
+                        // is a dynamic value and must clobber, not record `sp + 0`.
+                        // `sub` (e.g. `sub x8, x29, #imm` for slots below the frame
+                        // pointer) subtracts the displacement.
+                        let sign = if inst.operation == Operation::Sub { -1 } else { 1 };
+                        let imm = match inst.operands.get(2) {
+                            Some(Operand::Immediate(i)) => Some(sign * i.value as i64),
+                            None => Some(0),
+                            Some(_) => None,
+                        };
+                        // The result is a frame address when `base` is a frame
+                        // register OR already holds one — so chained
+                        // `add x8, sp, #32; add x8, x8, #112` (clang) propagates,
+                        // accumulating the displacement.
+                        let frame = imm.and_then(|imm| {
+                            if let Some(class) = aarch64_frame_base_class(base.name()) {
+                                Some((class, imm))
+                            } else if let Some(RegVal::FrameAddr { base: b, disp }) =
+                                regs.get(&aarch64_canon_reg(base.name()))
+                            {
+                                Some((*b, *disp + imm))
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some((base, disp)) = frame {
+                            regs.insert(name, RegVal::FrameAddr { base, disp });
+                        } else {
+                            // Non-frame / dynamic add result: unknown value.
+                            regs.insert(name, RegVal::Clobbered);
+                        }
+                    }
+                }
+                Operation::Store => {
+                    let record = |store_base: u8,
+                                  off: i64,
+                                  reg: &hexray_core::Register,
+                                  consts: &mut HashMap<(u8, i64), i128>,
+                                  ptrs: &mut HashSet<(u8, i64)>,
+                                  targets: &mut HashMap<(u8, i64), (u8, i64)>| {
+                        let canon = aarch64_canon_reg(reg.name());
+                        // The zero register (`wzr`/`xzr`) is never a `mov` target,
+                        // so it isn't in `regs`; treat it as a literal 0. gcc -O2
+                        // stores the compacted `__vr_offs == 0` directly with it
+                        // (`str wzr` / `stp …, wzr`).
+                        let value = if canon == "wzr" || canon == "xzr" {
+                            Some(RegVal::Imm(0))
+                        } else {
+                            regs.get(&canon).copied()
+                        };
+                        match value {
+                            Some(RegVal::FrameAddr { base, disp }) => {
+                                ptrs.insert((store_base, off));
+                                targets.insert((store_base, off), (base, disp));
+                            }
+                            Some(RegVal::Imm(v)) => {
+                                if reg.size >= 64 {
+                                    // A 64-bit register may pack the two adjacent
+                                    // 32-bit offset fields (`mov`/`movk` then a
+                                    // 64-bit store): low half at `off`, high half
+                                    // at `off + 4`. (The tag-shape check below
+                                    // discards an incidental split.)
+                                    let bits = v as u64;
+                                    consts.entry((store_base, off)).or_insert((bits as u32) as i128);
+                                    consts
+                                        .entry((store_base, off + 4))
+                                        .or_insert(((bits >> 32) as u32) as i128);
+                                } else {
+                                    consts.entry((store_base, off)).or_insert(v);
+                                }
+                            }
+                            Some(RegVal::Clobbered) | None => {}
+                        }
+                    };
+                    match (
+                        inst.operands.first(),
+                        inst.operands.get(1),
+                        inst.operands.get(2),
+                    ) {
+                        // `str reg, [frame+disp]`.
+                        (Some(Operand::Register(src)), Some(Operand::Memory(mem)), None) => {
+                            if is_frame_base_memory(mem) {
+                                let base_class = mem
+                                    .base
+                                    .as_ref()
+                                    .and_then(|r| aarch64_frame_base_class(r.name()));
+                                note_arg_spill(
+                                    src,
+                                    base_class,
+                                    mem.displacement,
+                                    &regs,
+                                    &mut save_area,
+                                );
+                                if let Some(bc) = base_class {
+                                    record(
+                                        bc,
+                                        mem.displacement,
+                                        src,
+                                        &mut const_stores,
+                                        &mut pointer_offsets,
+                                        &mut pointer_targets,
+                                    );
+                                }
+                            }
+                        }
+                        // `stp r1, r2, [frame+disp]` — r1 at disp, r2 at the next
+                        // element (optimized prologues initialise the tag this
+                        // way). The element stride is the register width: 8 for
+                        // `stp x.., x..`, 4 for the 32-bit `stp w.., w..`.
+                        (
+                            Some(Operand::Register(r1)),
+                            Some(Operand::Register(r2)),
+                            Some(Operand::Memory(mem)),
+                        ) => {
+                            if is_frame_base_memory(mem) {
+                                let base_class = mem
+                                    .base
+                                    .as_ref()
+                                    .and_then(|r| aarch64_frame_base_class(r.name()));
+                                let stride = i64::from(r1.size / 8).max(1);
+                                for (i, reg) in [r1, r2].into_iter().enumerate() {
+                                    note_arg_spill(
+                                        reg,
+                                        base_class,
+                                        mem.displacement + stride * i as i64,
+                                        &regs,
+                                        &mut save_area,
+                                    );
+                                }
+                                if let Some(bc) = base_class {
+                                    record(
+                                        bc,
+                                        mem.displacement,
+                                        r1,
+                                        &mut const_stores,
+                                        &mut pointer_offsets,
+                                        &mut pointer_targets,
+                                    );
+                                    record(
+                                        bc,
+                                        mem.displacement + stride,
+                                        r2,
+                                        &mut const_stores,
+                                        &mut pointer_offsets,
+                                        &mut pointer_targets,
+                                    );
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Operation::Call | Operation::Syscall => {
+                    // Caller-saved registers don't survive a call: x0..x18 (args +
+                    // scratch x8..x18, which the scanner uses to build tag pointers)
+                    // and the v0..v7 FP arg/scratch bank. Clobber them so a stale
+                    // pre-call FrameAddr or a post-call store isn't read as a tag
+                    // pointer field or an incoming-argument spill.
+                    for i in 0..=18 {
+                        regs.insert(format!("x{i}"), RegVal::Clobbered);
+                    }
+                    for i in 0..8 {
+                        regs.insert(format!("v{i}"), RegVal::Clobbered);
+                    }
+                }
+                other => {
+                    // Any other operation that defines a register clobbers it, so a
+                    // reloaded/recomputed arg register (`ldr x7, …; str x7, …`)
+                    // isn't later mistaken for an untouched incoming-argument spill.
+                    if aarch64_op_writes_first_operand(other) {
+                        if matches!(other, Operation::Load | Operation::LoadExclusive) {
+                            // Multi-destination loads (`ldp x6, x7, [mem]`) write
+                            // every leading register operand; clobber them all up to
+                            // the address operand.
+                            for op in &inst.operands {
+                                let Operand::Register(dst) = op else { break };
+                                regs.insert(aarch64_canon_reg(dst.name()), RegVal::Clobbered);
+                            }
+                        } else if let Some(Operand::Register(dst)) = inst.operands.first() {
+                            regs.insert(aarch64_canon_reg(dst.name()), RegVal::Clobbered);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // 32-bit offset fields may arrive sign-extended or as a raw u32; normalize.
+    let as_i32 = |v: i128| -> i128 { (v as i32) as i128 };
+    let mut gr_slots: Vec<(u8, i64)> = const_stores.keys().copied().collect();
+    gr_slots.sort_unstable();
+    for (frame_base, gr_slot) in gr_slots {
+        let base = gr_slot - 24; // __gr_offs sits at tag base + 24
+        let gr_offs = as_i32(*const_stores.get(&(frame_base, gr_slot))?);
+        let Some(&vr_raw) = const_stores.get(&(frame_base, base + 28)) else {
+            continue;
+        };
+        let vr_offs = as_i32(vr_raw);
+        // An offset field is either a canonical negative value (`%8`/`%16`) or the
+        // compacted `0` gcc writes via `wzr` when that varargs class is unused.
+        // Anything else means this isn't the tag.
+        let gr_is_offset = gr_offs == 0 || ((-64..0).contains(&gr_offs) && gr_offs % 8 == 0);
+        let vr_is_offset = vr_offs == 0 || ((-128..0).contains(&vr_offs) && vr_offs % 16 == 0);
+        if !gr_is_offset || !vr_is_offset {
+            continue;
+        }
+        // Require at least one canonical (negative) offset as the variadic anchor.
+        // Both offsets `0` is only produced by the rare case of 8 named GP args
+        // with stack-only varargs and no FP use — and in that case the save area
+        // is fully compacted, so there is *no* register-save-area spill to
+        // corroborate. With no distinguishing evidence, two zero words following
+        // three frame-pointer stores are indistinguishable from an ordinary local
+        // layout; accepting them would mark non-variadic functions variadic. The
+        // false positive is worse than missing that rare signature, so decline.
+        if gr_offs >= 0 && vr_offs >= 0 {
+            continue;
+        }
+        // Recover the named count from the arg-register spills that land *inside*
+        // the save area `[top + offs, top)` (`top` = `__gr_top`/`__vr_top`, `offs`
+        // the negative offset). Bounding to that range excludes an address-taken
+        // named param's home spill and any unrelated x7/v7 spill elsewhere in the
+        // frame. If the area reaches register 7 it's a *full* `[named..8)` save and
+        // the count inverts from the area size (`8 - area_regs`, robust to a missed
+        // spill); otherwise (gcc -O2 compaction) the lowest in-area index is the
+        // named count. No in-area spill (or `offs == 0`, class unused) -> unknown.
+        let named_from_save_area = |spills: &[(u8, i64, usize)],
+                                    top: Option<&(u8, i64)>,
+                                    offs: i128,
+                                    reg_bytes: i128|
+         -> Option<usize> {
+            let &(top_base, top_disp) = top?;
+            let lo = top_disp + offs as i64;
+            let mut in_area = spills
+                .iter()
+                .filter(|&&(b, slot, _)| b == top_base && (lo..top_disp).contains(&slot))
+                .map(|&(_, _, idx)| idx)
+                .peekable();
+            in_area.peek()?;
+            if in_area.clone().any(|idx| idx == 7) {
+                8usize.checked_sub(usize::try_from(-offs / reg_bytes).ok()?)
+            } else {
+                in_area.min()
+            }
+        };
+        let named_gp = if gr_offs < 0 {
+            named_from_save_area(
+                &save_area.gp_spills,
+                pointer_targets.get(&(frame_base, base + 8)),
+                gr_offs,
+                8,
+            )
+        } else {
+            None
+        };
+        let named_fp = if vr_offs < 0 {
+            named_from_save_area(
+                &save_area.fp_spills,
+                pointer_targets.get(&(frame_base, base + 16)),
+                vr_offs,
+                16,
+            )
+        } else {
+            None
+        };
+        // `__stack` (base) is always written. A class's top pointer
+        // (`__gr_top`@+8 / `__vr_top`@+16) is only emitted when that class has a
+        // live register-save area; when its offset is the compacted `0` (class
+        // fully consumed / unused) clang omits the store, so require it only for
+        // an active (negative-offset) class. Combined with the negative-offset
+        // anchor above, this still needs two frame pointers at the right slots.
+        let stack_ok = pointer_offsets.contains(&(frame_base, base));
+        let gr_top_ok = gr_offs == 0 || pointer_offsets.contains(&(frame_base, base + 8));
+        let vr_top_ok = vr_offs == 0 || pointer_offsets.contains(&(frame_base, base + 16));
+        if stack_ok && gr_top_ok && vr_top_ok {
+            return Some((named_gp, named_fp));
         }
     }
     None
@@ -1070,6 +1612,7 @@ impl SignatureRecovery {
             invalidated_spill_offsets: HashSet::new(),
             param_spill_order: Vec::new(),
             va_list_float_count_seed: None,
+            aapcs_va_list_counts: None,
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -1136,6 +1679,15 @@ impl SignatureRecovery {
     /// recovery ran.
     pub fn with_va_list_float_count_seed(mut self, count: Option<usize>) -> Self {
         self.va_list_float_count_seed = count;
+        self
+    }
+
+    /// Seeds the aarch64 AAPCS variadic counts (see [`scan_aapcs_va_list`]).
+    pub fn with_aapcs_va_list_counts(
+        mut self,
+        counts: Option<(Option<usize>, Option<usize>)>,
+    ) -> Self {
+        self.aapcs_va_list_counts = counts;
         self
     }
 
@@ -4894,15 +5446,23 @@ impl SignatureRecovery {
         used_args.sort_unstable();
 
         let variadic_fixed_param_count = self.infer_variadic_fixed_param_count(&used_args);
+        // When the aarch64 GP count is unknown (`named_gp == None`: a compacted
+        // gcc -O2 save area, or no GP varargs), we can neither cap nor materialise
+        // a contiguous `0..N` prefix without fabricating bogus x0..x7 params — mark
+        // variadic and keep exactly the observed int args. A full save
+        // (`named_gp == Some`) caps/fills normally below.
+        let aapcs_uncapped_gp = matches!(self.aapcs_va_list_counts, Some((None, _)));
         if let Some(fixed_count) = variadic_fixed_param_count {
             sig.is_variadic = true;
-            used_args.retain(|idx| *idx < fixed_count);
-            for idx in 0..fixed_count.min(int_regs.len()) {
-                if !used_args.contains(&idx) {
-                    used_args.push(idx);
+            if !aapcs_uncapped_gp {
+                used_args.retain(|idx| *idx < fixed_count);
+                for idx in 0..fixed_count.min(int_regs.len()) {
+                    if !used_args.contains(&idx) {
+                        used_args.push(idx);
+                    }
                 }
+                used_args.sort_unstable();
             }
-            used_args.sort_unstable();
         }
 
         // Create parameters only for registers that were actually used
@@ -5059,25 +5619,42 @@ impl SignatureRecovery {
         // back to the integer fixed-count only when `fp_offset` wasn't seen
         // (e.g. the structurer already collapsed the diamond) to avoid
         // regressing the pre-existing behaviour there.
-        let float_param_cutoff = variadic_fixed_param_count.map(|int_fixed| {
-            // Prefer the structured-body __va_list_tag resolver; fall back to
-            // the raw-prologue seed when the va_arg diamonds were already
-            // collapsed (which deletes the fp_offset store the resolver reads);
-            // only then fall back to the integer prefix.
-            self.resolve_sysv_named_float_count()
-                .or(self.va_list_float_count_seed)
-                .unwrap_or(int_fixed)
-        });
+        let float_param_cutoff: Option<usize> = if let Some((_, named_fp)) =
+            self.aapcs_va_list_counts
+        {
+            // aarch64 AAPCS: `__vr_offs` gives the named float count only for a
+            // *full* FP save area (`named_fp == Some`); `None` (compacted gcc -O2,
+            // where the offset would encode the consumed count, or no FP varargs)
+            // means don't cap — let ordinary float-arg observation decide. (gcc
+            // -O2 compaction would otherwise misread e.g. `__vr_offs = -16` as 7
+            // named floats and leak q0..q6.)
+            named_fp
+        } else {
+            variadic_fixed_param_count.map(|int_fixed| {
+                // SysV: prefer the structured-body __va_list_tag resolver; fall
+                // back to the raw-prologue seed when the va_arg diamonds were
+                // already collapsed (which deletes the fp_offset store the
+                // resolver reads); only then fall back to the integer prefix.
+                self.resolve_sysv_named_float_count()
+                    .or(self.va_list_float_count_seed)
+                    .unwrap_or(int_fixed)
+            })
+        };
+        // A known AAPCS named-float count materializes farg0..farg{n-1} even when
+        // a register is never read in the body — symmetric with the GP prefix
+        // fill — so e.g. `double f(double d, ...)` keeps its fixed `d` parameter.
+        let aapcs_named_fp = self.aapcs_va_list_counts.and_then(|(_, fp)| fp);
         for (idx, reg) in float_regs.iter().enumerate() {
             if float_param_cutoff.is_some_and(|cutoff| idx >= cutoff) {
                 continue;
             }
             let reg_lower = reg.to_lowercase();
+            let forced_named_fp = aapcs_named_fp.is_some_and(|n| idx < n);
             let seen_as_param = self.read_regs.contains(&reg_lower)
                 || self.observed_float_arg_regs.contains(&reg_lower)
                 || (integer_simd_signature && idx == 0);
-            if seen_as_param {
-                if integer_simd_signature {
+            if seen_as_param || forced_named_fp {
+                if integer_simd_signature && seen_as_param {
                     sig.parameters.push(Parameter::new(
                         format!("arg{}", idx),
                         ParamType::SimdInt128,
@@ -5740,6 +6317,17 @@ impl SignatureRecovery {
     }
 
     fn infer_variadic_fixed_param_count(&self, used_args: &[usize]) -> Option<usize> {
+        // aarch64 AAPCS: a `__va_list` tag marks the function variadic. The named
+        // GP count is recoverable only from a *full* register-save area
+        // (`named_gp == Some`); when it's `None` (compacted/gcc -O2, or no GP
+        // varargs) `build_signature` skips the cap/fabrication (see
+        // `aapcs_uncapped_gp`) and keeps the observed args — the marker value
+        // returned here is unused in that case.
+        if let Some((named_gp, _)) = self.aapcs_va_list_counts {
+            return Some(named_gp.unwrap_or_else(|| {
+                used_args.iter().copied().max().map_or(0, |m| m + 1)
+            }));
+        }
         if !self.has_sysv_va_list_materialization() {
             return None;
         }
@@ -6100,6 +6688,38 @@ mod tests {
         }
         block.terminator = BlockTerminator::Return;
         cfg.add_block(block);
+        cfg
+    }
+
+    /// Build a two-block aarch64 CFG (block 0 falls through to block 1), so tests
+    /// can model a prologue split across blocks (e.g. a stack-protector branch).
+    fn aarch64_two_block_cfg(
+        block0: Vec<(&str, Operation, Vec<Operand>)>,
+        block1: Vec<(&str, Operation, Vec<Operand>)>,
+    ) -> ControlFlowGraph {
+        use hexray_core::{BasicBlock, BlockTerminator, Instruction};
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut addr = 0x1000u64;
+        for (idx, insts) in [block0, block1].into_iter().enumerate() {
+            let idx = idx as u32;
+            let mut block = BasicBlock::new(BasicBlockId::new(idx), addr);
+            for (mnemonic, op, operands) in insts {
+                block.instructions.push(
+                    Instruction::new(addr, 4, vec![], mnemonic)
+                        .with_operation(op)
+                        .with_operands(operands),
+                );
+                addr += 4;
+            }
+            block.terminator = if idx == 0 {
+                BlockTerminator::Fallthrough {
+                    target: BasicBlockId::new(1),
+                }
+            } else {
+                BlockTerminator::Return
+            };
+            cfg.add_block(block);
+        }
         cfg
     }
 
@@ -8128,6 +8748,1047 @@ mod tests {
             scan_sysv_va_list_named_float_count(&tag(48), CallingConvention::Win64),
             None
         );
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_recovers_named_gp_and_fp_counts() {
+        let sp = || aarch64_x(31, 64);
+        let x0 = || aarch64_x(0, 64);
+        let w0 = || aarch64_x(0, 32);
+        let add_frame = |imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x0()),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_x0 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x0()), aarch64_mem(sp(), slot)],
+            )
+        };
+        let str_w0 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(w0()), aarch64_mem(sp(), slot)],
+            )
+        };
+        // `movn w0, #k` loads `!k`; e.g. `__gr_offs = -56` is `movn w0, #55`.
+        let movn_w0 = |k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(w0()), Operand::imm(k, 32)],
+            )
+        };
+        // Full-save markers: spilling the top arg registers x7 / v7 signals the
+        // save area reaches register 7, so the offset → count formula applies.
+        let str_x7 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_x(7, 64)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let str_v7 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(aarch64_x(hexray_core::register::arm64::V7, 128)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        // __va_list tag at base 24: __stack@24, __gr_top@32, __vr_top@40,
+        // __gr_offs@48, __vr_offs@52.
+        let tag = |gr_k: i128, vr_k: i128| {
+            aarch64_single_block_cfg(vec![
+                // x7/v7 spilled INSIDE their save areas ([216,272) and [80,208)
+                // for these offsets) so the full-save inversion applies.
+                str_x7(264),
+                str_v7(192),
+                add_frame(0x110),
+                str_x0(24),
+                add_frame(0x110),
+                str_x0(32),
+                add_frame(0xd0),
+                str_x0(40),
+                movn_w0(gr_k),
+                str_w0(48),
+                movn_w0(vr_k),
+                str_w0(52),
+            ])
+        };
+        // movn #55 -> gr_offs=-56 -> named_gp=1; movn #127 -> vr_offs=-128 -> 0.
+        assert_eq!(scan_aapcs_va_list(&tag(55, 127)), Some((Some(1), Some(0))));
+        // 2 named GP, 1 named FP: gr_offs=-48 (movn #47), vr_offs=-112 (movn #111).
+        assert_eq!(scan_aapcs_va_list(&tag(47, 111)), Some((Some(2), Some(1))));
+        // Missing the pointer fields -> not a tag.
+        let no_ptrs =
+            aarch64_single_block_cfg(vec![movn_w0(55), str_w0(48), movn_w0(127), str_w0(52)]);
+        assert_eq!(scan_aapcs_va_list(&no_ptrs), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_treats_compact_vr_offs_zero_as_unknown_float_count() {
+        // gcc -O2 writes __vr_offs = 0 (`stp …, wzr`) for a compacted FP save
+        // area when no FP varargs are consumed (`int f(int, ...)`). The function
+        // is still variadic (named_gp from __gr_offs), but the float count is
+        // unknown -> `None`, NOT 8 (which would fabricate parameters, codex P1).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let stp = |r1: u16, r2: u16, slot: i64| {
+            (
+                "stp",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(r1, 64)),
+                    Operand::Register(x(r2, 64)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        // wzr is the 32-bit zero register (id arm64::XZR = 32), never a `mov`
+        // target.
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        // Full tag shape but __vr_offs written directly with `str wzr` (== 0).
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 264), // x7 in-area ([216,272)) -> full GP save
+            add_sp(8, 0x110),
+            add_sp(9, 0x110),
+            stp(8, 9, 24),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 55), // __gr_offs = -56 (named_gp = 1)
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0 via the zero register (compact)
+        ]);
+        // Variadic (named_gp = 1) with an unknown/uncapped float count.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_treats_compact_gr_offs_zero_as_unknown_int_count() {
+        // Symmetric to the __vr_offs == 0 case: for an FP-only variadic like
+        // `double f(int n, ...) { va_arg(ap, double); }`, gcc compacts the GP
+        // save area and writes __gr_offs = 0 via `wzr`, while __vr_offs stays
+        // canonical. The function is still variadic (the float count caps the
+        // d* params), but the int count is unknown -> `None`, NOT 8.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            // v7 spilled -> full FP save (named_fp recoverable from __vr_offs).
+            str_reg(hexray_core::register::arm64::V7, 128, 80),
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            str_wzr(48),    // __gr_offs = 0 via the zero register (compact)
+            movn(1, 127),   // __vr_offs = -128 (named_fp = 0)
+            str_reg(1, 32, 52),
+        ]);
+        // Variadic (named_fp = 0) with an unknown/uncapped int count.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
+        // Both offsets 0 with no save-area spill is indistinguishable from an
+        // ordinary local layout (three frame pointers + two zero words), so it is
+        // NOT accepted as a tag — a negative anchor is required to avoid marking
+        // non-variadic functions variadic.
+        let both_zero = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            str_wzr(48),
+            str_wzr(52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&both_zero), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_recovers_named_count_from_compacted_save_spill() {
+        // gcc -O2 compacts the save area to the *consumed* vararg count, so
+        // `__gr_offs` no longer inverts to the named count (here -8 ≠ a full
+        // save's -(8-named)*8). But the area still spills the consumed varargs
+        // starting at x[named], so the lowest *untouched* arg register spilled
+        // (here x1) gives named_gp = 1. The pointer-field setup reuses x9/x10
+        // (written first, so ignored) and x7 is NOT spilled (not a full save).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            // Address-taken named param x0 home-spilled at slot 8 — OUTSIDE the
+            // save area [264, 272), so it must NOT be counted (codex regression).
+            str_reg(0, 32, 8),
+            // Unrelated untouched x7 spilled OUTSIDE the save area: must NOT mark a
+            // full save (else __gr_offs=-8 would invert to a bogus named_gp=7).
+            str_reg(7, 64, 100),
+            str_reg(1, 64, 264), // x1 (untouched) spilled INTO the compacted save area
+            add_sp(9, 0x110),
+            str_reg(9, 64, 24), // __stack (x9 written by add -> ignored as a spill)
+            add_sp(10, 0x110),
+            str_reg(10, 64, 32), // __gr_top = sp + 0x110 (272); area = [264, 272)
+            add_sp(11, 0xd0),
+            str_reg(11, 64, 40), // __vr_top
+            movn(0, 7),          // __gr_offs = -8 (1 reg saved, NOT a full save)
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0 (no FP varargs)
+        ]);
+        // named_gp from the in-area spill (x1 -> 1), not the home spill (x0);
+        // float count unknown/compact -> None.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_rejects_tag_split_across_frame_bases() {
+        // Tag fields keyed by (base_class, slot): an unrelated `[sp,#48/#52]`
+        // constant pair must NOT combine with `[x29,#24/#32/#40]` pointer stores
+        // to fabricate a tag for a non-variadic function (codex P2).
+        let sp = || aarch64_x(31, 64);
+        let x29 = || aarch64_x(29, 64);
+        let x = aarch64_x;
+        let add_x29 = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x29()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_at = |reg_id: u16, bits: u16, base: hexray_core::Register, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg_id, bits)), aarch64_mem(base, slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            // Pointer fields at [x29, #24/#32/#40] (base class 1).
+            add_x29(10, 0x110),
+            str_at(10, 64, x29(), 24),
+            add_x29(11, 0x110),
+            str_at(11, 64, x29(), 32),
+            add_x29(12, 0xd0),
+            str_at(12, 64, x29(), 40),
+            // Offset-shaped constants at [sp, #48/#52] (base class 0) — a different
+            // coordinate, so they must not align with the x29 pointer fields.
+            movn(0, 55),
+            str_at(0, 32, sp(), 48),
+            movn(1, 127),
+            str_at(1, 32, sp(), 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_ignores_reloaded_arg_register_spill() {
+        // A reloaded arg register (`ldr x7, …; str x7, …`) must not be mistaken
+        // for an untouched incoming-argument spill: without clobbering, the x7
+        // store would set the full-save flag and invert __gr_offs = -8 to a bogus
+        // named_gp = 7 (codex P2). With clobbering it is ignored, so the compacted
+        // tag's GP count stays unknown (None).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let ldr = |reg: u16, slot: i64| {
+            (
+                "ldr",
+                Operation::Load,
+                vec![Operand::Register(x(reg, 64)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            ldr(7, 200),         // x7 reloaded from the stack (not an incoming arg)
+            str_reg(7, 64, 600), // ... then spilled — must NOT mark a full save
+            add_sp(9, 0x110),
+            str_reg(9, 64, 24),
+            add_sp(10, 0x110),
+            str_reg(10, 64, 32),
+            add_sp(11, 0xd0),
+            str_reg(11, 64, 40),
+            movn(0, 7), // __gr_offs = -8 (compacted, not a full save)
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0
+        ]);
+        // x7 was clobbered, so no full save and no in-area spill -> GP count
+        // unknown; tag still valid (negative __gr_offs) -> Some((None, None)).
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_clobbers_both_ldp_destinations() {
+        // `ldp x6, x7, [sp, …]` writes BOTH x6 and x7; the second destination must
+        // also be clobbered so a later in-area `str x7` isn't read as an untouched
+        // incoming-arg spill that fakes a full save (compacted -8 -> bogus 7).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let ldp = |r1: u16, r2: u16, slot: i64| {
+            (
+                "ldp",
+                Operation::Load,
+                vec![
+                    Operand::Register(x(r1, 64)),
+                    Operand::Register(x(r2, 64)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            ldp(6, 7, 500),      // reloads x6 AND x7 (neither is an incoming arg)
+            str_reg(7, 64, 264), // in-area, but x7 was clobbered by the ldp
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32), // __gr_top = 272 (area [264,272))
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 7), // __gr_offs = -8
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0
+        ]);
+        // x7 clobbered by the ldp -> not a full save, no in-area spill -> unknown.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_tracks_mov_from_sp_then_add() {
+        // clang materialises a tag pointer as `mov x9, sp; add x9, x9, #imm`. The
+        // `mov` must propagate the frame address (not clobber x9) so the `add`
+        // result is recognised as a pointer field and the tag is found.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let mov_sp = |dst: u16| {
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(x(dst, 64)), Operand::Register(sp())],
+            )
+        };
+        let add_reg = |dst: u16, base: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x(base, 64)),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        // Each pointer field built via `mov xN, sp; add xN, xN, #imm`.
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 264), // x7 in-area -> full GP save so named_gp inverts
+            str_reg(hexray_core::register::arm64::V7, 128, 80), // full FP save (v7)
+            mov_sp(9),
+            add_reg(9, 9, 0x110),
+            str_reg(9, 64, 24), // __stack
+            mov_sp(10),
+            add_reg(10, 10, 0x110),
+            str_reg(10, 64, 32), // __gr_top
+            mov_sp(11),
+            add_reg(11, 11, 0xd0),
+            str_reg(11, 64, 40), // __vr_top
+            movn(0, 55),         // __gr_offs = -56 (named_gp = 1)
+            str_reg(0, 32, 48),
+            movn(1, 127), // __vr_offs = -128 (named_fp = 0)
+            str_reg(1, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), Some(0))));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_register_offset_add_is_not_a_frame_address() {
+        // `add x10, sp, x0` is a dynamic address, not `sp + 0`. If it were recorded
+        // as a frame address it could fabricate a pointer field; instead x10 is
+        // clobbered, the __gr_top field is missing, and no tag is formed.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp_imm = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let add_sp_reg = |dst: u16, off: u16| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::Register(x(off, 64)),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp_imm(8, 0x110),
+            str_reg(8, 64, 24), // __stack
+            add_sp_reg(9, 0),   // register-offset add -> NOT a frame address
+            str_reg(9, 64, 32), // would-be __gr_top, but x9 is clobbered
+            add_sp_imm(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 55),
+            str_reg(0, 32, 48),
+            movn(1, 127),
+            str_reg(1, 32, 52),
+        ]);
+        // __gr_top missing (register-offset add clobbered) -> not a tag.
+        assert_eq!(scan_aapcs_va_list(&cfg), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_call_clobbers_caller_saved_arg_registers() {
+        // x0..x7 are caller-saved: a post-call store of x7 must not be counted as a
+        // prologue arg spill and mark a full save.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let call = || ("bl", Operation::Call, vec![Operand::imm(0x1000, 64)]);
+        // Compacted GP tag (gr_offs = -8, area [264, 272)). A post-call `str x7`
+        // lands in-area but x7 was clobbered by the call, so it must NOT mark a
+        // full save (which would invert -8 to a bogus named_gp = 7).
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32), // __gr_top = 272
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 7), // __gr_offs = -8
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0
+            call(),
+            str_reg(7, 64, 264), // post-call x7 (clobbered) -> not a full save
+        ]);
+        // No genuine in-area spill -> GP count unknown; tag valid -> (None, None).
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_collects_spills_from_split_prologue() {
+        // A stack-protector (or other early branch) can split the prologue: block 0
+        // does the guard, block 1 spills the register-save area and writes the tag.
+        // Register state carries forward, so the never-redefined incoming x7 spill
+        // in block 1 is still recognized -> full GP save -> named_gp recovered.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        // Block 0: stack-protector-style guard load (does NOT touch x7).
+        let block0 = vec![(
+            "ldr",
+            Operation::Load,
+            vec![Operand::Register(x(8, 64)), aarch64_mem(sp(), 504)],
+        )];
+        // Block 1: the actual va_list prologue (full GP save reaching x7 at 264).
+        let block1 = vec![
+            str_reg(7, 64, 264), // in-area (gr_top 272, area [216,272)) -> full GP save
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32), // __gr_top = 272
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 55), // __gr_offs = -56 -> named_gp = 1
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0 (FP unused)
+        ];
+        let cfg = aarch64_two_block_cfg(block0, block1);
+        // x7 (never redefined across the split) still counts -> named_gp = 1.
+        assert_eq!(scan_aapcs_va_list(&cfg).map(|(gp, _)| gp), Some(Some(1)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_accepts_omitted_top_pointer_for_compacted_class() {
+        // 8 named GP args + FP varargs (clang -O2): __gr_offs is compacted to 0 and
+        // clang omits __gr_top (no live GP save area), while __vr_top and a negative
+        // __vr_offs are emitted. The tag must still be recognized (the active FP
+        // class's top pointer is present); GP count unknown, FP count from the
+        // full FP save.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        // base 24: __stack@24, __gr_top@32 OMITTED, __vr_top@40, offsets@48/52.
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(hexray_core::register::arm64::V7, 128, 80), // v7 in FP area -> full FP save
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24), // __stack
+            // (no __gr_top store at slot 32 — GP class fully consumed)
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40), // __vr_top = 208, FP area [80,208)
+            str_wzr(48),         // __gr_offs = 0 (compacted)
+            movn(1, 127),        // __vr_offs = -128
+            str_reg(1, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_tracks_sub_from_frame_pointer() {
+        // x29-relative prologues build pointers below the frame pointer with
+        // `sub xN, x29, #imm`. `sub` must form a FrameAddr (not clobber), else the
+        // pointer fields are missed. Here __vr_top = x29 - 16 and the FP save area
+        // [x29-144, x29-16) holds v7, giving a full FP save.
+        let x29 = || aarch64_x(29, 64);
+        let x = aarch64_x;
+        let sub_x29 = |dst: u16, imm: i128| {
+            (
+                "sub",
+                Operation::Sub,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x29()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_at = |reg_id: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg_id, bits)), aarch64_mem(x29(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(x29(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            str_at(hexray_core::register::arm64::V7, 128, -144), // v7 in FP area
+            sub_x29(8, 8),
+            str_at(8, 64, 24), // __stack = x29 - 8
+            // __gr_top omitted (GP compacted)
+            sub_x29(10, 16),
+            str_at(10, 64, 40), // __vr_top = x29 - 16; FP area [-144, -16)
+            str_wzr(48),        // __gr_offs = 0
+            movn(1, 127),       // __vr_offs = -128
+            str_at(1, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_zero_extends_w_write_before_64bit_store() {
+        // `movn w0, #55` zero-extends into x0 (x0 = 0x0000_0000_ffff_ffc8), so a
+        // single 64-bit `str x0, [base+24]` packs __gr_offs = -56 (low half) and
+        // __vr_offs = 0 (high half). If the w-write weren't zero-extended the high
+        // half would decode as 0xffffffff and the tag would be rejected.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn_w = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 264), // x7 in-area -> full GP save
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn_w(0, 55),       // w0 = 0xffffffc8 (zero-extended into x0)
+            str_reg(0, 64, 48),  // 64-bit store: gr_offs=-56 @48, vr_offs=0 @52
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_handles_chained_adds_and_stp_pairs() {
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add = |dst: u16, base: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x(base, 64)),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let stp = |r1: u16, r2: u16, slot: i64| {
+            (
+                "stp",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(r1, 64)),
+                    Operand::Register(x(r2, 64)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        // __stack@24 + __gr_top@32 written by one STP of two frame pointers;
+        // __vr_top@40 via a chained `add x10, sp, #..; add x10, x10, #..`.
+        // x7 / v7 spills mark a full GP+FP save so the offset -> count formula
+        // applies (see `aarch64_top_arg_register`).
+        const V7: u16 = hexray_core::register::arm64::V7;
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 264), // in-area: gr_top 272, area [216,272)
+            str_reg(V7, 128, 192), // in-area: vr_top 208, area [80,208)
+            add_sp(8, 0x110),
+            add_sp(9, 0x110),
+            stp(8, 9, 24),
+            add_sp(10, 0x80),
+            add(10, 10, 0x50),
+            str_reg(10, 64, 40),
+            movn(0, 55),
+            str_reg(0, 32, 48),
+            movn(0, 127),
+            str_reg(0, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), Some(0))));
+
+        // The two 32-bit offset fields written by one `stp w0, w1, [sp, #48]`:
+        // w0 at 48 (__gr_offs), w1 at 48+4=52 (__vr_offs).
+        let stp_w = |r1: u16, r2: u16, slot: i64| {
+            (
+                "stp",
+                Operation::Store,
+                vec![
+                    Operand::Register(aarch64_x(r1, 32)),
+                    Operand::Register(aarch64_x(r2, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg2 = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 264), // in-area: gr_top 272, area [216,272)
+            str_reg(V7, 128, 192), // in-area: vr_top 208, area [80,208)
+            add_sp(8, 0x110),
+            add_sp(9, 0x110),
+            stp(8, 9, 24), // __stack@24, __gr_top@32
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40), // __vr_top@40
+            movn(0, 55),         // w0 = __gr_offs = -56
+            movn(1, 127),        // w1 = __vr_offs = -128
+            stp_w(0, 1, 48),     // 32-bit pair: w0@48, w1@52
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg2), Some((Some(1), Some(0))));
+
+        // clang -O1/-O2 packs both 32-bit offset fields into one x register
+        // with `mov`+`movk` and stores it 64-bit wide.
+        let mov = |reg: u16, v: i128| {
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(aarch64_x(reg, 64)), Operand::imm(v, 64)],
+            )
+        };
+        let movk = |reg: u16, k: i128, shift: i128| {
+            (
+                "movk",
+                Operation::Move,
+                vec![
+                    Operand::Register(aarch64_x(reg, 64)),
+                    Operand::imm(k, 32),
+                    Operand::imm(shift, 8),
+                ],
+            )
+        };
+        // tag base 176: pointers@176/184/192, packed offsets in x11 stored at 200
+        // -> __gr_offs@200, __vr_offs@204. mov x11,#-56 then movk #0xff80,lsl#32
+        // gives 0xffffff80_ffffffc8 -> gr=-56 (named_gp=1), vr=-128 (named_fp=0).
+        let cfg3 = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 248), // in-area: gr_top 256, area [200,256)
+            str_reg(V7, 128, 112), // in-area: vr_top 128, area [0,128)
+            add_sp(8, 0x100),
+            add_sp(9, 0x100),
+            stp(8, 9, 176), // __stack@176, __gr_top@184
+            add_sp(10, 0x80),
+            str_reg(10, 64, 192), // __vr_top@192
+            mov(11, -56),
+            movk(11, 0xff80, 32),
+            str_reg(11, 64, 200), // packed -> gr@200, vr@204
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg3), Some((Some(1), Some(0))));
     }
 
     #[test]
