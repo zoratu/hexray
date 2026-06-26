@@ -2312,7 +2312,7 @@ impl Decompiler {
     fn scan_aapcs_va_list_if_aarch64(
         &self,
         cfg: &ControlFlowGraph,
-    ) -> Option<(usize, Option<usize>)> {
+    ) -> Option<(Option<usize>, Option<usize>)> {
         if matches!(self.calling_convention, CallingConvention::Aarch64) {
             signature::scan_aapcs_va_list(cfg)
         } else {

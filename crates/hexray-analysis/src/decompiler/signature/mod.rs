@@ -177,12 +177,13 @@ pub struct SignatureRecovery {
     /// aarch64 AAPCS variadic counts recovered from the `__va_list` tag in the
     /// prologue (see [`scan_aapcs_va_list`]): `Some((named_gp, named_fp))` marks
     /// the function variadic and caps the recovered integer/float parameters so
-    /// the GP/SIMD register-save area isn't surfaced. The float count is itself
-    /// an `Option`: `None` when gcc compacted the FP save area (`__vr_offs == 0`
-    /// because no FP varargs are consumed), in which case the float parameters
-    /// are left to ordinary observation rather than capped from a meaningless
-    /// offset.
-    aapcs_va_list_counts: Option<(usize, Option<usize>)>,
+    /// the GP/SIMD register-save area isn't surfaced. Each count is itself an
+    /// `Option`: `None` when gcc compacted that save area (the matching
+    /// `__gr_offs`/`__vr_offs` is `0` because that varargs class isn't
+    /// consumed), in which case those parameters are left to ordinary
+    /// observation rather than capped from a meaningless offset. `Some` overall
+    /// requires at least one canonical (negative) offset so the tag is genuine.
+    aapcs_va_list_counts: Option<(Option<usize>, Option<usize>)>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -591,7 +592,11 @@ fn is_aarch64_frame_base_register(name: &str) -> bool {
 
 /// Scan the prologue for the aarch64 AAPCS `__va_list` tag and recover the
 /// named (non-variadic) GP and FP/SIMD parameter counts as `(named_gp,
-/// named_fp)`. Returns `None` for a non-variadic function (no tag found).
+/// named_fp)`. Returns `None` for a non-variadic function (no tag found). Each
+/// count is itself an `Option`: `None` when gcc compacted that save area (its
+/// offset field written as `0` because that varargs class isn't consumed), so
+/// those parameters are left to observation rather than capped. `Some` overall
+/// requires at least one canonical (negative) offset.
 ///
 /// The 32-byte tag is `{ void* __stack; void* __gr_top; void* __vr_top;
 /// int __gr_offs; int __vr_offs; }`. `va_start` initialises
@@ -604,7 +609,9 @@ fn is_aarch64_frame_base_register(name: &str) -> bool {
 /// values. The full tag shape (three frame-pointer fields + the two offset
 /// fields at the right relative positions) is required so an unrelated constant
 /// can't be mistaken for the tag.
-pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize>)> {
+pub fn scan_aapcs_va_list(
+    cfg: &ControlFlowGraph,
+) -> Option<(Option<usize>, Option<usize>)> {
     #[derive(Clone, Copy)]
     enum RegVal {
         Imm(i128),
@@ -769,24 +776,30 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize
     for gr_slot in gr_slots {
         let base = gr_slot - 24; // __gr_offs sits at tag base + 24
         let gr_offs = as_i32(*const_stores.get(&gr_slot)?);
-        // `__gr_offs` is the variadic anchor and must be a strictly-negative
-        // canonical value (`-(8 - named_gp) * 8`, named_gp 0..7). `0` would mean
-        // all 8 GP registers are named (implausible for a variadic) or a
-        // compacted GP save area we can't trust — decline.
-        if !(-64..0).contains(&gr_offs) || gr_offs % 8 != 0 {
+        // `__gr_offs = -(8 - named_gp) * 8` (named_gp 0..7) when the GP save area
+        // is canonical. gcc compacts it to `0` (via `wzr`/`xzr`) for an FP-only
+        // variadic like `double f(int n, ...) { va_arg(ap, double); }`, where no
+        // further GP varargs are consumed — record `None` (don't cap ints; let
+        // observation decide) rather than fabricating 8 GP params or declining.
+        // Any other non-canonical value isn't really the offset field — skip.
+        let named_gp = if gr_offs == 0 {
+            None
+        } else if (-64..0).contains(&gr_offs) && gr_offs % 8 == 0 {
+            Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
+        } else {
             continue;
-        }
+        };
         let Some(&vr_raw) = const_stores.get(&(base + 28)) else {
             continue;
         };
         let vr_offs = as_i32(vr_raw);
-        // `__vr_offs == 0` is the sentinel gcc -O2 writes (`stp …, wzr`) for a
-        // COMPACTED FP save area when no FP varargs are consumed — common for
-        // integer-only variadics like `int f(int, ...)`. Treating it as
-        // `named_fp = 8` would fabricate eight `d*` parameters (codex P1), so
-        // record `None` (don't cap floats; let observation decide) rather than
-        // declining the whole tag (codex P2). Any other non-canonical value
-        // means it isn't really the offset field — skip.
+        // Symmetric to `__gr_offs`: `__vr_offs == 0` is the sentinel gcc -O2
+        // writes (`stp …, wzr`) for a COMPACTED FP save area when no FP varargs
+        // are consumed — common for integer-only variadics like `int f(int,
+        // ...)`. Treating it as `named_fp = 8` would fabricate eight `d*`
+        // parameters (codex P1), so record `None` (don't cap floats; let
+        // observation decide). Any other non-canonical value isn't the offset
+        // field — skip.
         let named_fp = if vr_offs == 0 {
             None
         } else if (-128..0).contains(&vr_offs) && vr_offs % 16 == 0 {
@@ -794,11 +807,16 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize
         } else {
             continue;
         };
+        // At least one offset must be canonical (negative) so the tag is a real
+        // `__va_list` and not two zero-initialised words that happen to neighbour
+        // three pointers.
+        if named_gp.is_none() && named_fp.is_none() {
+            continue;
+        }
         if pointer_offsets.contains(&base)
             && pointer_offsets.contains(&(base + 8))
             && pointer_offsets.contains(&(base + 16))
         {
-            let named_gp = 8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?;
             return Some((named_gp, named_fp));
         }
     }
@@ -1384,7 +1402,10 @@ impl SignatureRecovery {
     }
 
     /// Seeds the aarch64 AAPCS variadic counts (see [`scan_aapcs_va_list`]).
-    pub fn with_aapcs_va_list_counts(mut self, counts: Option<(usize, Option<usize>)>) -> Self {
+    pub fn with_aapcs_va_list_counts(
+        mut self,
+        counts: Option<(Option<usize>, Option<usize>)>,
+    ) -> Self {
         self.aapcs_va_list_counts = counts;
         self
     }
@@ -6001,9 +6022,12 @@ impl SignatureRecovery {
     fn infer_variadic_fixed_param_count(&self, used_args: &[usize]) -> Option<usize> {
         // aarch64 AAPCS: the `__va_list` tag's `__gr_offs` directly encodes the
         // named integer-parameter prefix; the SysV materialization heuristics
-        // below don't apply (different ABI / tag layout).
+        // below don't apply (different ABI / tag layout). A compacted GP save
+        // area (`named_gp == None`) still marks the function variadic but caps
+        // nothing — fall back to the max GP-arg count so no observed int arg is
+        // suppressed.
         if let Some((named_gp, _)) = self.aapcs_va_list_counts {
-            return Some(named_gp);
+            return Some(named_gp.unwrap_or_else(|| self.convention.max_int_args()));
         }
         if !self.has_sysv_va_list_materialization() {
             return None;
@@ -8450,9 +8474,9 @@ mod tests {
             ])
         };
         // movn #55 -> gr_offs=-56 -> named_gp=1; movn #127 -> vr_offs=-128 -> 0.
-        assert_eq!(scan_aapcs_va_list(&tag(55, 127)), Some((1, Some(0))));
+        assert_eq!(scan_aapcs_va_list(&tag(55, 127)), Some((Some(1), Some(0))));
         // 2 named GP, 1 named FP: gr_offs=-48 (movn #47), vr_offs=-112 (movn #111).
-        assert_eq!(scan_aapcs_va_list(&tag(47, 111)), Some((2, Some(1))));
+        assert_eq!(scan_aapcs_va_list(&tag(47, 111)), Some((Some(2), Some(1))));
         // Missing the pointer fields -> not a tag.
         let no_ptrs =
             aarch64_single_block_cfg(vec![movn_w0(55), str_w0(48), movn_w0(127), str_w0(52)]);
@@ -8527,7 +8551,78 @@ mod tests {
             str_wzr(52), // __vr_offs = 0 via the zero register (compact)
         ]);
         // Variadic (named_gp = 1) with an unknown/uncapped float count.
-        assert_eq!(scan_aapcs_va_list(&cfg), Some((1, None)));
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_treats_compact_gr_offs_zero_as_unknown_int_count() {
+        // Symmetric to the __vr_offs == 0 case: for an FP-only variadic like
+        // `double f(int n, ...) { va_arg(ap, double); }`, gcc compacts the GP
+        // save area and writes __gr_offs = 0 via `wzr`, while __vr_offs stays
+        // canonical. The function is still variadic (the float count caps the
+        // d* params), but the int count is unknown -> `None`, NOT 8.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            str_wzr(48),    // __gr_offs = 0 via the zero register (compact)
+            movn(1, 127),   // __vr_offs = -128 (named_fp = 0)
+            str_reg(1, 32, 52),
+        ]);
+        // Variadic (named_fp = 0) with an unknown/uncapped int count.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
+        // Both offsets compacted to 0 -> no canonical anchor -> not a tag.
+        let both_zero = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            str_wzr(48),
+            str_wzr(52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&both_zero), None);
     }
 
     #[test]
@@ -8595,7 +8690,7 @@ mod tests {
             movn(0, 127),
             str_reg(0, 32, 52),
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg), Some((1, Some(0))));
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), Some(0))));
 
         // The two 32-bit offset fields written by one `stp w0, w1, [sp, #48]`:
         // w0 at 48 (__gr_offs), w1 at 48+4=52 (__vr_offs).
@@ -8620,7 +8715,7 @@ mod tests {
             movn(1, 127),        // w1 = __vr_offs = -128
             stp_w(0, 1, 48),     // 32-bit pair: w0@48, w1@52
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg2), Some((1, Some(0))));
+        assert_eq!(scan_aapcs_va_list(&cfg2), Some((Some(1), Some(0))));
 
         // clang -O1/-O2 packs both 32-bit offset fields into one x register
         // with `mov`+`movk` and stores it 64-bit wide.
@@ -8655,7 +8750,7 @@ mod tests {
             movk(11, 0xff80, 32),
             str_reg(11, 64, 200), // packed -> gr@200, vr@204
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg3), Some((1, Some(0))));
+        assert_eq!(scan_aapcs_va_list(&cfg3), Some((Some(1), Some(0))));
     }
 
     #[test]
