@@ -585,9 +585,15 @@ fn aarch64_canon_reg(name: &str) -> String {
     lower
 }
 
-/// True if `name` is an aarch64 frame/stack base register (`sp`, `x29`/`fp`).
-fn is_aarch64_frame_base_register(name: &str) -> bool {
-    matches!(name.to_lowercase().as_str(), "sp" | "x31" | "x29" | "fp")
+/// The frame-base class of `name`: `0` for the stack pointer (`sp`/`x31`), `1`
+/// for the frame pointer (`x29`/`fp`). These are distinct registers with
+/// distinct values, so displacements are only comparable within the same class.
+fn aarch64_frame_base_class(name: &str) -> Option<u8> {
+    match name.to_lowercase().as_str() {
+        "sp" | "x31" => Some(0),
+        "x29" | "fp" => Some(1),
+        _ => None,
+    }
 }
 
 /// If `name` is an argument register (index 0..=7) of its class, returns
@@ -639,49 +645,64 @@ fn aarch64_arg_register(name: &str) -> Option<(usize, bool)> {
 pub fn scan_aapcs_va_list(
     cfg: &ControlFlowGraph,
 ) -> Option<(Option<usize>, Option<usize>)> {
+    // A frame address carries its base class (0 = sp/x31, 1 = x29/fp — distinct
+    // registers with distinct values) and displacement, so save-area spills and
+    // the `__gr_top`/`__vr_top` pointers can be compared in the same coordinate.
     #[derive(Clone, Copy)]
     enum RegVal {
         Imm(i128),
-        FrameAddr,
+        FrameAddr { base: u8, disp: i64 },
     }
     let mut const_stores: HashMap<i64, i128> = HashMap::new();
     let mut pointer_offsets: HashSet<i64> = HashSet::new();
-    // Whether the GP / FP register-save area spills its top register (x7 / q7),
-    // i.e. is a *full* `[named..8)` save — only then is the offset → count
-    // formula valid (gcc -O2 compacts to the consumed count and stops short).
-    let mut gp_full_save = false;
-    let mut fp_full_save = false;
-    // Lowest incoming arg register spilled into the save area, per class. For a
-    // compacted save (gcc -O2, which doesn't home-spill named params) this equals
-    // the named count: the consumed varargs are spilled starting at `x[named]`.
-    let mut gp_spill_min: Option<usize> = None;
-    let mut fp_spill_min: Option<usize> = None;
-    // Record a frame store of an argument register, updating the full-save flag
-    // (top register x7/q7 spilled) and the per-class lowest-spilled index. Only a
-    // register still holding its incoming caller value counts: a register reused
-    // to build a pointer field has been written (so it's in `regs`) and must be
-    // ignored, otherwise the `__gr_top`/`__vr_top` setup would skew the count.
+    // Frame-pointer fields keyed by their store slot -> the (base, disp) they hold
+    // (e.g. `__gr_top`/`__vr_top` point just past their save areas).
+    let mut pointer_targets: HashMap<i64, (u8, i64)> = HashMap::new();
+    // Save-area observations accumulated across the prologue. `*_full` is set when
+    // that class's top register (x7 / q7) is spilled — a *full* `[named..8)` save,
+    // the only case the offset → count formula is valid for (gcc -O2 compacts to
+    // the consumed count and stops short). `*_spills` collect (base_class, slot,
+    // arg_register_index) for each incoming arg register stored to a frame slot;
+    // bounded to the actual save area in the decode, so an address-taken named
+    // param's home spill isn't counted. For a compacted save the lowest in-area
+    // index is the named count.
+    #[derive(Default)]
+    struct SaveAreaScan {
+        gp_full: bool,
+        fp_full: bool,
+        gp_spills: Vec<(u8, i64, usize)>,
+        fp_spills: Vec<(u8, i64, usize)>,
+    }
+    let mut save_area = SaveAreaScan::default();
+    // Record a frame store of an argument register: update the full-save flag and
+    // collect a spill candidate. Only a register still holding its incoming caller
+    // value counts — a register reused to build a pointer field has been written
+    // (so it's in `regs`) and is ignored.
     fn note_arg_spill(
         reg: &hexray_core::Register,
+        base_class: Option<u8>,
+        slot: i64,
         regs: &HashMap<String, RegVal>,
-        gp_full: &mut bool,
-        fp_full: &mut bool,
-        gp_min: &mut Option<usize>,
-        fp_min: &mut Option<usize>,
+        scan: &mut SaveAreaScan,
     ) {
+        let Some(base_class) = base_class else { return };
         if regs.contains_key(&aarch64_canon_reg(reg.name())) {
             return;
         }
         if let Some((idx, is_fp)) = aarch64_arg_register(reg.name()) {
             if idx == 7 {
                 if is_fp {
-                    *fp_full = true;
+                    scan.fp_full = true;
                 } else {
-                    *gp_full = true;
+                    scan.gp_full = true;
                 }
             }
-            let slot = if is_fp { fp_min } else { gp_min };
-            *slot = Some(slot.map_or(idx, |m| m.min(idx)));
+            let spills = if is_fp {
+                &mut scan.fp_spills
+            } else {
+                &mut scan.gp_spills
+            };
+            spills.push((base_class, slot, idx));
         }
     }
     for block in cfg.blocks() {
@@ -746,16 +767,25 @@ pub fn scan_aapcs_va_list(
                         (inst.operands.first(), inst.operands.get(1))
                     {
                         let name = aarch64_canon_reg(dst.name());
+                        let imm = match inst.operands.get(2) {
+                            Some(Operand::Immediate(i)) => i.value as i64,
+                            _ => 0,
+                        };
                         // The result is a frame address when `base` is a frame
-                        // register OR already holds a frame address — so chained
-                        // `add x8, sp, #32; add x8, x8, #112` (clang) propagates.
-                        let base_is_frame = is_aarch64_frame_base_register(base.name())
-                            || matches!(
-                                regs.get(&aarch64_canon_reg(base.name())),
-                                Some(RegVal::FrameAddr)
-                            );
-                        if base_is_frame {
-                            regs.insert(name, RegVal::FrameAddr);
+                        // register OR already holds one — so chained
+                        // `add x8, sp, #32; add x8, x8, #112` (clang) propagates,
+                        // accumulating the displacement.
+                        let frame = if let Some(class) = aarch64_frame_base_class(base.name()) {
+                            Some((class, imm))
+                        } else if let Some(RegVal::FrameAddr { base: b, disp }) =
+                            regs.get(&aarch64_canon_reg(base.name()))
+                        {
+                            Some((*b, *disp + imm))
+                        } else {
+                            None
+                        };
+                        if let Some((base, disp)) = frame {
+                            regs.insert(name, RegVal::FrameAddr { base, disp });
                         } else {
                             regs.remove(&name);
                         }
@@ -765,7 +795,8 @@ pub fn scan_aapcs_va_list(
                     let record = |off: i64,
                                   reg: &hexray_core::Register,
                                   consts: &mut HashMap<i64, i128>,
-                                  ptrs: &mut HashSet<i64>| {
+                                  ptrs: &mut HashSet<i64>,
+                                  targets: &mut HashMap<i64, (u8, i64)>| {
                         let canon = aarch64_canon_reg(reg.name());
                         // The zero register (`wzr`/`xzr`) is never a `mov` target,
                         // so it isn't in `regs`; treat it as a literal 0. gcc -O2
@@ -777,8 +808,9 @@ pub fn scan_aapcs_va_list(
                             regs.get(&canon).copied()
                         };
                         match value {
-                            Some(RegVal::FrameAddr) => {
+                            Some(RegVal::FrameAddr { base, disp }) => {
                                 ptrs.insert(off);
+                                targets.insert(off, (base, disp));
                             }
                             Some(RegVal::Imm(v)) => {
                                 if reg.size >= 64 {
@@ -807,19 +839,23 @@ pub fn scan_aapcs_va_list(
                         // `str reg, [frame+disp]`.
                         (Some(Operand::Register(src)), Some(Operand::Memory(mem)), None) => {
                             if is_frame_base_memory(mem) {
+                                let base_class = mem
+                                    .base
+                                    .as_ref()
+                                    .and_then(|r| aarch64_frame_base_class(r.name()));
                                 note_arg_spill(
                                     src,
+                                    base_class,
+                                    mem.displacement,
                                     &regs,
-                                    &mut gp_full_save,
-                                    &mut fp_full_save,
-                                    &mut gp_spill_min,
-                                    &mut fp_spill_min,
+                                    &mut save_area,
                                 );
                                 record(
                                     mem.displacement,
                                     src,
                                     &mut const_stores,
                                     &mut pointer_offsets,
+                                    &mut pointer_targets,
                                 );
                             }
                         }
@@ -833,28 +869,33 @@ pub fn scan_aapcs_va_list(
                             Some(Operand::Memory(mem)),
                         ) => {
                             if is_frame_base_memory(mem) {
-                                for reg in [r1, r2] {
+                                let base_class = mem
+                                    .base
+                                    .as_ref()
+                                    .and_then(|r| aarch64_frame_base_class(r.name()));
+                                let stride = i64::from(r1.size / 8).max(1);
+                                for (i, reg) in [r1, r2].into_iter().enumerate() {
                                     note_arg_spill(
                                         reg,
+                                        base_class,
+                                        mem.displacement + stride * i as i64,
                                         &regs,
-                                        &mut gp_full_save,
-                                        &mut fp_full_save,
-                                        &mut gp_spill_min,
-                                        &mut fp_spill_min,
+                                        &mut save_area,
                                     );
                                 }
-                                let stride = i64::from(r1.size / 8).max(1);
                                 record(
                                     mem.displacement,
                                     r1,
                                     &mut const_stores,
                                     &mut pointer_offsets,
+                                    &mut pointer_targets,
                                 );
                                 record(
                                     mem.displacement + stride,
                                     r2,
                                     &mut const_stores,
                                     &mut pointer_offsets,
+                                    &mut pointer_targets,
                                 );
                             }
                         }
@@ -889,28 +930,43 @@ pub fn scan_aapcs_va_list(
         if gr_offs >= 0 && vr_offs >= 0 {
             continue;
         }
+        // The lowest arg register spilled *into the save area* gives the named
+        // count for a compacted save. The save area is `[top + offs, top)` where
+        // `top` is the `__gr_top`/`__vr_top` pointer and `offs` the (negative)
+        // offset; bounding to that range excludes an address-taken named param's
+        // home spill, which lands at an unrelated slot.
+        let bounded_spill_min = |spills: &[(u8, i64, usize)],
+                                 top: Option<&(u8, i64)>,
+                                 offs: i128|
+         -> Option<usize> {
+            let &(top_base, top_disp) = top?;
+            let lo = top_disp + offs as i64;
+            spills
+                .iter()
+                .filter(|&&(b, slot, _)| b == top_base && (lo..top_disp).contains(&slot))
+                .map(|&(_, _, idx)| idx)
+                .min()
+        };
         // `__gr_offs = -(area_size_in_regs) * 8`. For a *full* save (`[named..8)`,
         // reaching x7) the named count inverts to `8 - area_size`. gcc -O2
         // compacts the area to the *consumed* vararg count, so the offset no
-        // longer inverts — but the compacted area still spills the consumed
-        // varargs starting at `x[named]`, so the lowest spilled arg register
-        // (`*_spill_min`) gives the named count directly. When the area is
-        // compacted to `0` (class unused) there's nothing to spill and the count
-        // is left to observation (`None`).
+        // longer inverts — fall back to the bounded save-area spill-min. When the
+        // area is compacted to `0` (class unused) there's nothing to spill and the
+        // count is left to observation (`None`).
         let named_gp = if gr_offs < 0 {
-            if gp_full_save {
+            if save_area.gp_full {
                 Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
             } else {
-                gp_spill_min
+                bounded_spill_min(&save_area.gp_spills, pointer_targets.get(&(base + 8)), gr_offs)
             }
         } else {
             None
         };
         let named_fp = if vr_offs < 0 {
-            if fp_full_save {
+            if save_area.fp_full {
                 Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
             } else {
-                fp_spill_min
+                bounded_spill_min(&save_area.fp_spills, pointer_targets.get(&(base + 16)), vr_offs)
             }
         } else {
             None
@@ -8810,18 +8866,22 @@ mod tests {
             )
         };
         let cfg = aarch64_single_block_cfg(vec![
-            str_reg(1, 64, 72), // x1 (untouched) spilled into the compacted save area
+            // Address-taken named param x0 home-spilled at slot 8 — OUTSIDE the
+            // save area [264, 272), so it must NOT be counted (codex regression).
+            str_reg(0, 32, 8),
+            str_reg(1, 64, 264), // x1 (untouched) spilled INTO the compacted save area
             add_sp(9, 0x110),
             str_reg(9, 64, 24), // __stack (x9 written by add -> ignored as a spill)
             add_sp(10, 0x110),
-            str_reg(10, 64, 32), // __gr_top
+            str_reg(10, 64, 32), // __gr_top = sp + 0x110 (272); area = [264, 272)
             add_sp(11, 0xd0),
             str_reg(11, 64, 40), // __vr_top
             movn(0, 7),          // __gr_offs = -8 (1 reg saved, NOT a full save)
             str_reg(0, 32, 48),
             str_wzr(52), // __vr_offs = 0 (no FP varargs)
         ]);
-        // named_gp from the spill (1), float count unknown/compact -> None.
+        // named_gp from the in-area spill (x1 -> 1), not the home spill (x0);
+        // float count unknown/compact -> None.
         assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
     }
 
