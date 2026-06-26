@@ -638,6 +638,14 @@ fn contains_free_break(nodes: &[StructuredNode]) -> bool {
                 || else_body.as_ref().is_some_and(|b| contains_free_break(b))
         }
         StructuredNode::Sequence(ns) => contains_free_break(ns),
+        // try/catch does not capture `break`, so recurse into its bodies.
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            contains_free_break(try_body)
+                || catch_handlers.iter().any(|h| contains_free_break(&h.body))
+        }
         // Loops and switches capture `break`, so one inside them isn't free.
         _ => false,
     })
@@ -1229,6 +1237,26 @@ mod tests {
         let body = vec![iff(
             cmp(BinOpKind::Eq, state_access(), 0),
             vec![StructuredNode::Break],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::int(1)])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
+    }
+
+    #[test]
+    fn declines_when_a_free_break_is_inside_try_catch() {
+        // A `break` inside a case body's try/catch (which doesn't capture break)
+        // would still be recaptured by the synthesized switch -> decline.
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![StructuredNode::TryCatch {
+                try_body: vec![StructuredNode::Break],
+                catch_handlers: vec![],
+            }],
             vec![iff(
                 cmp(BinOpKind::Eq, state_access(), 1),
                 vec![block(vec![Expr::int(1)])],
