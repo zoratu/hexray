@@ -1077,10 +1077,16 @@ pub fn scan_aapcs_va_list(
         } else {
             None
         };
-        if pointer_offsets.contains(&(frame_base, base))
-            && pointer_offsets.contains(&(frame_base, base + 8))
-            && pointer_offsets.contains(&(frame_base, base + 16))
-        {
+        // `__stack` (base) is always written. A class's top pointer
+        // (`__gr_top`@+8 / `__vr_top`@+16) is only emitted when that class has a
+        // live register-save area; when its offset is the compacted `0` (class
+        // fully consumed / unused) clang omits the store, so require it only for
+        // an active (negative-offset) class. Combined with the negative-offset
+        // anchor above, this still needs two frame pointers at the right slots.
+        let stack_ok = pointer_offsets.contains(&(frame_base, base));
+        let gr_top_ok = gr_offs == 0 || pointer_offsets.contains(&(frame_base, base + 8));
+        let vr_top_ok = vr_offs == 0 || pointer_offsets.contains(&(frame_base, base + 16));
+        if stack_ok && gr_top_ok && vr_top_ok {
             return Some((named_gp, named_fp));
         }
     }
@@ -9397,6 +9403,65 @@ mod tests {
         let cfg = aarch64_two_block_cfg(block0, block1);
         // x7 (never redefined across the split) still counts -> named_gp = 1.
         assert_eq!(scan_aapcs_va_list(&cfg).map(|(gp, _)| gp), Some(Some(1)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_accepts_omitted_top_pointer_for_compacted_class() {
+        // 8 named GP args + FP varargs (clang -O2): __gr_offs is compacted to 0 and
+        // clang omits __gr_top (no live GP save area), while __vr_top and a negative
+        // __vr_offs are emitted. The tag must still be recognized (the active FP
+        // class's top pointer is present); GP count unknown, FP count from the
+        // full FP save.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        // base 24: __stack@24, __gr_top@32 OMITTED, __vr_top@40, offsets@48/52.
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(hexray_core::register::arm64::V7, 128, 80), // v7 in FP area -> full FP save
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24), // __stack
+            // (no __gr_top store at slot 32 — GP class fully consumed)
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40), // __vr_top = 208, FP area [80,208)
+            str_wzr(48),         // __gr_offs = 0 (compacted)
+            movn(1, 127),        // __vr_offs = -128
+            str_reg(1, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
     }
 
     #[test]
