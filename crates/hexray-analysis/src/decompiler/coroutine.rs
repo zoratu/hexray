@@ -658,8 +658,29 @@ fn collect_cases(
         | BinOpKind::ULe
         | BinOpKind::UGt
         | BinOpKind::UGe => {
-            collect_branch(then_body, frame, state, env, acc)?;
-            collect_branch_opt(else_body, frame, state, env, acc)
+            match else_body {
+                Some(else_nodes) => {
+                    // Both ranges are dispatched explicitly.
+                    collect_branch(then_body, frame, state, env, acc)?;
+                    collect_branch(else_nodes, frame, state, env, acc)
+                }
+                None => {
+                    // No else: states NOT satisfying the bound fall through past the
+                    // dispatch. Collect the taken range's cases, but its default
+                    // covers only taken-range gaps — for a dense coroutine dispatch
+                    // that's a dead trap, so drop it and let the complementary
+                    // states fall through. A *live* taken default can't be merged
+                    // with that implicit fallthrough in one switch default — abort.
+                    let mut taken = Dispatch::default();
+                    collect_branch(then_body, frame, state, env, &mut taken)?;
+                    acc.cases.extend(taken.cases);
+                    match taken.default {
+                        None => Some(()),
+                        Some(d) if body_is_noreturn(&d) => Some(()),
+                        Some(_) => None,
+                    }
+                }
+            }
         }
         _ => None,
     }
@@ -1204,11 +1225,12 @@ mod tests {
 
     #[test]
     fn appends_suffix_to_nested_real_default_fallthrough() {
-        // if (state <= 1) { if (state==0) A else if (state==1) B else REAL ; suffix }
-        // The non-trap REAL default also falls through to `suffix`, so the suffix
-        // must be appended to it (not just the cases).
+        // if (state == 9) X else { if (state==0) A else if (state==1) B else REAL ; suffix }
+        // The non-trap REAL default (genuine catch-all for all unmatched states)
+        // also falls through to `suffix`, so the suffix is appended to it.
         let body = vec![iff(
-            cmp(BinOpKind::Le, state_access(), 1),
+            cmp(BinOpKind::Eq, state_access(), 9),
+            vec![block(vec![Expr::unknown("body_x")])],
             vec![
                 iff(
                     cmp(BinOpKind::Eq, state_access(), 0),
@@ -1221,10 +1243,9 @@ mod tests {
                 ),
                 block(vec![Expr::unknown("suffix")]),
             ],
-            vec![],
         )];
         let out = recover_resume_dispatch(body);
-        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 9]));
         // The real default must carry the suffix; a trap default would not.
         let default_dump = find_default_dump(&out).expect("switch default present");
         assert!(default_dump.contains("real_default"));
@@ -1234,7 +1255,8 @@ mod tests {
     #[test]
     fn noreturn_trap_default_does_not_get_dead_suffix() {
         let body = vec![iff(
-            cmp(BinOpKind::Le, state_access(), 1),
+            cmp(BinOpKind::Eq, state_access(), 9),
+            vec![block(vec![Expr::unknown("body_x")])],
             vec![
                 iff(
                     cmp(BinOpKind::Eq, state_access(), 0),
@@ -1252,12 +1274,40 @@ mod tests {
                 ),
                 block(vec![Expr::unknown("suffix")]),
             ],
-            vec![],
         )];
         let out = recover_resume_dispatch(body);
         let default_dump = find_default_dump(&out).expect("switch default present");
         assert!(default_dump.contains("__builtin_trap"));
         assert!(!default_dump.contains("suffix"));
+    }
+
+    #[test]
+    fn bound_without_else_does_not_trap_fallthrough_states() {
+        // if (state <= 1) { if (state==0) A else if (state==1) B else trap }
+        // No else on the bound: states > 1 fall through, so the dead taken-range
+        // trap must NOT become the switch default that captures them.
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![block(vec![Expr::call(
+                        crate::decompiler::expression::CallTarget::Named(
+                            "__builtin_trap".to_string(),
+                        ),
+                        vec![],
+                    )])],
+                )],
+            )],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        // The dead taken-range trap is dropped; no default captures state > 1.
+        assert!(find_default_dump(&out).is_none());
     }
 
     fn find_default_dump(body: &[StructuredNode]) -> Option<String> {
