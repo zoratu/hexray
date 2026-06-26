@@ -15,7 +15,7 @@
 //! recovered and every condition on the path is a state comparison, so ordinary
 //! control flow (and non-coroutine functions) is never mangled.
 
-use super::expression::{BinOpKind, Expr, ExprKind};
+use super::expression::{BinOpKind, Expr, ExprKind, VarKind};
 use std::collections::{HashMap, HashSet};
 
 /// Synthesized name for the coroutine frame's suspend/resume index field.
@@ -76,7 +76,7 @@ fn build_frame(body: &[StructuredNode]) -> Option<Frame> {
     loop {
         let mut changed = false;
         visit_assignments(body, &mut |lhs, rhs| {
-            if !is_memory(lhs) {
+            if !is_stable_frame_home(lhs) {
                 return;
             }
             if let (Some(rk), Some(lk)) = (alias_key(rhs), alias_key(lhs)) {
@@ -116,10 +116,20 @@ fn is_frame_param_expr(e: &Expr) -> bool {
     }
 }
 
-fn is_memory(e: &Expr) -> bool {
+/// A frame-pointer spill destination that stably holds the frame for the rest
+/// of the function: a memory location (`*(rbp-N)`) or a named stack-slot local
+/// (`local_N`, a `VarKind::Stack` variable). Scratch registers are excluded —
+/// they get reused, so trusting them as frame aliases would be unsound.
+fn is_stable_frame_home(e: &Expr) -> bool {
     matches!(
         e.kind,
-        ExprKind::ArrayAccess { .. } | ExprKind::Deref { .. } | ExprKind::FieldAccess { .. }
+        ExprKind::ArrayAccess { .. }
+            | ExprKind::Deref { .. }
+            | ExprKind::FieldAccess { .. }
+            | ExprKind::Var(super::expression::Variable {
+                kind: VarKind::Stack(_),
+                ..
+            })
     )
 }
 
@@ -1147,6 +1157,28 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn recognizes_named_stack_local_frame_spill() {
+        // local_8 = arg0;  (a VarKind::Stack home, not a memory expr)
+        // if (local_8[18] == 0) .. else if (local_8[18] == 1) ..
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let local_state = || Expr::array_access(local(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, local_state(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, local_state(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
     }
 
     #[test]
