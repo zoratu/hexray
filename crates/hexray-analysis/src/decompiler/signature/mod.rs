@@ -590,18 +590,41 @@ fn is_aarch64_frame_base_register(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "sp" | "x31" | "x29" | "fp")
 }
 
+/// If `name` is the top (index-7) argument register of its class, returns
+/// `Some(is_fp)`: `true` for the FP/SIMD `v7`/`q7`/`d7`/`s7`/`h7`, `false` for
+/// the GP `x7`/`w7`. Used to detect a *full* register-save area (the area spills
+/// the whole `[named..8)` run, so it reaches register 7); only then does the
+/// `8 - (-offset)/N` formula recover the named count. A gcc -O2 *compacted* save
+/// area stops short of register 7, so its offset must not be read as a count.
+fn aarch64_top_arg_register(name: &str) -> Option<bool> {
+    let lower = name.to_lowercase();
+    let (class, num) = lower.split_at(1);
+    if num != "7" {
+        return None;
+    }
+    match class {
+        "x" | "w" => Some(false),
+        "v" | "q" | "d" | "s" | "h" => Some(true),
+        _ => None,
+    }
+}
+
 /// Scan the prologue for the aarch64 AAPCS `__va_list` tag and recover the
 /// named (non-variadic) GP and FP/SIMD parameter counts as `(named_gp,
 /// named_fp)`. Returns `None` for a non-variadic function (no tag found). Each
-/// count is itself an `Option`: `None` when gcc compacted that save area (its
-/// offset field written as `0` because that varargs class isn't consumed), so
-/// those parameters are left to observation rather than capped. `Some` overall
+/// count is itself an `Option`: `Some(n)` only when that register-save area is a
+/// *full* `[named..8)` save (its top register x7/q7 is spilled); `None` when the
+/// area is compacted — gcc compacts it either to `0` (class unused) or, at -O2,
+/// to the *consumed* vararg count (which the formula would misread). A compacted
+/// count is left to observation rather than capped/fabricated. `Some` overall
 /// requires at least one canonical (negative) offset.
 ///
 /// The 32-byte tag is `{ void* __stack; void* __gr_top; void* __vr_top;
 /// int __gr_offs; int __vr_offs; }`. `va_start` initialises
-/// `__gr_offs = -(8 - named_gp) * 8` and `__vr_offs = -(8 - named_fp) * 16`, so
-/// `named_gp = 8 - (-__gr_offs)/8` and `named_fp = 8 - (-__vr_offs)/16`.
+/// `__gr_offs = -(area_regs) * 8` and `__vr_offs = -(area_regs) * 16`. For a full
+/// save `area_regs = 8 - named`, so `named_gp = 8 - (-__gr_offs)/8` and
+/// `named_fp = 8 - (-__vr_offs)/16`; for a compacted save the offset encodes the
+/// consumed count instead, so it can't be inverted to a named count.
 ///
 /// Unlike the SysV tag, the offset fields are materialised via a register
 /// (`movn w, #k` loads the negative `!k`; `str w, [slot]`) and the pointers via
@@ -619,6 +642,11 @@ pub fn scan_aapcs_va_list(
     }
     let mut const_stores: HashMap<i64, i128> = HashMap::new();
     let mut pointer_offsets: HashSet<i64> = HashSet::new();
+    // Whether the GP / FP register-save area spills its top register (x7 / q7),
+    // i.e. is a *full* `[named..8)` save — only then is the offset → count
+    // formula valid (gcc -O2 compacts to the consumed count and stops short).
+    let mut gp_full_save = false;
+    let mut fp_full_save = false;
     for block in cfg.blocks() {
         let mut regs: HashMap<String, RegVal> = HashMap::new();
         for inst in &block.instructions {
@@ -742,6 +770,11 @@ pub fn scan_aapcs_va_list(
                         // `str reg, [frame+disp]`.
                         (Some(Operand::Register(src)), Some(Operand::Memory(mem)), None) => {
                             if is_frame_base_memory(mem) {
+                                match aarch64_top_arg_register(src.name()) {
+                                    Some(true) => fp_full_save = true,
+                                    Some(false) => gp_full_save = true,
+                                    None => {}
+                                }
                                 record(
                                     mem.displacement,
                                     src,
@@ -760,6 +793,13 @@ pub fn scan_aapcs_va_list(
                             Some(Operand::Memory(mem)),
                         ) => {
                             if is_frame_base_memory(mem) {
+                                for reg in [r1, r2] {
+                                    match aarch64_top_arg_register(reg.name()) {
+                                        Some(true) => fp_full_save = true,
+                                        Some(false) => gp_full_save = true,
+                                        None => {}
+                                    }
+                                }
                                 let stride = i64::from(r1.size / 8).max(1);
                                 record(
                                     mem.displacement,
@@ -789,43 +829,39 @@ pub fn scan_aapcs_va_list(
     for gr_slot in gr_slots {
         let base = gr_slot - 24; // __gr_offs sits at tag base + 24
         let gr_offs = as_i32(*const_stores.get(&gr_slot)?);
-        // `__gr_offs = -(8 - named_gp) * 8` (named_gp 0..7) when the GP save area
-        // is canonical. gcc compacts it to `0` (via `wzr`/`xzr`) for an FP-only
-        // variadic like `double f(int n, ...) { va_arg(ap, double); }`, where no
-        // further GP varargs are consumed — record `None` (don't cap ints; let
-        // observation decide) rather than fabricating 8 GP params or declining.
-        // Any other non-canonical value isn't really the offset field — skip.
-        let named_gp = if gr_offs == 0 {
-            None
-        } else if (-64..0).contains(&gr_offs) && gr_offs % 8 == 0 {
-            Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
-        } else {
-            continue;
-        };
         let Some(&vr_raw) = const_stores.get(&(base + 28)) else {
             continue;
         };
         let vr_offs = as_i32(vr_raw);
-        // Symmetric to `__gr_offs`: `__vr_offs == 0` is the sentinel gcc -O2
-        // writes (`stp …, wzr`) for a COMPACTED FP save area when no FP varargs
-        // are consumed — common for integer-only variadics like `int f(int,
-        // ...)`. Treating it as `named_fp = 8` would fabricate eight `d*`
-        // parameters (codex P1), so record `None` (don't cap floats; let
-        // observation decide). Any other non-canonical value isn't the offset
-        // field — skip.
-        let named_fp = if vr_offs == 0 {
-            None
-        } else if (-128..0).contains(&vr_offs) && vr_offs % 16 == 0 {
-            Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
-        } else {
-            continue;
-        };
-        // At least one offset must be canonical (negative) so the tag is a real
-        // `__va_list` and not two zero-initialised words that happen to neighbour
-        // three pointers.
-        if named_gp.is_none() && named_fp.is_none() {
+        // An offset field is either a canonical negative value (`%8`/`%16`) or the
+        // compacted `0` gcc writes via `wzr` when that varargs class is unused.
+        // Anything else means this isn't the tag.
+        let gr_is_offset = gr_offs == 0 || ((-64..0).contains(&gr_offs) && gr_offs % 8 == 0);
+        let vr_is_offset = vr_offs == 0 || ((-128..0).contains(&vr_offs) && vr_offs % 16 == 0);
+        if !gr_is_offset || !vr_is_offset {
             continue;
         }
+        // At least one offset must be canonical (negative) so two zero-initialised
+        // words next to three pointers aren't mistaken for a `__va_list`.
+        if gr_offs >= 0 && vr_offs >= 0 {
+            continue;
+        }
+        // `__gr_offs = -(area_size_in_regs) * 8` and the named count is
+        // `8 - area_size` ONLY when the save area is *full* (`[named..8)`, reaching
+        // x7). gcc -O2 compacts the area to the *consumed* vararg count, so a
+        // negative offset there encodes that, not the named count — in which case
+        // (or when compacted to `0`) record `None` and let observation decide,
+        // rather than mis-capping/fabricating parameters.
+        let named_gp = if gr_offs < 0 && gp_full_save {
+            Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
+        } else {
+            None
+        };
+        let named_fp = if vr_offs < 0 && fp_full_save {
+            Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
+        } else {
+            None
+        };
         if pointer_offsets.contains(&base)
             && pointer_offsets.contains(&(base + 8))
             && pointer_offsets.contains(&(base + 16))
@@ -5178,11 +5214,11 @@ impl SignatureRecovery {
         used_args.sort_unstable();
 
         let variadic_fixed_param_count = self.infer_variadic_fixed_param_count(&used_args);
-        // A compacted aarch64 GP save area (`__gr_offs == 0`) marks the function
-        // variadic but leaves the named integer count unknown — no GP varargs are
-        // consumed, so we can neither cap nor materialise a contiguous `0..N`
-        // prefix without fabricating bogus x0..x7 params. Mark variadic and keep
-        // exactly the observed int args.
+        // When the aarch64 GP count is unknown (`named_gp == None`: a compacted
+        // gcc -O2 save area, or no GP varargs), we can neither cap nor materialise
+        // a contiguous `0..N` prefix without fabricating bogus x0..x7 params — mark
+        // variadic and keep exactly the observed int args. A full save
+        // (`named_gp == Some`) caps/fills normally below.
         let aapcs_uncapped_gp = matches!(self.aapcs_va_list_counts, Some((None, _)));
         if let Some(fixed_count) = variadic_fixed_param_count {
             sig.is_variadic = true;
@@ -5354,9 +5390,12 @@ impl SignatureRecovery {
         let float_param_cutoff: Option<usize> = if let Some((_, named_fp)) =
             self.aapcs_va_list_counts
         {
-            // aarch64 AAPCS: `__vr_offs` gives the named float count when the FP
-            // save area is canonical; `None` (compact, `__vr_offs == 0`) means
-            // don't cap — let ordinary float-arg observation decide.
+            // aarch64 AAPCS: `__vr_offs` gives the named float count only for a
+            // *full* FP save area (`named_fp == Some`); `None` (compacted gcc -O2,
+            // where the offset would encode the consumed count, or no FP varargs)
+            // means don't cap — let ordinary float-arg observation decide. (gcc
+            // -O2 compaction would otherwise misread e.g. `__vr_offs = -16` as 7
+            // named floats and leak q0..q6.)
             named_fp
         } else {
             variadic_fixed_param_count.map(|int_fixed| {
@@ -6041,14 +6080,12 @@ impl SignatureRecovery {
     }
 
     fn infer_variadic_fixed_param_count(&self, used_args: &[usize]) -> Option<usize> {
-        // aarch64 AAPCS: the `__va_list` tag's `__gr_offs` directly encodes the
-        // named integer-parameter prefix; the SysV materialization heuristics
-        // below don't apply (different ABI / tag layout). A compacted GP save
-        // area (`named_gp == None`) means no GP varargs are consumed, so every
-        // observed int-register arg is itself a named parameter (contiguous from
-        // x0) and there are no others — derive the prefix from observation. Using
-        // `max_int_args()` here would be wrong: `build_signature` materialises a
-        // contiguous `0..fixed_count` prefix, fabricating bogus x0..x7 params.
+        // aarch64 AAPCS: a `__va_list` tag marks the function variadic. The named
+        // GP count is recoverable only from a *full* register-save area
+        // (`named_gp == Some`); when it's `None` (compacted/gcc -O2, or no GP
+        // varargs) `build_signature` skips the cap/fabrication (see
+        // `aapcs_uncapped_gp`) and keeps the observed args — the marker value
+        // returned here is unused in that case.
         if let Some((named_gp, _)) = self.aapcs_va_list_counts {
             return Some(named_gp.unwrap_or_else(|| {
                 used_args.iter().copied().max().map_or(0, |m| m + 1)
@@ -8482,10 +8519,31 @@ mod tests {
                 vec![Operand::Register(w0()), Operand::imm(k, 32)],
             )
         };
+        // Full-save markers: spilling the top arg registers x7 / v7 signals the
+        // save area reaches register 7, so the offset → count formula applies.
+        let str_x7 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(aarch64_x(7, 64)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let str_v7 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(aarch64_x(hexray_core::register::arm64::V7, 128)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
         // __va_list tag at base 24: __stack@24, __gr_top@32, __vr_top@40,
         // __gr_offs@48, __vr_offs@52.
         let tag = |gr_k: i128, vr_k: i128| {
             aarch64_single_block_cfg(vec![
+                str_x7(64),
+                str_v7(80),
                 add_frame(0x110),
                 str_x0(24),
                 add_frame(0x110),
@@ -8566,6 +8624,7 @@ mod tests {
         };
         // Full tag shape but __vr_offs written directly with `str wzr` (== 0).
         let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 64), // x7 spilled -> full GP save (named_gp recoverable)
             add_sp(8, 0x110),
             add_sp(9, 0x110),
             stp(8, 9, 24),
@@ -8624,6 +8683,8 @@ mod tests {
             )
         };
         let cfg = aarch64_single_block_cfg(vec![
+            // v7 spilled -> full FP save (named_fp recoverable from __vr_offs).
+            str_reg(hexray_core::register::arm64::V7, 128, 80),
             add_sp(8, 0x110),
             str_reg(8, 64, 24),
             add_sp(9, 0x110),
@@ -8684,6 +8745,7 @@ mod tests {
             )
         };
         let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 64), // x7 spilled -> full GP save
             add_sp(8, 0x110),
             str_reg(8, 64, 24),
             add_sp(9, 0x110),
@@ -8749,7 +8811,12 @@ mod tests {
         };
         // __stack@24 + __gr_top@32 written by one STP of two frame pointers;
         // __vr_top@40 via a chained `add x10, sp, #..; add x10, x10, #..`.
+        // x7 / v7 spills mark a full GP+FP save so the offset -> count formula
+        // applies (see `aarch64_top_arg_register`).
+        const V7: u16 = hexray_core::register::arm64::V7;
         let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 300),
+            str_reg(V7, 128, 320),
             add_sp(8, 0x110),
             add_sp(9, 0x110),
             stp(8, 9, 24),
@@ -8777,6 +8844,8 @@ mod tests {
             )
         };
         let cfg2 = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 300),
+            str_reg(V7, 128, 320),
             add_sp(8, 0x110),
             add_sp(9, 0x110),
             stp(8, 9, 24), // __stack@24, __gr_top@32
@@ -8812,6 +8881,8 @@ mod tests {
         // -> __gr_offs@200, __vr_offs@204. mov x11,#-56 then movk #0xff80,lsl#32
         // gives 0xffffff80_ffffffc8 -> gr=-56 (named_gp=1), vr=-128 (named_fp=0).
         let cfg3 = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 300),
+            str_reg(V7, 128, 320),
             add_sp(8, 0x100),
             add_sp(9, 0x100),
             stp(8, 9, 176), // __stack@176, __gr_top@184
