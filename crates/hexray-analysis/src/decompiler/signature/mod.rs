@@ -635,7 +635,15 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                         (inst.operands.first(), inst.operands.get(1))
                     {
                         let name = aarch64_canon_reg(dst.name());
-                        if is_aarch64_frame_base_register(base.name()) {
+                        // The result is a frame address when `base` is a frame
+                        // register OR already holds a frame address — so chained
+                        // `add x8, sp, #32; add x8, x8, #112` (clang) propagates.
+                        let base_is_frame = is_aarch64_frame_base_register(base.name())
+                            || matches!(
+                                regs.get(&aarch64_canon_reg(base.name())),
+                                Some(RegVal::FrameAddr)
+                            );
+                        if base_is_frame {
                             regs.insert(name, RegVal::FrameAddr);
                         } else {
                             regs.remove(&name);
@@ -643,21 +651,59 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                     }
                 }
                 Operation::Store => {
-                    // aarch64 store form: `str reg, [frame+disp]`.
-                    if let (Some(Operand::Register(src)), Some(Operand::Memory(mem))) =
-                        (inst.operands.first(), inst.operands.get(1))
-                    {
-                        if is_frame_base_memory(mem) {
-                            match regs.get(&aarch64_canon_reg(src.name())) {
-                                Some(RegVal::Imm(v)) => {
-                                    const_stores.entry(mem.displacement).or_insert(*v);
-                                }
-                                Some(RegVal::FrameAddr) => {
-                                    pointer_offsets.insert(mem.displacement);
-                                }
-                                None => {}
+                    let record = |off: i64,
+                                  reg: &str,
+                                  consts: &mut HashMap<i64, i128>,
+                                  ptrs: &mut HashSet<i64>| {
+                        match regs.get(&aarch64_canon_reg(reg)) {
+                            Some(RegVal::Imm(v)) => {
+                                consts.entry(off).or_insert(*v);
+                            }
+                            Some(RegVal::FrameAddr) => {
+                                ptrs.insert(off);
+                            }
+                            None => {}
+                        }
+                    };
+                    match (
+                        inst.operands.first(),
+                        inst.operands.get(1),
+                        inst.operands.get(2),
+                    ) {
+                        // `str reg, [frame+disp]`.
+                        (Some(Operand::Register(src)), Some(Operand::Memory(mem)), None) => {
+                            if is_frame_base_memory(mem) {
+                                record(
+                                    mem.displacement,
+                                    src.name(),
+                                    &mut const_stores,
+                                    &mut pointer_offsets,
+                                );
                             }
                         }
+                        // `stp r1, r2, [frame+disp]` — r1 at disp, r2 at disp+8
+                        // (optimized prologues initialise the tag this way).
+                        (
+                            Some(Operand::Register(r1)),
+                            Some(Operand::Register(r2)),
+                            Some(Operand::Memory(mem)),
+                        ) => {
+                            if is_frame_base_memory(mem) {
+                                record(
+                                    mem.displacement,
+                                    r1.name(),
+                                    &mut const_stores,
+                                    &mut pointer_offsets,
+                                );
+                                record(
+                                    mem.displacement + 8,
+                                    r2.name(),
+                                    &mut const_stores,
+                                    &mut pointer_offsets,
+                                );
+                            }
+                        }
+                        _ => {}
                     }
                 }
                 _ => {}
@@ -8342,6 +8388,74 @@ mod tests {
         let no_ptrs =
             aarch64_single_block_cfg(vec![movn_w0(55), str_w0(48), movn_w0(127), str_w0(52)]);
         assert_eq!(scan_aapcs_va_list(&no_ptrs), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_handles_chained_adds_and_stp_pairs() {
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add = |dst: u16, base: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x(base, 64)),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let stp = |r1: u16, r2: u16, slot: i64| {
+            (
+                "stp",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(r1, 64)),
+                    Operand::Register(x(r2, 64)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        // __stack@24 + __gr_top@32 written by one STP of two frame pointers;
+        // __vr_top@40 via a chained `add x10, sp, #..; add x10, x10, #..`.
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            add_sp(9, 0x110),
+            stp(8, 9, 24),
+            add_sp(10, 0x80),
+            add(10, 10, 0x50),
+            str_reg(10, 64, 40),
+            movn(0, 55),
+            str_reg(0, 32, 48),
+            movn(0, 127),
+            str_reg(0, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((1, 0)));
     }
 
     #[test]
