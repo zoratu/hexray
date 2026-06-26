@@ -174,11 +174,15 @@ pub struct SignatureRecovery {
     /// diamonds (deleting the `fp_offset` store the structured-body resolver
     /// reads). See [`scan_sysv_va_list_named_float_count`].
     va_list_float_count_seed: Option<usize>,
-    /// aarch64 AAPCS variadic `(named_gp, named_fp)` counts recovered from the
-    /// `__va_list` tag in the prologue (see [`scan_aapcs_va_list`]). `Some`
-    /// marks the function variadic; the named counts cap the recovered integer
-    /// and float parameters so the GP/SIMD register-save area isn't surfaced.
-    aapcs_va_list_counts: Option<(usize, usize)>,
+    /// aarch64 AAPCS variadic counts recovered from the `__va_list` tag in the
+    /// prologue (see [`scan_aapcs_va_list`]): `Some((named_gp, named_fp))` marks
+    /// the function variadic and caps the recovered integer/float parameters so
+    /// the GP/SIMD register-save area isn't surfaced. The float count is itself
+    /// an `Option`: `None` when gcc compacted the FP save area (`__vr_offs == 0`
+    /// because no FP varargs are consumed), in which case the float parameters
+    /// are left to ordinary observation rather than capped from a meaningless
+    /// offset.
+    aapcs_va_list_counts: Option<(usize, Option<usize>)>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -600,7 +604,7 @@ fn is_aarch64_frame_base_register(name: &str) -> bool {
 /// values. The full tag shape (three frame-pointer fields + the two offset
 /// fields at the right relative positions) is required so an unrelated constant
 /// can't be mistaken for the tag.
-pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
+pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize>)> {
     #[derive(Clone, Copy)]
     enum RegVal {
         Imm(i128),
@@ -750,12 +754,10 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
     for gr_slot in gr_slots {
         let base = gr_slot - 24; // __gr_offs sits at tag base + 24
         let gr_offs = as_i32(*const_stores.get(&gr_slot)?);
-        // Require STRICTLY-negative canonical offsets (`-(8 - named) * stride`
-        // with `named < 8`). `0` would mean all 8 registers are named — which
-        // is implausible for a variadic — and is also the sentinel gcc -O2
-        // writes (`stp …, wzr`) for a COMPACTED save area when the matching
-        // varargs class isn't consumed; treating that as `named = 8` would
-        // fabricate eight fixed parameters (codex P1). Decline instead.
+        // `__gr_offs` is the variadic anchor and must be a strictly-negative
+        // canonical value (`-(8 - named_gp) * 8`, named_gp 0..7). `0` would mean
+        // all 8 GP registers are named (implausible for a variadic) or a
+        // compacted GP save area we can't trust — decline.
         if !(-64..0).contains(&gr_offs) || gr_offs % 8 != 0 {
             continue;
         }
@@ -763,15 +765,25 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
             continue;
         };
         let vr_offs = as_i32(vr_raw);
-        if !(-128..0).contains(&vr_offs) || vr_offs % 16 != 0 {
+        // `__vr_offs == 0` is the sentinel gcc -O2 writes (`stp …, wzr`) for a
+        // COMPACTED FP save area when no FP varargs are consumed — common for
+        // integer-only variadics like `int f(int, ...)`. Treating it as
+        // `named_fp = 8` would fabricate eight `d*` parameters (codex P1), so
+        // record `None` (don't cap floats; let observation decide) rather than
+        // declining the whole tag (codex P2). Any other non-canonical value
+        // means it isn't really the offset field — skip.
+        let named_fp = if vr_offs == 0 {
+            None
+        } else if (-128..0).contains(&vr_offs) && vr_offs % 16 == 0 {
+            Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
+        } else {
             continue;
-        }
+        };
         if pointer_offsets.contains(&base)
             && pointer_offsets.contains(&(base + 8))
             && pointer_offsets.contains(&(base + 16))
         {
             let named_gp = 8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?;
-            let named_fp = 8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?;
             return Some((named_gp, named_fp));
         }
     }
@@ -1356,9 +1368,8 @@ impl SignatureRecovery {
         self
     }
 
-    /// Seeds the aarch64 AAPCS variadic `(named_gp, named_fp)` counts
-    /// (see [`scan_aapcs_va_list`]).
-    pub fn with_aapcs_va_list_counts(mut self, counts: Option<(usize, usize)>) -> Self {
+    /// Seeds the aarch64 AAPCS variadic counts (see [`scan_aapcs_va_list`]).
+    pub fn with_aapcs_va_list_counts(mut self, counts: Option<(usize, Option<usize>)>) -> Self {
         self.aapcs_va_list_counts = counts;
         self
     }
@@ -5283,20 +5294,24 @@ impl SignatureRecovery {
         // back to the integer fixed-count only when `fp_offset` wasn't seen
         // (e.g. the structurer already collapsed the diamond) to avoid
         // regressing the pre-existing behaviour there.
-        let float_param_cutoff = variadic_fixed_param_count.map(|int_fixed| {
-            // aarch64 AAPCS: the `__vr_offs` field gives the named float count
-            // directly.
-            if let Some((_, named_fp)) = self.aapcs_va_list_counts {
-                return named_fp;
-            }
-            // SysV: prefer the structured-body __va_list_tag resolver; fall back
-            // to the raw-prologue seed when the va_arg diamonds were already
-            // collapsed (which deletes the fp_offset store the resolver reads);
-            // only then fall back to the integer prefix.
-            self.resolve_sysv_named_float_count()
-                .or(self.va_list_float_count_seed)
-                .unwrap_or(int_fixed)
-        });
+        let float_param_cutoff: Option<usize> = if let Some((_, named_fp)) =
+            self.aapcs_va_list_counts
+        {
+            // aarch64 AAPCS: `__vr_offs` gives the named float count when the FP
+            // save area is canonical; `None` (compact, `__vr_offs == 0`) means
+            // don't cap — let ordinary float-arg observation decide.
+            named_fp
+        } else {
+            variadic_fixed_param_count.map(|int_fixed| {
+                // SysV: prefer the structured-body __va_list_tag resolver; fall
+                // back to the raw-prologue seed when the va_arg diamonds were
+                // already collapsed (which deletes the fp_offset store the
+                // resolver reads); only then fall back to the integer prefix.
+                self.resolve_sysv_named_float_count()
+                    .or(self.va_list_float_count_seed)
+                    .unwrap_or(int_fixed)
+            })
+        };
         for (idx, reg) in float_regs.iter().enumerate() {
             if float_param_cutoff.is_some_and(|cutoff| idx >= cutoff) {
                 continue;
@@ -8420,9 +8435,9 @@ mod tests {
             ])
         };
         // movn #55 -> gr_offs=-56 -> named_gp=1; movn #127 -> vr_offs=-128 -> 0.
-        assert_eq!(scan_aapcs_va_list(&tag(55, 127)), Some((1, 0)));
+        assert_eq!(scan_aapcs_va_list(&tag(55, 127)), Some((1, Some(0))));
         // 2 named GP, 1 named FP: gr_offs=-48 (movn #47), vr_offs=-112 (movn #111).
-        assert_eq!(scan_aapcs_va_list(&tag(47, 111)), Some((2, 1)));
+        assert_eq!(scan_aapcs_va_list(&tag(47, 111)), Some((2, Some(1))));
         // Missing the pointer fields -> not a tag.
         let no_ptrs =
             aarch64_single_block_cfg(vec![movn_w0(55), str_w0(48), movn_w0(127), str_w0(52)]);
@@ -8430,11 +8445,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_aapcs_va_list_declines_compact_vr_offs_zero() {
+    fn scan_aapcs_va_list_treats_compact_vr_offs_zero_as_unknown_float_count() {
         // gcc -O2 writes __vr_offs = 0 (`stp …, wzr`) for a compacted FP save
-        // area when no FP varargs are consumed. That is the canonical value for
-        // 8 named floats; deriving the count from it would fabricate parameters,
-        // so the full tag must be declined (codex P1 on PR #49).
+        // area when no FP varargs are consumed (`int f(int, ...)`). The function
+        // is still variadic (named_gp from __gr_offs), but the float count is
+        // unknown -> `None`, NOT 8 (which would fabricate parameters, codex P1).
         let sp = || aarch64_x(31, 64);
         let x = aarch64_x;
         let add_sp = |dst: u16, imm: i128| {
@@ -8492,7 +8507,8 @@ mod tests {
             mov0(0), // __vr_offs = 0 (compact sentinel)
             str_reg(0, 32, 52),
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg), None);
+        // Variadic (named_gp = 1) with an unknown/uncapped float count.
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((1, None)));
     }
 
     #[test]
@@ -8560,7 +8576,7 @@ mod tests {
             movn(0, 127),
             str_reg(0, 32, 52),
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg), Some((1, 0)));
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((1, Some(0))));
 
         // The two 32-bit offset fields written by one `stp w0, w1, [sp, #48]`:
         // w0 at 48 (__gr_offs), w1 at 48+4=52 (__vr_offs).
@@ -8585,7 +8601,7 @@ mod tests {
             movn(1, 127),        // w1 = __vr_offs = -128
             stp_w(0, 1, 48),     // 32-bit pair: w0@48, w1@52
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg2), Some((1, 0)));
+        assert_eq!(scan_aapcs_va_list(&cfg2), Some((1, Some(0))));
 
         // clang -O1/-O2 packs both 32-bit offset fields into one x register
         // with `mov`+`movk` and stores it 64-bit wide.
@@ -8620,7 +8636,7 @@ mod tests {
             movk(11, 0xff80, 32),
             str_reg(11, 64, 200), // packed -> gr@200, vr@204
         ]);
-        assert_eq!(scan_aapcs_va_list(&cfg3), Some((1, 0)));
+        assert_eq!(scan_aapcs_va_list(&cfg3), Some((1, Some(0))));
     }
 
     #[test]
