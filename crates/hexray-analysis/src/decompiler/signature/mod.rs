@@ -626,6 +626,11 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, Option<usize
                                 // field at shift `s`, keeping the rest — used to
                                 // pack the two 32-bit offset fields into one
                                 // x register (`mov x8, #-56; movk x8, #.., lsl #32`).
+                                // hexray decodes this as three operands —
+                                // `[dst, Immediate(k, 16), Immediate(s, 8)]` — so
+                                // the `lsl` amount is operand 2 (verified against
+                                // a real clang -O2 binary). There is no duplicated
+                                // immediate operand.
                                 let shift = match inst.operands.get(2) {
                                     Some(Operand::Immediate(s)) => (s.value as u32) & 63,
                                     _ => 0,
