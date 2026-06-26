@@ -174,6 +174,11 @@ pub struct SignatureRecovery {
     /// diamonds (deleting the `fp_offset` store the structured-body resolver
     /// reads). See [`scan_sysv_va_list_named_float_count`].
     va_list_float_count_seed: Option<usize>,
+    /// aarch64 AAPCS variadic `(named_gp, named_fp)` counts recovered from the
+    /// `__va_list` tag in the prologue (see [`scan_aapcs_va_list`]). `Some`
+    /// marks the function variadic; the named counts cap the recovered integer
+    /// and float parameters so the GP/SIMD register-save area isn't surfaced.
+    aapcs_va_list_counts: Option<(usize, usize)>,
     /// Explicit parameter type overrides inferred from wrappers/patterns.
     param_type_overrides: HashMap<usize, ParamType>,
     /// DWARF parameter names in declaration order.
@@ -557,6 +562,132 @@ pub fn scan_sysv_va_list_named_float_count(
         }
         if pointer_offsets.contains(&(base + 8)) && pointer_offsets.contains(&(base + 16)) {
             return usize::try_from((fp - 48) / 16).ok();
+        }
+    }
+    None
+}
+
+/// Canonicalize an aarch64 GP register name to its 64-bit form: `w{n}` and
+/// `x{n}` alias the same physical register, so the `mov w0, …; str x0, …`
+/// sequences that build the va_list tag must be tracked as one register.
+fn aarch64_canon_reg(name: &str) -> String {
+    let lower = name.to_lowercase();
+    if let Some(num) = lower.strip_prefix('w') {
+        if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+            return format!("x{num}");
+        }
+    }
+    lower
+}
+
+/// True if `name` is an aarch64 frame/stack base register (`sp`, `x29`/`fp`).
+fn is_aarch64_frame_base_register(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "sp" | "x31" | "x29" | "fp")
+}
+
+/// Scan the prologue for the aarch64 AAPCS `__va_list` tag and recover the
+/// named (non-variadic) GP and FP/SIMD parameter counts as `(named_gp,
+/// named_fp)`. Returns `None` for a non-variadic function (no tag found).
+///
+/// The 32-byte tag is `{ void* __stack; void* __gr_top; void* __vr_top;
+/// int __gr_offs; int __vr_offs; }`. `va_start` initialises
+/// `__gr_offs = -(8 - named_gp) * 8` and `__vr_offs = -(8 - named_fp) * 16`, so
+/// `named_gp = 8 - (-__gr_offs)/8` and `named_fp = 8 - (-__vr_offs)/16`.
+///
+/// Unlike the SysV tag, the offset fields are materialised via a register
+/// (`movn w, #k` loads the negative `!k`; `str w, [slot]`) and the pointers via
+/// `add x, sp, #N; str x, [slot]`, so this tracks simple per-block register
+/// values. The full tag shape (three frame-pointer fields + the two offset
+/// fields at the right relative positions) is required so an unrelated constant
+/// can't be mistaken for the tag.
+pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
+    #[derive(Clone, Copy)]
+    enum RegVal {
+        Imm(i128),
+        FrameAddr,
+    }
+    let mut const_stores: HashMap<i64, i128> = HashMap::new();
+    let mut pointer_offsets: HashSet<i64> = HashSet::new();
+    for block in cfg.blocks() {
+        let mut regs: HashMap<String, RegVal> = HashMap::new();
+        for inst in &block.instructions {
+            match inst.operation {
+                Operation::Move => {
+                    if let Some(Operand::Register(dst)) = inst.operands.first() {
+                        let name = aarch64_canon_reg(dst.name());
+                        if let Some(Operand::Immediate(imm)) = inst.operands.get(1) {
+                            // aarch64 builds small negative immediates with MOVN
+                            // (`movn w, #k` -> `!k`); the disassembler surfaces
+                            // the raw MOVN operand, so resolve it here.
+                            let value = if inst.mnemonic.eq_ignore_ascii_case("movn") {
+                                !imm.value
+                            } else {
+                                imm.value
+                            };
+                            regs.insert(name, RegVal::Imm(value));
+                        } else {
+                            regs.remove(&name);
+                        }
+                    }
+                }
+                Operation::Add => {
+                    if let (Some(Operand::Register(dst)), Some(Operand::Register(base))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    {
+                        let name = aarch64_canon_reg(dst.name());
+                        if is_aarch64_frame_base_register(base.name()) {
+                            regs.insert(name, RegVal::FrameAddr);
+                        } else {
+                            regs.remove(&name);
+                        }
+                    }
+                }
+                Operation::Store => {
+                    // aarch64 store form: `str reg, [frame+disp]`.
+                    if let (Some(Operand::Register(src)), Some(Operand::Memory(mem))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    {
+                        if is_frame_base_memory(mem) {
+                            match regs.get(&aarch64_canon_reg(src.name())) {
+                                Some(RegVal::Imm(v)) => {
+                                    const_stores.entry(mem.displacement).or_insert(*v);
+                                }
+                                Some(RegVal::FrameAddr) => {
+                                    pointer_offsets.insert(mem.displacement);
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // 32-bit offset fields may arrive sign-extended or as a raw u32; normalize.
+    let as_i32 = |v: i128| -> i128 { (v as i32) as i128 };
+    let mut gr_slots: Vec<i64> = const_stores.keys().copied().collect();
+    gr_slots.sort_unstable();
+    for gr_slot in gr_slots {
+        let base = gr_slot - 24; // __gr_offs sits at tag base + 24
+        let gr_offs = as_i32(*const_stores.get(&gr_slot)?);
+        if !(-64..=0).contains(&gr_offs) || gr_offs % 8 != 0 {
+            continue;
+        }
+        let Some(&vr_raw) = const_stores.get(&(base + 28)) else {
+            continue;
+        };
+        let vr_offs = as_i32(vr_raw);
+        if !(-128..=0).contains(&vr_offs) || vr_offs % 16 != 0 {
+            continue;
+        }
+        if pointer_offsets.contains(&base)
+            && pointer_offsets.contains(&(base + 8))
+            && pointer_offsets.contains(&(base + 16))
+        {
+            let named_gp = 8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?;
+            let named_fp = 8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?;
+            return Some((named_gp, named_fp));
         }
     }
     None
@@ -1070,6 +1201,7 @@ impl SignatureRecovery {
             invalidated_spill_offsets: HashSet::new(),
             param_spill_order: Vec::new(),
             va_list_float_count_seed: None,
+            aapcs_va_list_counts: None,
             param_type_overrides: HashMap::new(),
             dwarf_param_names: Vec::new(),
             param_hints: HashMap::new(),
@@ -1136,6 +1268,13 @@ impl SignatureRecovery {
     /// recovery ran.
     pub fn with_va_list_float_count_seed(mut self, count: Option<usize>) -> Self {
         self.va_list_float_count_seed = count;
+        self
+    }
+
+    /// Seeds the aarch64 AAPCS variadic `(named_gp, named_fp)` counts
+    /// (see [`scan_aapcs_va_list`]).
+    pub fn with_aapcs_va_list_counts(mut self, counts: Option<(usize, usize)>) -> Self {
+        self.aapcs_va_list_counts = counts;
         self
     }
 
@@ -5060,8 +5199,13 @@ impl SignatureRecovery {
         // (e.g. the structurer already collapsed the diamond) to avoid
         // regressing the pre-existing behaviour there.
         let float_param_cutoff = variadic_fixed_param_count.map(|int_fixed| {
-            // Prefer the structured-body __va_list_tag resolver; fall back to
-            // the raw-prologue seed when the va_arg diamonds were already
+            // aarch64 AAPCS: the `__vr_offs` field gives the named float count
+            // directly.
+            if let Some((_, named_fp)) = self.aapcs_va_list_counts {
+                return named_fp;
+            }
+            // SysV: prefer the structured-body __va_list_tag resolver; fall back
+            // to the raw-prologue seed when the va_arg diamonds were already
             // collapsed (which deletes the fp_offset store the resolver reads);
             // only then fall back to the integer prefix.
             self.resolve_sysv_named_float_count()
@@ -5740,6 +5884,12 @@ impl SignatureRecovery {
     }
 
     fn infer_variadic_fixed_param_count(&self, used_args: &[usize]) -> Option<usize> {
+        // aarch64 AAPCS: the `__va_list` tag's `__gr_offs` directly encodes the
+        // named integer-parameter prefix; the SysV materialization heuristics
+        // below don't apply (different ABI / tag layout).
+        if let Some((named_gp, _)) = self.aapcs_va_list_counts {
+            return Some(named_gp);
+        }
         if !self.has_sysv_va_list_materialization() {
             return None;
         }
@@ -8128,6 +8278,70 @@ mod tests {
             scan_sysv_va_list_named_float_count(&tag(48), CallingConvention::Win64),
             None
         );
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_recovers_named_gp_and_fp_counts() {
+        let sp = || aarch64_x(31, 64);
+        let x0 = || aarch64_x(0, 64);
+        let w0 = || aarch64_x(0, 32);
+        let add_frame = |imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x0()),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_x0 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x0()), aarch64_mem(sp(), slot)],
+            )
+        };
+        let str_w0 = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(w0()), aarch64_mem(sp(), slot)],
+            )
+        };
+        // `movn w0, #k` loads `!k`; e.g. `__gr_offs = -56` is `movn w0, #55`.
+        let movn_w0 = |k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(w0()), Operand::imm(k, 32)],
+            )
+        };
+        // __va_list tag at base 24: __stack@24, __gr_top@32, __vr_top@40,
+        // __gr_offs@48, __vr_offs@52.
+        let tag = |gr_k: i128, vr_k: i128| {
+            aarch64_single_block_cfg(vec![
+                add_frame(0x110),
+                str_x0(24),
+                add_frame(0x110),
+                str_x0(32),
+                add_frame(0xd0),
+                str_x0(40),
+                movn_w0(gr_k),
+                str_w0(48),
+                movn_w0(vr_k),
+                str_w0(52),
+            ])
+        };
+        // movn #55 -> gr_offs=-56 -> named_gp=1; movn #127 -> vr_offs=-128 -> 0.
+        assert_eq!(scan_aapcs_va_list(&tag(55, 127)), Some((1, 0)));
+        // 2 named GP, 1 named FP: gr_offs=-48 (movn #47), vr_offs=-112 (movn #111).
+        assert_eq!(scan_aapcs_va_list(&tag(47, 111)), Some((2, 1)));
+        // Missing the pointer fields -> not a tag.
+        let no_ptrs =
+            aarch64_single_block_cfg(vec![movn_w0(55), str_w0(48), movn_w0(127), str_w0(52)]);
+        assert_eq!(scan_aapcs_va_list(&no_ptrs), None);
     }
 
     #[test]
