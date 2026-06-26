@@ -99,25 +99,40 @@ fn build_frame(body: &[StructuredNode]) -> Option<Frame> {
     // The frame is the first parameter, represented as `Unknown("arg0")` (or a
     // `Var` named `arg0`). Find a representative base expression.
     let base_expr = find_frame_param(body)?;
-    let mut aliases = HashSet::new();
-    aliases.insert(alias_key(&base_expr)?);
+    let base_key = alias_key(&base_expr)?;
 
-    // Fixpoint: a `mem = <frame alias>` copy (the prologue spill) makes that
-    // stack home another alias. Restricted to memory destinations so reused
-    // scratch registers don't pollute the set.
+    // Collect, per stable home (memory location / stack-slot var — scratch
+    // registers excluded since they get reused), the alias key of every value
+    // ever assigned to it (`None` for a non-aliasable RHS such as a call result).
+    let mut assigns: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    visit_assignments(body, &mut |lhs, rhs| {
+        if !is_stable_frame_home(lhs) {
+            return;
+        }
+        if let Some(lk) = alias_key(lhs) {
+            assigns.entry(lk).or_default().push(alias_key(rhs));
+        }
+    });
+
+    // A home is a frame alias only if EVERY assignment to it copies a frame
+    // alias — so a slot reused for a non-frame value after the prologue spill is
+    // never trusted. Fixpoint from the parameter (which the body never reassigns).
+    let mut aliases: HashSet<String> = HashSet::from([base_key]);
     loop {
         let mut changed = false;
-        visit_assignments(body, &mut |lhs, rhs| {
-            if !is_stable_frame_home(lhs) {
-                return;
+        for (home, rhss) in &assigns {
+            if aliases.contains(home) {
+                continue;
             }
-            if let (Some(rk), Some(lk)) = (alias_key(rhs), alias_key(lhs)) {
-                if aliases.contains(&rk) && !aliases.contains(&lk) {
-                    aliases.insert(lk);
-                    changed = true;
-                }
+            if !rhss.is_empty()
+                && rhss
+                    .iter()
+                    .all(|r| r.as_ref().is_some_and(|rk| aliases.contains(rk)))
+            {
+                aliases.insert(home.clone());
+                changed = true;
             }
-        });
+        }
         if !changed {
             break;
         }
@@ -1297,6 +1312,33 @@ mod tests {
         )];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn reused_stack_slot_is_not_treated_as_frame_alias() {
+        // local_8 = arg0; local_8 = <non-frame>; if (local_8[18]==0/1) ...
+        // Because local_8 is later overwritten with a non-frame value, it must NOT
+        // be trusted as the frame, so its `[18]` compares aren't a resume dispatch.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let local_state = || Expr::array_access(local(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![
+                Expr::assign(local(), frame()),
+                Expr::assign(local(), Expr::var(Variable::reg("rcx", 8))), // non-frame reuse
+            ]),
+            iff(
+                cmp(BinOpKind::Eq, local_state(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, local_state(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
+        assert!(!format!("{out:?}").contains(RESUME_FIELD_NAME));
     }
 
     #[test]
