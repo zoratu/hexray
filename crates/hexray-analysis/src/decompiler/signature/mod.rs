@@ -738,7 +738,13 @@ pub fn scan_aapcs_va_list(
             spills.push((base_class, slot, idx));
         }
     }
-    for block in cfg.blocks() {
+    for (block_idx, block) in cfg.blocks().enumerate() {
+        // Incoming argument registers only hold their caller-passed values in the
+        // entry block's straight-line prologue (where va_start spills the
+        // register-save area). In any later block a register may have been
+        // redefined on some path, so the "untouched incoming arg" assumption — and
+        // thus arg-spill detection — is only valid in the first block.
+        let is_entry_block = block_idx == 0;
         let mut regs: HashMap<String, RegVal> = HashMap::new();
         for inst in &block.instructions {
             match inst.operation {
@@ -902,13 +908,15 @@ pub fn scan_aapcs_va_list(
                                     .base
                                     .as_ref()
                                     .and_then(|r| aarch64_frame_base_class(r.name()));
-                                note_arg_spill(
-                                    src,
-                                    base_class,
-                                    mem.displacement,
-                                    &regs,
-                                    &mut save_area,
-                                );
+                                if is_entry_block {
+                                    note_arg_spill(
+                                        src,
+                                        base_class,
+                                        mem.displacement,
+                                        &regs,
+                                        &mut save_area,
+                                    );
+                                }
                                 if let Some(bc) = base_class {
                                     record(
                                         bc,
@@ -936,14 +944,16 @@ pub fn scan_aapcs_va_list(
                                     .as_ref()
                                     .and_then(|r| aarch64_frame_base_class(r.name()));
                                 let stride = i64::from(r1.size / 8).max(1);
-                                for (i, reg) in [r1, r2].into_iter().enumerate() {
-                                    note_arg_spill(
-                                        reg,
-                                        base_class,
-                                        mem.displacement + stride * i as i64,
-                                        &regs,
-                                        &mut save_area,
-                                    );
+                                if is_entry_block {
+                                    for (i, reg) in [r1, r2].into_iter().enumerate() {
+                                        note_arg_spill(
+                                            reg,
+                                            base_class,
+                                            mem.displacement + stride * i as i64,
+                                            &regs,
+                                            &mut save_area,
+                                        );
+                                    }
                                 }
                                 if let Some(bc) = base_class {
                                     record(
@@ -969,11 +979,15 @@ pub fn scan_aapcs_va_list(
                     }
                 }
                 Operation::Call | Operation::Syscall => {
-                    // x0..x7 / v0..v7 are caller-saved: after a call they no longer
-                    // hold incoming arguments, so clobber them — a post-call store
-                    // of one must not be mistaken for a prologue arg spill.
-                    for i in 0..8 {
+                    // Caller-saved registers don't survive a call: x0..x18 (args +
+                    // scratch x8..x18, which the scanner uses to build tag pointers)
+                    // and the v0..v7 FP arg/scratch bank. Clobber them so a stale
+                    // pre-call FrameAddr or a post-call store isn't read as a tag
+                    // pointer field or an incoming-argument spill.
+                    for i in 0..=18 {
                         regs.insert(format!("x{i}"), RegVal::Clobbered);
+                    }
+                    for i in 0..8 {
                         regs.insert(format!("v{i}"), RegVal::Clobbered);
                     }
                 }
