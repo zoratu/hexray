@@ -628,6 +628,19 @@ pub fn scan_aapcs_va_list(
                         let name = aarch64_canon_reg(dst.name());
                         if let Some(Operand::Immediate(imm)) = inst.operands.get(1) {
                             let mnemonic = inst.mnemonic.to_ascii_lowercase();
+                            // A 32-bit (`wN`) write zero-extends into the full X
+                            // register, so the high 32 bits become 0. Mask the
+                            // recorded value accordingly; otherwise a later 64-bit
+                            // `str xN` would split the high half as 0xffffffff
+                            // instead of 0 and reject valid packed forms such as
+                            // `movn w,#55` (gr_offs=-56) + `str x` (vr_offs=0).
+                            let zext = |raw: i128| -> i128 {
+                                if dst.size <= 32 {
+                                    (raw as u64 & 0xffff_ffff) as i128
+                                } else {
+                                    raw
+                                }
+                            };
                             if mnemonic == "movk" {
                                 // `movk reg, #k, lsl #s` overwrites the 16-bit
                                 // field at shift `s`, keeping the rest — used to
@@ -648,15 +661,15 @@ pub fn scan_aapcs_va_list(
                                 };
                                 let field = (imm.value as u64 & 0xffff) << shift;
                                 let merged = (prev & !(0xffff_u64 << shift)) | field;
-                                regs.insert(name, RegVal::Imm(merged as i128));
+                                regs.insert(name, RegVal::Imm(zext(merged as i128)));
                             } else {
                                 // `movn reg, #k` loads `!k`; `mov`/`movz` load `k`.
-                                let value = if mnemonic == "movn" {
+                                let raw = if mnemonic == "movn" {
                                     !imm.value
                                 } else {
                                     imm.value
                                 };
-                                regs.insert(name, RegVal::Imm(value));
+                                regs.insert(name, RegVal::Imm(zext(raw)));
                             }
                         } else {
                             regs.remove(&name);
@@ -8635,6 +8648,52 @@ mod tests {
             str_wzr(52),
         ]);
         assert_eq!(scan_aapcs_va_list(&both_zero), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_zero_extends_w_write_before_64bit_store() {
+        // `movn w0, #55` zero-extends into x0 (x0 = 0x0000_0000_ffff_ffc8), so a
+        // single 64-bit `str x0, [base+24]` packs __gr_offs = -56 (low half) and
+        // __vr_offs = 0 (high half). If the w-write weren't zero-extended the high
+        // half would decode as 0xffffffff and the tag would be rejected.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn_w = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn_w(0, 55),       // w0 = 0xffffffc8 (zero-extended into x0)
+            str_reg(0, 64, 48),  // 64-bit store: gr_offs=-56 @48, vr_offs=0 @52
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
     }
 
     #[test]
