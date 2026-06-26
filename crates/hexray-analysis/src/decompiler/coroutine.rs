@@ -628,9 +628,11 @@ fn collect_cases(
             collect_branch_opt(else_body, frame, state, env, acc)
         }
         BinOpKind::Ne => {
-            if let Some(else_nodes) = else_body {
-                acc.cases.push((value, else_nodes.clone()));
-            }
+            // `state != N` guards the rest in `then`; the excluded value N takes
+            // the `else`. Always materialize case N — with the else body, or an
+            // empty body when there's no else (so state == N breaks to the shared
+            // post-dispatch flow instead of hitting the default).
+            acc.cases.push((value, else_body.clone().unwrap_or_default()));
             collect_branch(then_body, frame, state, env, acc)
         }
         BinOpKind::Lt
@@ -1342,6 +1344,35 @@ mod tests {
         ];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn ne_without_else_makes_excluded_value_fall_through_not_trap() {
+        // if (state != 0) { if (state==1) A else if (state==2) B else trap }
+        // state == 0 must NOT hit the trap default; it falls through (empty case).
+        let body = vec![iff(
+            cmp(BinOpKind::Ne, state_access(), 0),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 2),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![block(vec![Expr::call(
+                        crate::decompiler::expression::CallTarget::Named(
+                            "__builtin_trap".to_string(),
+                        ),
+                        vec![],
+                    )])],
+                )],
+            )],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        // Case 0 exists (empty fall-through), 1 and 2 carry bodies, trap is default.
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
+        let default_dump = find_default_dump(&out).expect("trap default");
+        assert!(default_dump.contains("__builtin_trap"));
     }
 
     #[test]
