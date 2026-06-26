@@ -696,6 +696,26 @@ fn collect_branch(
             // Flatten the nested dispatch into a private accumulator first.
             let mut sub = Dispatch::default();
             collect_cases(condition, then_body, else_body, frame, state, &local_env, &mut sub)?;
+            // Sibling code after the nested dispatch is the fall-through suffix for
+            // the states IT covered. It runs for each matched case AND for the
+            // states that fell through unmatched — so append it to the case bodies
+            // and to the default. When there is no explicit default, the unmatched
+            // states implicitly fall through to the suffix, so synthesize one from
+            // it; a noreturn (trap) default never falls through, so it is left as
+            // is. (Done before the prefix so the prefix wraps the synthesized
+            // default too.)
+            if !rest.is_empty() {
+                for (_, body) in &mut sub.cases {
+                    body.extend(rest.iter().cloned());
+                }
+                match &mut sub.default {
+                    None => sub.default = Some(rest.to_vec()),
+                    Some(default_body) if !body_is_noreturn(default_body) => {
+                        default_body.extend(rest.iter().cloned());
+                    }
+                    Some(_) => {}
+                }
+            }
             // The peeled prefix runs before the dispatch for whichever state is
             // selected, so prepend it to every recovered case body and the
             // default (only the chosen one executes it).
@@ -709,22 +729,6 @@ fn collect_branch(
                     let mut combined = prefix.clone();
                     combined.append(default_body);
                     *default_body = combined;
-                }
-            }
-            // Sibling code after the nested dispatch is the fall-through for the
-            // states IT covered only — append it to those case bodies (and the
-            // nested default, which also falls through) rather than hoisting it,
-            // so it never runs for states handled elsewhere. (When the nested
-            // default is the usual unreachable trap the appended copy is dead but
-            // harmless.)
-            if !rest.is_empty() {
-                for (_, body) in &mut sub.cases {
-                    body.extend(rest.iter().cloned());
-                }
-                if let Some(default_body) = &mut sub.default {
-                    if !body_is_noreturn(default_body) {
-                        default_body.extend(rest.iter().cloned());
-                    }
                 }
             }
             acc.cases.extend(sub.cases);
@@ -1303,6 +1307,29 @@ mod tests {
         ];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn implicit_fallthrough_suffix_becomes_default() {
+        // if (state != 0) { if (state == 1) A ; suffix } else B
+        // Unmatched states (not 0, not 1) fall through the inner if to `suffix`,
+        // so the synthesized switch default must run `suffix`.
+        let body = vec![iff(
+            cmp(BinOpKind::Ne, state_access(), 0),
+            vec![
+                iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_a")])],
+                    vec![],
+                ),
+                block(vec![Expr::unknown("suffix")]),
+            ],
+            vec![block(vec![Expr::unknown("body_b")])],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let default_dump = find_default_dump(&out).expect("synthesized default");
+        assert!(default_dump.contains("suffix"));
     }
 
     #[test]
