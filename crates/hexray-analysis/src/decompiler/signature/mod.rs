@@ -577,9 +577,19 @@ pub fn scan_sysv_va_list_named_float_count(
 /// sequences that build the va_list tag must be tracked as one register.
 fn aarch64_canon_reg(name: &str) -> String {
     let lower = name.to_lowercase();
+    // GP alias `w{n}` -> `x{n}`.
     if let Some(num) = lower.strip_prefix('w') {
         if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
             return format!("x{num}");
+        }
+    }
+    // FP/SIMD aliases `q/d/s/h/b{n}` all name the same physical register `v{n}`,
+    // so canonicalize them together (a `str q5` and a clobber of `v5` must match).
+    for prefix in ['q', 'd', 's', 'h', 'b'] {
+        if let Some(num) = lower.strip_prefix(prefix) {
+            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+                return format!("v{num}");
+            }
         }
     }
     lower
@@ -808,27 +818,33 @@ pub fn scan_aapcs_va_list(
                         (inst.operands.first(), inst.operands.get(1))
                     {
                         let name = aarch64_canon_reg(dst.name());
+                        // Only a `frame_base + immediate` (or no offset) yields a
+                        // static frame address; a register-offset `add x8, sp, x0`
+                        // is a dynamic value and must clobber, not record `sp + 0`.
                         let imm = match inst.operands.get(2) {
-                            Some(Operand::Immediate(i)) => i.value as i64,
-                            _ => 0,
+                            Some(Operand::Immediate(i)) => Some(i.value as i64),
+                            None => Some(0),
+                            Some(_) => None,
                         };
                         // The result is a frame address when `base` is a frame
                         // register OR already holds one — so chained
                         // `add x8, sp, #32; add x8, x8, #112` (clang) propagates,
                         // accumulating the displacement.
-                        let frame = if let Some(class) = aarch64_frame_base_class(base.name()) {
-                            Some((class, imm))
-                        } else if let Some(RegVal::FrameAddr { base: b, disp }) =
-                            regs.get(&aarch64_canon_reg(base.name()))
-                        {
-                            Some((*b, *disp + imm))
-                        } else {
-                            None
-                        };
+                        let frame = imm.and_then(|imm| {
+                            if let Some(class) = aarch64_frame_base_class(base.name()) {
+                                Some((class, imm))
+                            } else if let Some(RegVal::FrameAddr { base: b, disp }) =
+                                regs.get(&aarch64_canon_reg(base.name()))
+                            {
+                                Some((*b, *disp + imm))
+                            } else {
+                                None
+                            }
+                        });
                         if let Some((base, disp)) = frame {
                             regs.insert(name, RegVal::FrameAddr { base, disp });
                         } else {
-                            // Non-frame add result: written with an unknown value.
+                            // Non-frame / dynamic add result: unknown value.
                             regs.insert(name, RegVal::Clobbered);
                         }
                     }
@@ -950,6 +966,15 @@ pub fn scan_aapcs_va_list(
                             }
                         }
                         _ => {}
+                    }
+                }
+                Operation::Call | Operation::Syscall => {
+                    // x0..x7 / v0..v7 are caller-saved: after a call they no longer
+                    // hold incoming arguments, so clobber them — a post-call store
+                    // of one must not be mistaken for a prologue arg spill.
+                    for i in 0..8 {
+                        regs.insert(format!("x{i}"), RegVal::Clobbered);
+                        regs.insert(format!("v{i}"), RegVal::Clobbered);
                     }
                 }
                 other => {
@@ -9133,6 +9158,127 @@ mod tests {
             str_reg(1, 32, 52),
         ]);
         assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), Some(0))));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_register_offset_add_is_not_a_frame_address() {
+        // `add x10, sp, x0` is a dynamic address, not `sp + 0`. If it were recorded
+        // as a frame address it could fabricate a pointer field; instead x10 is
+        // clobbered, the __gr_top field is missing, and no tag is formed.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp_imm = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let add_sp_reg = |dst: u16, off: u16| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::Register(x(off, 64)),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp_imm(8, 0x110),
+            str_reg(8, 64, 24), // __stack
+            add_sp_reg(9, 0),   // register-offset add -> NOT a frame address
+            str_reg(9, 64, 32), // would-be __gr_top, but x9 is clobbered
+            add_sp_imm(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 55),
+            str_reg(0, 32, 48),
+            movn(1, 127),
+            str_reg(1, 32, 52),
+        ]);
+        // __gr_top missing (register-offset add clobbered) -> not a tag.
+        assert_eq!(scan_aapcs_va_list(&cfg), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_call_clobbers_caller_saved_arg_registers() {
+        // x0..x7 are caller-saved: a post-call store of x7 must not be counted as a
+        // prologue arg spill and mark a full save.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let call = || ("bl", Operation::Call, vec![Operand::imm(0x1000, 64)]);
+        // Compacted GP tag (gr_offs = -8, area [264, 272)). A post-call `str x7`
+        // lands in-area but x7 was clobbered by the call, so it must NOT mark a
+        // full save (which would invert -8 to a bogus named_gp = 7).
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            str_reg(8, 64, 24),
+            add_sp(9, 0x110),
+            str_reg(9, 64, 32), // __gr_top = 272
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 7), // __gr_offs = -8
+            str_reg(0, 32, 48),
+            str_wzr(52), // __vr_offs = 0
+            call(),
+            str_reg(7, 64, 264), // post-call x7 (clobbered) -> not a full save
+        ]);
+        // No genuine in-area spill -> GP count unknown; tag valid -> (None, None).
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
     }
 
     #[test]
