@@ -653,11 +653,14 @@ pub fn scan_aapcs_va_list(
         Imm(i128),
         FrameAddr { base: u8, disp: i64 },
     }
-    let mut const_stores: HashMap<i64, i128> = HashMap::new();
-    let mut pointer_offsets: HashSet<i64> = HashSet::new();
-    // Frame-pointer fields keyed by their store slot -> the (base, disp) they hold
-    // (e.g. `__gr_top`/`__vr_top` point just past their save areas).
-    let mut pointer_targets: HashMap<i64, (u8, i64)> = HashMap::new();
+    // Tag-field stores keyed by (base_class, slot) so a function mixing sp- and
+    // x29-relative accesses can't assemble a spurious tag from stores against
+    // different bases — all five tag fields must share one frame base.
+    let mut const_stores: HashMap<(u8, i64), i128> = HashMap::new();
+    let mut pointer_offsets: HashSet<(u8, i64)> = HashSet::new();
+    // Frame-pointer fields keyed by (base_class, slot) -> the (base, disp) they
+    // hold (e.g. `__gr_top`/`__vr_top` point just past their save areas).
+    let mut pointer_targets: HashMap<(u8, i64), (u8, i64)> = HashMap::new();
     // Save-area observations accumulated across the prologue. `*_full` is set when
     // that class's top register (x7 / q7) is spilled — a *full* `[named..8)` save,
     // the only case the offset → count formula is valid for (gcc -O2 compacts to
@@ -792,11 +795,12 @@ pub fn scan_aapcs_va_list(
                     }
                 }
                 Operation::Store => {
-                    let record = |off: i64,
+                    let record = |store_base: u8,
+                                  off: i64,
                                   reg: &hexray_core::Register,
-                                  consts: &mut HashMap<i64, i128>,
-                                  ptrs: &mut HashSet<i64>,
-                                  targets: &mut HashMap<i64, (u8, i64)>| {
+                                  consts: &mut HashMap<(u8, i64), i128>,
+                                  ptrs: &mut HashSet<(u8, i64)>,
+                                  targets: &mut HashMap<(u8, i64), (u8, i64)>| {
                         let canon = aarch64_canon_reg(reg.name());
                         // The zero register (`wzr`/`xzr`) is never a `mov` target,
                         // so it isn't in `regs`; treat it as a literal 0. gcc -O2
@@ -809,8 +813,8 @@ pub fn scan_aapcs_va_list(
                         };
                         match value {
                             Some(RegVal::FrameAddr { base, disp }) => {
-                                ptrs.insert(off);
-                                targets.insert(off, (base, disp));
+                                ptrs.insert((store_base, off));
+                                targets.insert((store_base, off), (base, disp));
                             }
                             Some(RegVal::Imm(v)) => {
                                 if reg.size >= 64 {
@@ -820,12 +824,12 @@ pub fn scan_aapcs_va_list(
                                     // at `off + 4`. (The tag-shape check below
                                     // discards an incidental split.)
                                     let bits = v as u64;
-                                    consts.entry(off).or_insert((bits as u32) as i128);
+                                    consts.entry((store_base, off)).or_insert((bits as u32) as i128);
                                     consts
-                                        .entry(off + 4)
+                                        .entry((store_base, off + 4))
                                         .or_insert(((bits >> 32) as u32) as i128);
                                 } else {
-                                    consts.entry(off).or_insert(v);
+                                    consts.entry((store_base, off)).or_insert(v);
                                 }
                             }
                             None => {}
@@ -850,13 +854,16 @@ pub fn scan_aapcs_va_list(
                                     &regs,
                                     &mut save_area,
                                 );
-                                record(
-                                    mem.displacement,
-                                    src,
-                                    &mut const_stores,
-                                    &mut pointer_offsets,
-                                    &mut pointer_targets,
-                                );
+                                if let Some(bc) = base_class {
+                                    record(
+                                        bc,
+                                        mem.displacement,
+                                        src,
+                                        &mut const_stores,
+                                        &mut pointer_offsets,
+                                        &mut pointer_targets,
+                                    );
+                                }
                             }
                         }
                         // `stp r1, r2, [frame+disp]` — r1 at disp, r2 at the next
@@ -883,20 +890,24 @@ pub fn scan_aapcs_va_list(
                                         &mut save_area,
                                     );
                                 }
-                                record(
-                                    mem.displacement,
-                                    r1,
-                                    &mut const_stores,
-                                    &mut pointer_offsets,
-                                    &mut pointer_targets,
-                                );
-                                record(
-                                    mem.displacement + stride,
-                                    r2,
-                                    &mut const_stores,
-                                    &mut pointer_offsets,
-                                    &mut pointer_targets,
-                                );
+                                if let Some(bc) = base_class {
+                                    record(
+                                        bc,
+                                        mem.displacement,
+                                        r1,
+                                        &mut const_stores,
+                                        &mut pointer_offsets,
+                                        &mut pointer_targets,
+                                    );
+                                    record(
+                                        bc,
+                                        mem.displacement + stride,
+                                        r2,
+                                        &mut const_stores,
+                                        &mut pointer_offsets,
+                                        &mut pointer_targets,
+                                    );
+                                }
                             }
                         }
                         _ => {}
@@ -908,12 +919,12 @@ pub fn scan_aapcs_va_list(
     }
     // 32-bit offset fields may arrive sign-extended or as a raw u32; normalize.
     let as_i32 = |v: i128| -> i128 { (v as i32) as i128 };
-    let mut gr_slots: Vec<i64> = const_stores.keys().copied().collect();
+    let mut gr_slots: Vec<(u8, i64)> = const_stores.keys().copied().collect();
     gr_slots.sort_unstable();
-    for gr_slot in gr_slots {
+    for (frame_base, gr_slot) in gr_slots {
         let base = gr_slot - 24; // __gr_offs sits at tag base + 24
-        let gr_offs = as_i32(*const_stores.get(&gr_slot)?);
-        let Some(&vr_raw) = const_stores.get(&(base + 28)) else {
+        let gr_offs = as_i32(*const_stores.get(&(frame_base, gr_slot))?);
+        let Some(&vr_raw) = const_stores.get(&(frame_base, base + 28)) else {
             continue;
         };
         let vr_offs = as_i32(vr_raw);
@@ -957,7 +968,11 @@ pub fn scan_aapcs_va_list(
             if save_area.gp_full {
                 Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
             } else {
-                bounded_spill_min(&save_area.gp_spills, pointer_targets.get(&(base + 8)), gr_offs)
+                bounded_spill_min(
+                    &save_area.gp_spills,
+                    pointer_targets.get(&(frame_base, base + 8)),
+                    gr_offs,
+                )
             }
         } else {
             None
@@ -966,14 +981,18 @@ pub fn scan_aapcs_va_list(
             if save_area.fp_full {
                 Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
             } else {
-                bounded_spill_min(&save_area.fp_spills, pointer_targets.get(&(base + 16)), vr_offs)
+                bounded_spill_min(
+                    &save_area.fp_spills,
+                    pointer_targets.get(&(frame_base, base + 16)),
+                    vr_offs,
+                )
             }
         } else {
             None
         };
-        if pointer_offsets.contains(&base)
-            && pointer_offsets.contains(&(base + 8))
-            && pointer_offsets.contains(&(base + 16))
+        if pointer_offsets.contains(&(frame_base, base))
+            && pointer_offsets.contains(&(frame_base, base + 8))
+            && pointer_offsets.contains(&(frame_base, base + 16))
         {
             return Some((named_gp, named_fp));
         }
@@ -8883,6 +8902,57 @@ mod tests {
         // named_gp from the in-area spill (x1 -> 1), not the home spill (x0);
         // float count unknown/compact -> None.
         assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_rejects_tag_split_across_frame_bases() {
+        // Tag fields keyed by (base_class, slot): an unrelated `[sp,#48/#52]`
+        // constant pair must NOT combine with `[x29,#24/#32/#40]` pointer stores
+        // to fabricate a tag for a non-variadic function (codex P2).
+        let sp = || aarch64_x(31, 64);
+        let x29 = || aarch64_x(29, 64);
+        let x = aarch64_x;
+        let add_x29 = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x29()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_at = |reg_id: u16, bits: u16, base: hexray_core::Register, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg_id, bits)), aarch64_mem(base, slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            // Pointer fields at [x29, #24/#32/#40] (base class 1).
+            add_x29(10, 0x110),
+            str_at(10, 64, x29(), 24),
+            add_x29(11, 0x110),
+            str_at(11, 64, x29(), 32),
+            add_x29(12, 0xd0),
+            str_at(12, 64, x29(), 40),
+            // Offset-shaped constants at [sp, #48/#52] (base class 0) — a different
+            // coordinate, so they must not align with the x29 pointer fields.
+            movn(0, 55),
+            str_at(0, 32, sp(), 48),
+            movn(1, 127),
+            str_at(1, 32, sp(), 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), None);
     }
 
     #[test]
