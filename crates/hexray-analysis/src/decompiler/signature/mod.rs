@@ -692,26 +692,22 @@ pub fn scan_aapcs_va_list(
     // Frame-pointer fields keyed by (base_class, slot) -> the (base, disp) they
     // hold (e.g. `__gr_top`/`__vr_top` point just past their save areas).
     let mut pointer_targets: HashMap<(u8, i64), (u8, i64)> = HashMap::new();
-    // Save-area observations accumulated across the prologue. `*_full` is set when
-    // that class's top register (x7 / q7) is spilled — a *full* `[named..8)` save,
-    // the only case the offset → count formula is valid for (gcc -O2 compacts to
-    // the consumed count and stops short). `*_spills` collect (base_class, slot,
-    // arg_register_index) for each incoming arg register stored to a frame slot;
-    // bounded to the actual save area in the decode, so an address-taken named
-    // param's home spill isn't counted. For a compacted save the lowest in-area
-    // index is the named count.
+    // Save-area observations accumulated across the prologue: (base_class, slot,
+    // arg_register_index) for each incoming arg register stored to a frame slot.
+    // Bounded to the actual save area in the decode (so an address-taken named
+    // param's home spill, or an unrelated x7/v7 spill, isn't counted). Within the
+    // bounded area the lowest index is the named count, and a present index 7
+    // means the save is full (`[named..8)`), validating the offset → count
+    // inversion.
     #[derive(Default)]
     struct SaveAreaScan {
-        gp_full: bool,
-        fp_full: bool,
         gp_spills: Vec<(u8, i64, usize)>,
         fp_spills: Vec<(u8, i64, usize)>,
     }
     let mut save_area = SaveAreaScan::default();
-    // Record a frame store of an argument register: update the full-save flag and
-    // collect a spill candidate. Only a register still holding its incoming caller
-    // value counts — a register reused to build a pointer field has been written
-    // (so it's in `regs`) and is ignored.
+    // Record a frame store of an argument register as a spill candidate. Only a
+    // register still holding its incoming caller value counts — a register reused
+    // to build a pointer field has been written (so it's in `regs`) and is ignored.
     fn note_arg_spill(
         reg: &hexray_core::Register,
         base_class: Option<u8>,
@@ -724,13 +720,6 @@ pub fn scan_aapcs_va_list(
             return;
         }
         if let Some((idx, is_fp)) = aarch64_arg_register(reg.name()) {
-            if idx == 7 {
-                if is_fp {
-                    scan.fp_full = true;
-                } else {
-                    scan.gp_full = true;
-                }
-            }
             let spills = if is_fp {
                 &mut scan.fp_spills
             } else {
@@ -1000,52 +989,50 @@ pub fn scan_aapcs_va_list(
         if gr_offs >= 0 && vr_offs >= 0 {
             continue;
         }
-        // The lowest arg register spilled *into the save area* gives the named
-        // count for a compacted save. The save area is `[top + offs, top)` where
-        // `top` is the `__gr_top`/`__vr_top` pointer and `offs` the (negative)
-        // offset; bounding to that range excludes an address-taken named param's
-        // home spill, which lands at an unrelated slot.
-        let bounded_spill_min = |spills: &[(u8, i64, usize)],
-                                 top: Option<&(u8, i64)>,
-                                 offs: i128|
+        // Recover the named count from the arg-register spills that land *inside*
+        // the save area `[top + offs, top)` (`top` = `__gr_top`/`__vr_top`, `offs`
+        // the negative offset). Bounding to that range excludes an address-taken
+        // named param's home spill and any unrelated x7/v7 spill elsewhere in the
+        // frame. If the area reaches register 7 it's a *full* `[named..8)` save and
+        // the count inverts from the area size (`8 - area_regs`, robust to a missed
+        // spill); otherwise (gcc -O2 compaction) the lowest in-area index is the
+        // named count. No in-area spill (or `offs == 0`, class unused) -> unknown.
+        let named_from_save_area = |spills: &[(u8, i64, usize)],
+                                    top: Option<&(u8, i64)>,
+                                    offs: i128,
+                                    reg_bytes: i128|
          -> Option<usize> {
             let &(top_base, top_disp) = top?;
             let lo = top_disp + offs as i64;
-            spills
+            let mut in_area = spills
                 .iter()
                 .filter(|&&(b, slot, _)| b == top_base && (lo..top_disp).contains(&slot))
                 .map(|&(_, _, idx)| idx)
-                .min()
-        };
-        // `__gr_offs = -(area_size_in_regs) * 8`. For a *full* save (`[named..8)`,
-        // reaching x7) the named count inverts to `8 - area_size`. gcc -O2
-        // compacts the area to the *consumed* vararg count, so the offset no
-        // longer inverts — fall back to the bounded save-area spill-min. When the
-        // area is compacted to `0` (class unused) there's nothing to spill and the
-        // count is left to observation (`None`).
-        let named_gp = if gr_offs < 0 {
-            if save_area.gp_full {
-                Some(8usize.checked_sub(usize::try_from(-gr_offs / 8).ok()?)?)
+                .peekable();
+            in_area.peek()?;
+            if in_area.clone().any(|idx| idx == 7) {
+                8usize.checked_sub(usize::try_from(-offs / reg_bytes).ok()?)
             } else {
-                bounded_spill_min(
-                    &save_area.gp_spills,
-                    pointer_targets.get(&(frame_base, base + 8)),
-                    gr_offs,
-                )
+                in_area.min()
             }
+        };
+        let named_gp = if gr_offs < 0 {
+            named_from_save_area(
+                &save_area.gp_spills,
+                pointer_targets.get(&(frame_base, base + 8)),
+                gr_offs,
+                8,
+            )
         } else {
             None
         };
         let named_fp = if vr_offs < 0 {
-            if save_area.fp_full {
-                Some(8usize.checked_sub(usize::try_from(-vr_offs / 16).ok()?)?)
-            } else {
-                bounded_spill_min(
-                    &save_area.fp_spills,
-                    pointer_targets.get(&(frame_base, base + 16)),
-                    vr_offs,
-                )
-            }
+            named_from_save_area(
+                &save_area.fp_spills,
+                pointer_targets.get(&(frame_base, base + 16)),
+                vr_offs,
+                16,
+            )
         } else {
             None
         };
@@ -8729,8 +8716,10 @@ mod tests {
         // __gr_offs@48, __vr_offs@52.
         let tag = |gr_k: i128, vr_k: i128| {
             aarch64_single_block_cfg(vec![
-                str_x7(64),
-                str_v7(80),
+                // x7/v7 spilled INSIDE their save areas ([216,272) and [80,208)
+                // for these offsets) so the full-save inversion applies.
+                str_x7(264),
+                str_v7(192),
                 add_frame(0x110),
                 str_x0(24),
                 add_frame(0x110),
@@ -8811,7 +8800,7 @@ mod tests {
         };
         // Full tag shape but __vr_offs written directly with `str wzr` (== 0).
         let cfg = aarch64_single_block_cfg(vec![
-            str_reg(7, 64, 64), // x7 spilled -> full GP save (named_gp recoverable)
+            str_reg(7, 64, 264), // x7 in-area ([216,272)) -> full GP save
             add_sp(8, 0x110),
             add_sp(9, 0x110),
             stp(8, 9, 24),
@@ -8947,6 +8936,9 @@ mod tests {
             // Address-taken named param x0 home-spilled at slot 8 — OUTSIDE the
             // save area [264, 272), so it must NOT be counted (codex regression).
             str_reg(0, 32, 8),
+            // Unrelated untouched x7 spilled OUTSIDE the save area: must NOT mark a
+            // full save (else __gr_offs=-8 would invert to a bogus named_gp=7).
+            str_reg(7, 64, 100),
             str_reg(1, 64, 264), // x1 (untouched) spilled INTO the compacted save area
             add_sp(9, 0x110),
             str_reg(9, 64, 24), // __stack (x9 written by add -> ignored as a spill)
@@ -9124,7 +9116,7 @@ mod tests {
         };
         // Each pointer field built via `mov xN, sp; add xN, xN, #imm`.
         let cfg = aarch64_single_block_cfg(vec![
-            str_reg(7, 64, 64), // full GP save (x7) so named_gp inverts
+            str_reg(7, 64, 264), // x7 in-area -> full GP save so named_gp inverts
             str_reg(hexray_core::register::arm64::V7, 128, 80), // full FP save (v7)
             mov_sp(9),
             add_reg(9, 9, 0x110),
@@ -9177,7 +9169,7 @@ mod tests {
             )
         };
         let cfg = aarch64_single_block_cfg(vec![
-            str_reg(7, 64, 64), // x7 spilled -> full GP save
+            str_reg(7, 64, 264), // x7 in-area -> full GP save
             add_sp(8, 0x110),
             str_reg(8, 64, 24),
             add_sp(9, 0x110),
@@ -9247,8 +9239,8 @@ mod tests {
         // applies (see `aarch64_top_arg_register`).
         const V7: u16 = hexray_core::register::arm64::V7;
         let cfg = aarch64_single_block_cfg(vec![
-            str_reg(7, 64, 300),
-            str_reg(V7, 128, 320),
+            str_reg(7, 64, 264), // in-area: gr_top 272, area [216,272)
+            str_reg(V7, 128, 192), // in-area: vr_top 208, area [80,208)
             add_sp(8, 0x110),
             add_sp(9, 0x110),
             stp(8, 9, 24),
@@ -9276,8 +9268,8 @@ mod tests {
             )
         };
         let cfg2 = aarch64_single_block_cfg(vec![
-            str_reg(7, 64, 300),
-            str_reg(V7, 128, 320),
+            str_reg(7, 64, 264), // in-area: gr_top 272, area [216,272)
+            str_reg(V7, 128, 192), // in-area: vr_top 208, area [80,208)
             add_sp(8, 0x110),
             add_sp(9, 0x110),
             stp(8, 9, 24), // __stack@24, __gr_top@32
@@ -9313,8 +9305,8 @@ mod tests {
         // -> __gr_offs@200, __vr_offs@204. mov x11,#-56 then movk #0xff80,lsl#32
         // gives 0xffffff80_ffffffc8 -> gr=-56 (named_gp=1), vr=-128 (named_fp=0).
         let cfg3 = aarch64_single_block_cfg(vec![
-            str_reg(7, 64, 300),
-            str_reg(V7, 128, 320),
+            str_reg(7, 64, 248), // in-area: gr_top 256, area [200,256)
+            str_reg(V7, 128, 112), // in-area: vr_top 128, area [0,128)
             add_sp(8, 0x100),
             add_sp(9, 0x100),
             stp(8, 9, 176), // __stack@176, __gr_top@184
