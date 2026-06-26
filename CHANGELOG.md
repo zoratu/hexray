@@ -5,6 +5,30 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.13] - 2026-06-26
+
+### Decompiler — aarch64 variadic signatures
+
+- **aarch64 AAPCS variadic recovery (greenfield).** Variadic functions compiled
+  for aarch64 now recover their fixed-parameter prefix and trailing `...`;
+  previously variadic detection was SysV-only, so the register-save area leaked
+  into recovered signatures. A new `__va_list` prologue scanner reads the
+  AAPCS register-save area to recover the named GP/FP parameter counts. The key
+  subtlety: `__gr_offs`/`__vr_offs` encode the save-area *size*, not the named
+  count — the `8 - (-offset)/N` inversion is valid only for a *full* `[named..8)`
+  save (clang; gcc `-O0`), whereas gcc `-O2` compacts the area to the *consumed*
+  vararg count. Full saves invert the offset; compacted saves take the lowest
+  argument register spilled into the bounded save-area range `[top + offs, top)`
+  (which excludes address-taken parameters' home spills); unknown counts are left
+  to observation rather than capped or fabricated.
+- Recovers, e.g., `int sum_ints(int n, ...)` (gcc/clang `-O0`/`-O2`),
+  `double firsti(double d, ...)`, `double scaled(double factor, int n, ...)`,
+  the 8-named-GP `f8(...)` (where clang omits `__gr_top`), and an unread named
+  float `double f(double d, ...)`. Hardened across gcc/clang × `-O0`/`-O2` for
+  split prologues (stack protectors), `mov`/`add`/`sub` frame-pointer pointer
+  materialization, multi-register loads, caller-saved clobbers across calls, and
+  mixed `sp`/`x29` frame bases.
+
 ## [1.3.12] - 2026-06-24
 
 ### Decompiler — C++ readability & variadic signatures
