@@ -681,6 +681,14 @@ fn collect_branch(
     let mut prefix: Vec<StructuredNode> = Vec::new();
     let mut tail = nodes;
     while let [block @ StructuredNode::Block { statements, .. }, more @ ..] = tail {
+        // Only peel a block that is purely state-reload plumbing
+        // (`tmp = frame->__resume_index`). Such a block is dead once the dispatch
+        // is a switch, so it's safe to skip on unmatched states; a block with any
+        // other effect must stay put (it becomes the terminal default body), so
+        // stop peeling.
+        if !is_state_reload_block(statements, frame, state, &local_env) {
+            break;
+        }
         local_env.note_block(statements, frame, state);
         prefix.push(block.clone());
         tail = more;
@@ -716,9 +724,12 @@ fn collect_branch(
                     Some(_) => {}
                 }
             }
-            // The peeled prefix runs before the dispatch for whichever state is
-            // selected, so prepend it to every recovered case body and the
-            // default (only the chosen one executes it).
+            // The peeled prefix is a pure state reload (see the peel loop), which
+            // becomes dead once the dispatch is a switch on the named field —
+            // prepend it to each matched case body (harmless, keeps any temp use
+            // defined) and to an existing default. Unmatched states skip it, which
+            // is safe precisely because it has no effect beyond feeding the
+            // dispatch we just replaced.
             if !prefix.is_empty() {
                 for (_, body) in &mut sub.cases {
                     let mut combined = prefix.clone();
@@ -759,6 +770,30 @@ fn collect_branch(
     }
     acc.default = Some(nodes.to_vec());
     Some(())
+}
+
+/// True if every statement in a block is a state-reload assignment
+/// (`tmp = <state field or state temp>`) — pure dispatch plumbing with no other
+/// effect, which is dead once the dispatch becomes a switch on the named field.
+/// An empty block qualifies. `env` is the binding state on entry to the block.
+fn is_state_reload_block(
+    statements: &[Expr],
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> bool {
+    let mut local = env.clone();
+    for stmt in statements {
+        match &stmt.kind {
+            ExprKind::Assign { lhs, rhs }
+                if matches!(lhs.kind, ExprKind::Var(_)) && local.is_state(rhs, frame, state) =>
+            {
+                local.note_block(std::slice::from_ref(stmt), frame, state);
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// True if a branch body cannot fall through to following code — its last
