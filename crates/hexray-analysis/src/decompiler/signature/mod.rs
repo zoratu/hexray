@@ -750,14 +750,20 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
     for gr_slot in gr_slots {
         let base = gr_slot - 24; // __gr_offs sits at tag base + 24
         let gr_offs = as_i32(*const_stores.get(&gr_slot)?);
-        if !(-64..=0).contains(&gr_offs) || gr_offs % 8 != 0 {
+        // Require STRICTLY-negative canonical offsets (`-(8 - named) * stride`
+        // with `named < 8`). `0` would mean all 8 registers are named — which
+        // is implausible for a variadic — and is also the sentinel gcc -O2
+        // writes (`stp …, wzr`) for a COMPACTED save area when the matching
+        // varargs class isn't consumed; treating that as `named = 8` would
+        // fabricate eight fixed parameters (codex P1). Decline instead.
+        if !(-64..0).contains(&gr_offs) || gr_offs % 8 != 0 {
             continue;
         }
         let Some(&vr_raw) = const_stores.get(&(base + 28)) else {
             continue;
         };
         let vr_offs = as_i32(vr_raw);
-        if !(-128..=0).contains(&vr_offs) || vr_offs % 16 != 0 {
+        if !(-128..0).contains(&vr_offs) || vr_offs % 16 != 0 {
             continue;
         }
         if pointer_offsets.contains(&base)
@@ -8421,6 +8427,72 @@ mod tests {
         let no_ptrs =
             aarch64_single_block_cfg(vec![movn_w0(55), str_w0(48), movn_w0(127), str_w0(52)]);
         assert_eq!(scan_aapcs_va_list(&no_ptrs), None);
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_declines_compact_vr_offs_zero() {
+        // gcc -O2 writes __vr_offs = 0 (`stp …, wzr`) for a compacted FP save
+        // area when no FP varargs are consumed. That is the canonical value for
+        // 8 named floats; deriving the count from it would fabricate parameters,
+        // so the full tag must be declined (codex P1 on PR #49).
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let add_sp = |dst: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(sp()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let stp = |r1: u16, r2: u16, slot: i64| {
+            (
+                "stp",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(r1, 64)),
+                    Operand::Register(x(r2, 64)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let mov0 = |reg: u16| {
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(0, 32)],
+            )
+        };
+        // Full tag shape but __vr_offs = 0 (compact). Must decline.
+        let cfg = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            add_sp(9, 0x110),
+            stp(8, 9, 24),
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40),
+            movn(0, 55), // __gr_offs = -56 (named_gp = 1)
+            str_reg(0, 32, 48),
+            mov0(0), // __vr_offs = 0 (compact sentinel)
+            str_reg(0, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), None);
     }
 
     #[test]
