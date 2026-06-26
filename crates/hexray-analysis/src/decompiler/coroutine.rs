@@ -573,12 +573,19 @@ fn collect_branch(
             let mut sub = Dispatch::default();
             collect_cases(condition, then_body, else_body, frame, state, env, &mut sub)?;
             // Sibling code after the nested dispatch is the fall-through for the
-            // cases IT introduced only — append it to those case bodies rather
-            // than hoisting it (it must not run for states handled elsewhere).
-            // The default leaf is a trap / unreachable, so nothing falls through.
+            // states IT covered only — append it to those case bodies (and the
+            // nested default, which also falls through) rather than hoisting it,
+            // so it never runs for states handled elsewhere. (When the nested
+            // default is the usual unreachable trap the appended copy is dead but
+            // harmless.)
             if !rest.is_empty() {
                 for (_, body) in &mut sub.cases {
                     body.extend(rest.iter().cloned());
+                }
+                if let Some(default_body) = &mut sub.default {
+                    if !body_is_noreturn(default_body) {
+                        default_body.extend(rest.iter().cloned());
+                    }
                 }
             }
             acc.cases.extend(sub.cases);
@@ -599,6 +606,36 @@ fn collect_branch(
     }
     acc.default = Some(nodes.to_vec());
     Some(())
+}
+
+/// True if a branch body cannot fall through to following code — its last
+/// statement is a `return`/`break`/`continue`, or a call to a noreturn builtin
+/// (`__builtin_trap`/`__builtin_unreachable`, `abort`). Used so a post-dispatch
+/// suffix is not appended (as dead code) after such a body.
+fn body_is_noreturn(nodes: &[StructuredNode]) -> bool {
+    match nodes.last() {
+        Some(StructuredNode::Return(_) | StructuredNode::Break | StructuredNode::Continue) => true,
+        Some(StructuredNode::Block { statements, .. }) => {
+            statements.iter().any(is_noreturn_call)
+        }
+        Some(StructuredNode::Expr(e)) => is_noreturn_call(e),
+        _ => false,
+    }
+}
+
+fn is_noreturn_call(e: &Expr) -> bool {
+    use super::expression::CallTarget;
+    if let ExprKind::Call { target, .. } = &e.kind {
+        let name = match target {
+            CallTarget::Named(n) => Some(n.as_str()),
+            _ => None,
+        };
+        return matches!(
+            name,
+            Some("__builtin_trap" | "__builtin_unreachable" | "abort" | "std::terminate")
+        );
+    }
+    false
 }
 
 /// If `cond` is `state <op> const`, return the op (oriented so `state` is the
@@ -994,6 +1031,84 @@ mod tests {
         )];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), None);
+    }
+
+    #[test]
+    fn appends_suffix_to_nested_real_default_fallthrough() {
+        // if (state <= 1) { if (state==0) A else if (state==1) B else REAL ; suffix }
+        // The non-trap REAL default also falls through to `suffix`, so the suffix
+        // must be appended to it (not just the cases).
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![
+                iff(
+                    cmp(BinOpKind::Eq, state_access(), 0),
+                    vec![block(vec![Expr::unknown("body_a")])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, state_access(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![block(vec![Expr::unknown("real_default")])],
+                    )],
+                ),
+                block(vec![Expr::unknown("suffix")]),
+            ],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        // The real default must carry the suffix; a trap default would not.
+        let default_dump = find_default_dump(&out).expect("switch default present");
+        assert!(default_dump.contains("real_default"));
+        assert!(default_dump.contains("suffix"));
+    }
+
+    #[test]
+    fn noreturn_trap_default_does_not_get_dead_suffix() {
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![
+                iff(
+                    cmp(BinOpKind::Eq, state_access(), 0),
+                    vec![block(vec![Expr::unknown("body_a")])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, state_access(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![block(vec![Expr::call(
+                            crate::decompiler::expression::CallTarget::Named(
+                                "__builtin_trap".to_string(),
+                            ),
+                            vec![],
+                        )])],
+                    )],
+                ),
+                block(vec![Expr::unknown("suffix")]),
+            ],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        let default_dump = find_default_dump(&out).expect("switch default present");
+        assert!(default_dump.contains("__builtin_trap"));
+        assert!(!default_dump.contains("suffix"));
+    }
+
+    fn find_default_dump(body: &[StructuredNode]) -> Option<String> {
+        for n in body {
+            match n {
+                StructuredNode::Switch { default, .. } => {
+                    return default.as_ref().map(|d| format!("{d:?}"));
+                }
+                StructuredNode::If { then_body, else_body, .. } => {
+                    if let Some(d) = find_default_dump(then_body) {
+                        return Some(d);
+                    }
+                    if let Some(d) = else_body.as_ref().and_then(|b| find_default_dump(b)) {
+                        return Some(d);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
