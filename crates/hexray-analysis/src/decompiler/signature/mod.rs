@@ -791,8 +791,25 @@ pub fn scan_aapcs_va_list(
                                 };
                                 regs.insert(name, RegVal::Imm(zext(raw)));
                             }
+                        } else if let Some(Operand::Register(src)) = inst.operands.get(1) {
+                            // Reg-to-reg move: `mov x9, sp` (clang materialises a
+                            // tag pointer this way before `add x9, x9, #imm`) copies
+                            // a frame address; propagate it. Otherwise the value is
+                            // unknown -> clobbered.
+                            let copied = if let Some(class) = aarch64_frame_base_class(src.name())
+                            {
+                                RegVal::FrameAddr {
+                                    base: class,
+                                    disp: 0,
+                                }
+                            } else {
+                                match regs.get(&aarch64_canon_reg(src.name())) {
+                                    Some(&fa @ RegVal::FrameAddr { .. }) => fa,
+                                    _ => RegVal::Clobbered,
+                                }
+                            };
+                            regs.insert(name, copied);
                         } else {
-                            // Reg-to-reg move: written with an unknown value.
                             regs.insert(name, RegVal::Clobbered);
                         }
                     }
@@ -9064,6 +9081,66 @@ mod tests {
         // x7 was clobbered, so no full save and no in-area spill -> GP count
         // unknown; tag still valid (negative __gr_offs) -> Some((None, None)).
         assert_eq!(scan_aapcs_va_list(&cfg), Some((None, None)));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_tracks_mov_from_sp_then_add() {
+        // clang materialises a tag pointer as `mov x9, sp; add x9, x9, #imm`. The
+        // `mov` must propagate the frame address (not clobber x9) so the `add`
+        // result is recognised as a pointer field and the tag is found.
+        let sp = || aarch64_x(31, 64);
+        let x = aarch64_x;
+        let mov_sp = |dst: u16| {
+            (
+                "mov",
+                Operation::Move,
+                vec![Operand::Register(x(dst, 64)), Operand::Register(sp())],
+            )
+        };
+        let add_reg = |dst: u16, base: u16, imm: i128| {
+            (
+                "add",
+                Operation::Add,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x(base, 64)),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_reg = |reg: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg, bits)), aarch64_mem(sp(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        // Each pointer field built via `mov xN, sp; add xN, xN, #imm`.
+        let cfg = aarch64_single_block_cfg(vec![
+            str_reg(7, 64, 64), // full GP save (x7) so named_gp inverts
+            str_reg(hexray_core::register::arm64::V7, 128, 80), // full FP save (v7)
+            mov_sp(9),
+            add_reg(9, 9, 0x110),
+            str_reg(9, 64, 24), // __stack
+            mov_sp(10),
+            add_reg(10, 10, 0x110),
+            str_reg(10, 64, 32), // __gr_top
+            mov_sp(11),
+            add_reg(11, 11, 0xd0),
+            str_reg(11, 64, 40), // __vr_top
+            movn(0, 55),         // __gr_offs = -56 (named_gp = 1)
+            str_reg(0, 32, 48),
+            movn(1, 127), // __vr_offs = -128 (named_fp = 0)
+            str_reg(1, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((Some(1), Some(0))));
     }
 
     #[test]
