@@ -681,14 +681,18 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                                 );
                             }
                         }
-                        // `stp r1, r2, [frame+disp]` — r1 at disp, r2 at disp+8
-                        // (optimized prologues initialise the tag this way).
+                        // `stp r1, r2, [frame+disp]` — r1 at disp, r2 at the next
+                        // element (optimized prologues initialise the tag this
+                        // way). The element stride is the register width: 8 for
+                        // `stp x.., x..`, 4 for the 32-bit `stp w.., w..` that
+                        // packs the adjacent `__gr_offs`/`__vr_offs` fields.
                         (
                             Some(Operand::Register(r1)),
                             Some(Operand::Register(r2)),
                             Some(Operand::Memory(mem)),
                         ) => {
                             if is_frame_base_memory(mem) {
+                                let stride = i64::from(r1.size / 8).max(1);
                                 record(
                                     mem.displacement,
                                     r1.name(),
@@ -696,7 +700,7 @@ pub fn scan_aapcs_va_list(cfg: &ControlFlowGraph) -> Option<(usize, usize)> {
                                     &mut pointer_offsets,
                                 );
                                 record(
-                                    mem.displacement + 8,
+                                    mem.displacement + stride,
                                     r2.name(),
                                     &mut const_stores,
                                     &mut pointer_offsets,
@@ -8456,6 +8460,31 @@ mod tests {
             str_reg(0, 32, 52),
         ]);
         assert_eq!(scan_aapcs_va_list(&cfg), Some((1, 0)));
+
+        // The two 32-bit offset fields written by one `stp w0, w1, [sp, #48]`:
+        // w0 at 48 (__gr_offs), w1 at 48+4=52 (__vr_offs).
+        let stp_w = |r1: u16, r2: u16, slot: i64| {
+            (
+                "stp",
+                Operation::Store,
+                vec![
+                    Operand::Register(aarch64_x(r1, 32)),
+                    Operand::Register(aarch64_x(r2, 32)),
+                    aarch64_mem(sp(), slot),
+                ],
+            )
+        };
+        let cfg2 = aarch64_single_block_cfg(vec![
+            add_sp(8, 0x110),
+            add_sp(9, 0x110),
+            stp(8, 9, 24), // __stack@24, __gr_top@32
+            add_sp(10, 0xd0),
+            str_reg(10, 64, 40), // __vr_top@40
+            movn(0, 55),         // w0 = __gr_offs = -56
+            movn(1, 127),        // w1 = __vr_offs = -128
+            stp_w(0, 1, 48),     // 32-bit pair: w0@48, w1@52
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg2), Some((1, 0)));
     }
 
     #[test]
