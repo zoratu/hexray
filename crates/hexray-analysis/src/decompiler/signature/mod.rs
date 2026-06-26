@@ -5610,25 +5610,6 @@ impl SignatureRecovery {
             }
         }
 
-        // A variadic function must have at least one fixed parameter (`f(...)` is
-        // invalid C). The aarch64 `__va_list` tag can mark a function variadic
-        // when no fixed parameter is observable and none is recoverable from the
-        // tag — e.g. gcc -O2 for `double f(int n, ...)` where `n` is never read
-        // and the GP save area is compacted (`__gr_offs == 0`). Synthesize the
-        // leading integer parameter rather than emit an illegal signature.
-        if self.aapcs_va_list_counts.is_some() && sig.is_variadic && sig.parameters.is_empty() {
-            if let Some(reg0) = int_regs.first() {
-                sig.parameters.push(Parameter::new(
-                    "arg0".to_string(),
-                    ParamType::SignedInt(64),
-                    ParameterLocation::IntegerRegister {
-                        name: reg0.to_string(),
-                        index: 0,
-                    },
-                ));
-            }
-        }
-
         // Determine return type
         sig.has_return = self.return_value_set;
         sig.return_provenance = self.return_provenance.clone();
