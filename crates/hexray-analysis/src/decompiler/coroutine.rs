@@ -594,6 +594,18 @@ fn try_flatten_switch(
         return None;
     }
 
+    // A `break` in a recovered body that targeted an enclosing loop/switch would
+    // be captured by the switch we're about to synthesize, changing its target.
+    // Decline the flatten if any case or the default has such a free break.
+    if acc
+        .cases
+        .iter()
+        .any(|(_, body)| contains_free_break(body))
+        || acc.default.as_deref().is_some_and(contains_free_break)
+    {
+        return None;
+    }
+
     acc.cases.sort_by_key(|(label, _)| *label);
     let switch_cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = acc
         .cases
@@ -613,6 +625,22 @@ fn try_flatten_switch(
         cases: switch_cases,
         default,
     }])
+}
+
+/// True if `nodes` contain a `break` that is not already enclosed by a nested
+/// loop/switch (and so would bind to a freshly-synthesized switch). `continue`
+/// only ever targets a loop, which our switch can't capture, so it's ignored.
+fn contains_free_break(nodes: &[StructuredNode]) -> bool {
+    nodes.iter().any(|n| match n {
+        StructuredNode::Break => true,
+        StructuredNode::If { then_body, else_body, .. } => {
+            contains_free_break(then_body)
+                || else_body.as_ref().is_some_and(|b| contains_free_break(b))
+        }
+        StructuredNode::Sequence(ns) => contains_free_break(ns),
+        // Loops and switches capture `break`, so one inside them isn't free.
+        _ => false,
+    })
 }
 
 /// Accumulator for a flattened dispatch: equality cases and the terminal default
@@ -1192,6 +1220,23 @@ mod tests {
         // The epilogue block survives as a sibling after the switch.
         let has_epilogue = format!("{out:?}").contains("epilogue");
         assert!(has_epilogue);
+    }
+
+    #[test]
+    fn declines_when_a_case_body_has_a_free_break() {
+        // A `break` in a case body would have targeted an enclosing loop/switch;
+        // synthesizing a switch around it would recapture it, so decline.
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![StructuredNode::Break],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::int(1)])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
     }
 
     #[test]
