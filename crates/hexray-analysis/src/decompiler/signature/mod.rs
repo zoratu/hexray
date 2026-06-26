@@ -1019,12 +1019,17 @@ pub fn scan_aapcs_va_list(
         if !gr_is_offset || !vr_is_offset {
             continue;
         }
-        // Both offsets may legitimately be `0`: a variadic with 8 named GP args
-        // (`__gr_offs = -(8-8)*8 = 0`) whose varargs all land on the stack and
-        // whose FP class is unused initialises both fields to 0. The three
-        // distinct frame-pointer fields below are va_list-specific enough to
-        // confirm the tag without requiring a negative anchor — in that case both
-        // counts are simply unknown (left to observation).
+        // Require at least one canonical (negative) offset as the variadic anchor.
+        // Both offsets `0` is only produced by the rare case of 8 named GP args
+        // with stack-only varargs and no FP use — and in that case the save area
+        // is fully compacted, so there is *no* register-save-area spill to
+        // corroborate. With no distinguishing evidence, two zero words following
+        // three frame-pointer stores are indistinguishable from an ordinary local
+        // layout; accepting them would mark non-variadic functions variadic. The
+        // false positive is worse than missing that rare signature, so decline.
+        if gr_offs >= 0 && vr_offs >= 0 {
+            continue;
+        }
         // Recover the named count from the arg-register spills that land *inside*
         // the save area `[top + offs, top)` (`top` = `__gr_top`/`__vr_top`, `offs`
         // the negative offset). Bounding to that range excludes an address-taken
@@ -8941,9 +8946,10 @@ mod tests {
         ]);
         // Variadic (named_fp = 0) with an unknown/uncapped int count.
         assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
-        // Both offsets 0 is a legitimate tag (e.g. 8 named GP args + stack-only
-        // varargs, FP unused): the three frame-pointer fields confirm it, and both
-        // counts are unknown -> Some((None, None)).
+        // Both offsets 0 with no save-area spill is indistinguishable from an
+        // ordinary local layout (three frame pointers + two zero words), so it is
+        // NOT accepted as a tag — a negative anchor is required to avoid marking
+        // non-variadic functions variadic.
         let both_zero = aarch64_single_block_cfg(vec![
             add_sp(8, 0x110),
             str_reg(8, 64, 24),
@@ -8954,7 +8960,7 @@ mod tests {
             str_wzr(48),
             str_wzr(52),
         ]);
-        assert_eq!(scan_aapcs_va_list(&both_zero), Some((None, None)));
+        assert_eq!(scan_aapcs_va_list(&both_zero), None);
     }
 
     #[test]
