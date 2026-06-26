@@ -5637,16 +5637,21 @@ impl SignatureRecovery {
                     .unwrap_or(int_fixed)
             })
         };
+        // A known AAPCS named-float count materializes farg0..farg{n-1} even when
+        // a register is never read in the body — symmetric with the GP prefix
+        // fill — so e.g. `double f(double d, ...)` keeps its fixed `d` parameter.
+        let aapcs_named_fp = self.aapcs_va_list_counts.and_then(|(_, fp)| fp);
         for (idx, reg) in float_regs.iter().enumerate() {
             if float_param_cutoff.is_some_and(|cutoff| idx >= cutoff) {
                 continue;
             }
             let reg_lower = reg.to_lowercase();
+            let forced_named_fp = aapcs_named_fp.is_some_and(|n| idx < n);
             let seen_as_param = self.read_regs.contains(&reg_lower)
                 || self.observed_float_arg_regs.contains(&reg_lower)
                 || (integer_simd_signature && idx == 0);
-            if seen_as_param {
-                if integer_simd_signature {
+            if seen_as_param || forced_named_fp {
+                if integer_simd_signature && seen_as_param {
                     sig.parameters.push(Parameter::new(
                         format!("arg{}", idx),
                         ParamType::SimdInt128,
