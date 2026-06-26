@@ -636,16 +636,45 @@ fn collect_branch(
     env: &BindingEnv,
     acc: &mut Dispatch,
 ) -> Option<()> {
+    // A nested dispatch may be preceded by leading `Block`s — typically a reload
+    // `tmp = frame->__resume_index` that feeds the comparisons. Peel them as a
+    // shared prefix (advancing the binding env so the reloaded temp resolves) and
+    // prepend them to each selected case below, so the reload still runs exactly
+    // once for the chosen state.
+    let mut local_env = env.clone();
+    let mut prefix: Vec<StructuredNode> = Vec::new();
+    let mut tail = nodes;
+    while let [block @ StructuredNode::Block { statements, .. }, more @ ..] = tail {
+        local_env.note_block(statements, frame, state);
+        prefix.push(block.clone());
+        tail = more;
+    }
+
     if let [StructuredNode::If {
         condition,
         then_body,
         else_body,
-    }, rest @ ..] = nodes
+    }, rest @ ..] = tail
     {
-        if as_state_compare(condition, frame, state, env).is_some() {
+        if as_state_compare(condition, frame, state, &local_env).is_some() {
             // Flatten the nested dispatch into a private accumulator first.
             let mut sub = Dispatch::default();
-            collect_cases(condition, then_body, else_body, frame, state, env, &mut sub)?;
+            collect_cases(condition, then_body, else_body, frame, state, &local_env, &mut sub)?;
+            // The peeled prefix runs before the dispatch for whichever state is
+            // selected, so prepend it to every recovered case body and the
+            // default (only the chosen one executes it).
+            if !prefix.is_empty() {
+                for (_, body) in &mut sub.cases {
+                    let mut combined = prefix.clone();
+                    combined.append(body);
+                    *body = combined;
+                }
+                if let Some(default_body) = &mut sub.default {
+                    let mut combined = prefix.clone();
+                    combined.append(default_body);
+                    *default_body = combined;
+                }
+            }
             // Sibling code after the nested dispatch is the fall-through for the
             // states IT covered only — append it to those case bodies (and the
             // nested default, which also falls through) rather than hoisting it,
@@ -1157,6 +1186,40 @@ mod tests {
             }
         }
         None
+    }
+
+    #[test]
+    fn flattens_dispatch_with_leading_reload_block_in_branch() {
+        // if (arg0[18] <= 1) { tmp = arg0[18]; if (tmp==0) A else if (tmp==1) B }
+        // else                { if (arg0[18] == 2) C else trap }
+        // The reload block before the nested dispatch is peeled and re-prepended
+        // to the recovered cases.
+        let tmp = || Expr::var(Variable::reg("rax", 4));
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![
+                block(vec![Expr::assign(tmp(), state_access())]),
+                iff(
+                    cmp(BinOpKind::Eq, tmp(), 0),
+                    vec![block(vec![Expr::unknown("body_a")])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, tmp(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![],
+                    )],
+                ),
+            ],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 2),
+                vec![block(vec![Expr::unknown("body_c")])],
+                vec![block(vec![Expr::call(
+                    crate::decompiler::expression::CallTarget::Named("__builtin_trap".to_string()),
+                    vec![],
+                )])],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
     }
 
     #[test]
