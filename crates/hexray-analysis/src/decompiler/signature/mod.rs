@@ -819,16 +819,19 @@ pub fn scan_aapcs_va_list(
                         }
                     }
                 }
-                Operation::Add => {
+                Operation::Add | Operation::Sub => {
                     if let (Some(Operand::Register(dst)), Some(Operand::Register(base))) =
                         (inst.operands.first(), inst.operands.get(1))
                     {
                         let name = aarch64_canon_reg(dst.name());
-                        // Only a `frame_base + immediate` (or no offset) yields a
+                        // Only a `frame_base ± immediate` (or no offset) yields a
                         // static frame address; a register-offset `add x8, sp, x0`
                         // is a dynamic value and must clobber, not record `sp + 0`.
+                        // `sub` (e.g. `sub x8, x29, #imm` for slots below the frame
+                        // pointer) subtracts the displacement.
+                        let sign = if inst.operation == Operation::Sub { -1 } else { 1 };
                         let imm = match inst.operands.get(2) {
-                            Some(Operand::Immediate(i)) => Some(i.value as i64),
+                            Some(Operand::Immediate(i)) => Some(sign * i.value as i64),
                             None => Some(0),
                             Some(_) => None,
                         };
@@ -9543,6 +9546,63 @@ mod tests {
             str_wzr(48),         // __gr_offs = 0 (compacted)
             movn(1, 127),        // __vr_offs = -128
             str_reg(1, 32, 52),
+        ]);
+        assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
+    }
+
+    #[test]
+    fn scan_aapcs_va_list_tracks_sub_from_frame_pointer() {
+        // x29-relative prologues build pointers below the frame pointer with
+        // `sub xN, x29, #imm`. `sub` must form a FrameAddr (not clobber), else the
+        // pointer fields are missed. Here __vr_top = x29 - 16 and the FP save area
+        // [x29-144, x29-16) holds v7, giving a full FP save.
+        let x29 = || aarch64_x(29, 64);
+        let x = aarch64_x;
+        let sub_x29 = |dst: u16, imm: i128| {
+            (
+                "sub",
+                Operation::Sub,
+                vec![
+                    Operand::Register(x(dst, 64)),
+                    Operand::Register(x29()),
+                    Operand::imm(imm, 64),
+                ],
+            )
+        };
+        let str_at = |reg_id: u16, bits: u16, slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![Operand::Register(x(reg_id, bits)), aarch64_mem(x29(), slot)],
+            )
+        };
+        let movn = |reg: u16, k: i128| {
+            (
+                "movn",
+                Operation::Move,
+                vec![Operand::Register(x(reg, 32)), Operand::imm(k, 32)],
+            )
+        };
+        let str_wzr = |slot: i64| {
+            (
+                "str",
+                Operation::Store,
+                vec![
+                    Operand::Register(x(hexray_core::register::arm64::XZR, 32)),
+                    aarch64_mem(x29(), slot),
+                ],
+            )
+        };
+        let cfg = aarch64_single_block_cfg(vec![
+            str_at(hexray_core::register::arm64::V7, 128, -144), // v7 in FP area
+            sub_x29(8, 8),
+            str_at(8, 64, 24), // __stack = x29 - 8
+            // __gr_top omitted (GP compacted)
+            sub_x29(10, 16),
+            str_at(10, 64, 40), // __vr_top = x29 - 16; FP area [-144, -16)
+            str_wzr(48),        // __gr_offs = 0
+            movn(1, 127),       // __vr_offs = -128
+            str_at(1, 32, 52),
         ]);
         assert_eq!(scan_aapcs_va_list(&cfg), Some((None, Some(0))));
     }
