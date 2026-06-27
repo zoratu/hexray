@@ -717,6 +717,51 @@ fn eval_state_operand(
     None
 }
 
+/// Every state constant compared in a dispatch tree (case labels and bound
+/// constants) — the boundaries between distinct outcome ranges, used to sample
+/// large ranges without enumerating them.
+fn collect_state_constants(
+    nodes: &[StructuredNode],
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> Vec<i128> {
+    let mut out = Vec::new();
+    let mut env = env.clone();
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => env.note_block(statements, frame, state),
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                if let Some((_, k, _)) = as_state_compare_expr(condition, frame, state, &env) {
+                    out.push(k);
+                }
+                out.extend(collect_state_constants(then_body, frame, state, &env));
+                if let Some(b) = else_body {
+                    out.extend(collect_state_constants(b, frame, state, &env));
+                }
+            }
+            StructuredNode::Sequence(nodes) => {
+                out.extend(collect_state_constants(nodes, frame, state, &env))
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                out.extend(collect_state_constants(try_body, frame, state, &env));
+                for handler in catch_handlers {
+                    out.extend(collect_state_constants(&handler.body, frame, state, &env));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// The largest state constant compared anywhere in a dispatch tree (case labels
 /// and bound constants), so per-value enumeration covers every distinct range.
 fn max_state_constant(
@@ -1028,7 +1073,17 @@ fn try_flatten_switch(
         then_body: then_body.to_vec(),
         else_body: else_body.clone(),
     }];
-    let max_const = max_state_constant(&tree, frame, state, env).max(*labels.iter().max().unwrap());
+    // Resume indices are small. Cap the dense enumeration at the largest equality
+    // case label (not the largest *bound* constant, which may be huge, e.g. an
+    // unsigned `state <= 0xffffffff` guard — enumerating to it would hang). A
+    // label larger than the cap isn't a resume index — decline.
+    const ENUM_CAP: i128 = 4096;
+    let max_label = *labels.iter().max().unwrap();
+    if max_label > ENUM_CAP {
+        return None;
+    }
+    let max_const = max_state_constant(&tree, frame, state, env);
+
     // A value beyond every compared constant (of an allowed parity/slice) stands
     // in for all larger states; its outcome is the switch default. Search a full
     // slice period so periodic domains (e.g. `state & 1 == 0`, or a wider
@@ -1039,17 +1094,33 @@ fn try_flatten_switch(
         .map(|v| eval_outcome(&tree, v, frame, state, env))
         .unwrap_or_default();
 
-    // In-range unmatched values whose outcome differs from the default become
-    // explicit cases (grouped by identical outcome), so e.g. a single invalid
-    // index traps while the rest fall through.
+    // Unmatched small values (0..=max_label) whose outcome differs from the
+    // default become explicit cases (e.g. a single invalid index traps while the
+    // rest fall through).
     let mut extra: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
-    for v in 0..=max_const {
+    for v in 0..=max_label {
         if !domain.allows(v) || labels.contains(&v) {
             continue;
         }
         let outcome = eval_outcome(&tree, v, frame, state, env);
         if !bodies_equivalent(&outcome, &beyond_outcome) {
             extra.push((v, outcome));
+        }
+    }
+
+    // Values above the largest case label that are still bounded by a (possibly
+    // huge) range guard form ranges we can't enumerate as explicit cases. Sample
+    // each range boundary (compared constants and their successors): every such
+    // value must share the default outcome, otherwise a non-uniform large range
+    // would need explicit cases we can't emit — decline.
+    for c in collect_state_constants(&tree, frame, state, env) {
+        for d in [c, c + 1] {
+            if d > max_label && domain.allows(d) && !labels.contains(&d) {
+                let outcome = eval_outcome(&tree, d, frame, state, env);
+                if !bodies_equivalent(&outcome, &beyond_outcome) {
+                    return None;
+                }
+            }
         }
     }
 
@@ -1586,6 +1657,35 @@ mod tests {
         let out = recover_resume_dispatch(body);
         // Even branch: only {0, 2}; the odd value 1 is not a case.
         assert_eq!(switch_labels(&out), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn huge_bound_constant_does_not_hang() {
+        // if (state <= 0xffffffff) { if (state==0) A else if (state==1) B else trap }
+        // The dense enumeration must be capped at the small case labels, not the
+        // 4-billion bound; the huge trap range can't be explicit cases, so the
+        // pass declines (and returns promptly).
+        let body = vec![iff(
+            cmp(BinOpKind::ULe, state_access(), 0xffff_ffff),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![block(vec![Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("__builtin_trap".to_string()),
+                        vec![],
+                    )])],
+                )],
+            )],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        // The outer 4-billion bound declines fast (sampled, not enumerated); the
+        // inner small dispatch flattens to `switch { case 0; case 1; default trap }`
+        // inside the `if (state <= 0xffffffff)`. The test completing proves no hang.
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
     }
 
     #[test]
