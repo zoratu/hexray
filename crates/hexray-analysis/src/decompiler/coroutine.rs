@@ -1212,6 +1212,10 @@ fn rewrite_structural(
                 })
                 .collect(),
         },
+        StructuredNode::Expr(e) => StructuredNode::Expr(rename_state_in_expr(e, frame, state)),
+        StructuredNode::Return(Some(e)) => {
+            StructuredNode::Return(Some(rename_state_in_expr(e, frame, state)))
+        }
         other => other,
     }
 }
@@ -2055,6 +2059,31 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn expr_and_return_nodes_in_case_bodies_are_renamed() {
+        // case 0 is a standalone Expr node then a Return node, both referencing the
+        // state field; both must be renamed to frame->__resume_index (no raw
+        // arg0[18] ArrayAccess left behind).
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![
+                StructuredNode::Expr(Expr::assign(Expr::var(Variable::reg("rax", 8)), state_access())),
+                StructuredNode::Return(Some(state_access())),
+            ],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(c0.contains("__resume_index"), "{c0}");
+        assert!(!c0.contains("ArrayAccess"), "raw state access in case0: {c0}");
     }
 
     #[test]
