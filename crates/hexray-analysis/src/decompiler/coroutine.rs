@@ -316,17 +316,28 @@ fn scan_state_compares(
         match node {
             StructuredNode::Block { statements, .. } => {
                 for stmt in statements {
-                    if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
-                        if let ExprKind::Var(v) = &lhs.kind {
-                            match frame_offset(rhs, frame) {
-                                Some(off) => {
-                                    temp_offset.insert(v.name.clone(), off);
-                                }
-                                None => {
-                                    temp_offset.remove(&v.name);
+                    match &stmt.kind {
+                        ExprKind::Assign { lhs, rhs } => {
+                            if let ExprKind::Var(v) = &lhs.kind {
+                                match frame_offset(rhs, frame) {
+                                    Some(off) => {
+                                        temp_offset.insert(v.name.clone(), off);
+                                    }
+                                    None => {
+                                        temp_offset.remove(&v.name);
+                                    }
                                 }
                             }
                         }
+                        // A compound assignment mutates the temp — clear its binding
+                        // so a later comparison of the modified value isn't
+                        // attributed to the original frame offset.
+                        ExprKind::CompoundAssign { lhs, .. } => {
+                            if let ExprKind::Var(v) = &lhs.kind {
+                                temp_offset.remove(&v.name);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1000,19 +1011,30 @@ struct BindingEnv {
 impl BindingEnv {
     fn note_block(&mut self, statements: &[Expr], frame: &Frame, state: &StateField) {
         for stmt in statements {
-            if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
-                if let ExprKind::Var(v) = &lhs.kind {
-                    if self.is_state(rhs, frame, state) {
-                        self.state_temps.insert(v.name.clone());
-                        self.slice_temps.remove(&v.name);
-                    } else if let Some(slice) = self.state_slice(rhs, frame, state) {
-                        self.slice_temps.insert(v.name.clone(), slice);
-                        self.state_temps.remove(&v.name);
-                    } else {
+            match &stmt.kind {
+                ExprKind::Assign { lhs, rhs } => {
+                    if let ExprKind::Var(v) = &lhs.kind {
+                        if self.is_state(rhs, frame, state) {
+                            self.state_temps.insert(v.name.clone());
+                            self.slice_temps.remove(&v.name);
+                        } else if let Some(slice) = self.state_slice(rhs, frame, state) {
+                            self.slice_temps.insert(v.name.clone(), slice);
+                            self.state_temps.remove(&v.name);
+                        } else {
+                            self.state_temps.remove(&v.name);
+                            self.slice_temps.remove(&v.name);
+                        }
+                    }
+                }
+                // A compound assignment (`tmp += 1`, etc.) mutates the temp, so it
+                // no longer holds the resume index / slice — drop the binding.
+                ExprKind::CompoundAssign { lhs, .. } => {
+                    if let ExprKind::Var(v) = &lhs.kind {
                         self.state_temps.remove(&v.name);
                         self.slice_temps.remove(&v.name);
                     }
                 }
+                _ => {}
             }
         }
     }
@@ -2059,6 +2081,36 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn compound_assign_to_state_temp_clears_binding() {
+        // tmp = state; tmp += 1;
+        // if (tmp == 1) A else if (tmp == 2) B
+        // After `tmp += 1` the temp no longer holds the resume index, so the
+        // comparisons must NOT be flattened into a switch on __resume_index.
+        let tmp = || Expr::var(Variable::reg("rcx", 8));
+        let compound = Expr {
+            kind: ExprKind::CompoundAssign {
+                op: BinOpKind::Add,
+                lhs: Box::new(tmp()),
+                rhs: Box::new(Expr::int(1)),
+            },
+        };
+        let body = vec![
+            block(vec![Expr::assign(tmp(), state_access()), compound]),
+            iff(
+                cmp(BinOpKind::Eq, tmp(), 1),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, tmp(), 2),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
     }
 
     #[test]
