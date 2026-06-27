@@ -642,7 +642,12 @@ fn eval_outcome(
 /// / return / break / continue), so following siblings don't run.
 fn ends_noreturn(nodes: &[StructuredNode]) -> bool {
     match nodes.last() {
-        Some(StructuredNode::Return(_) | StructuredNode::Break | StructuredNode::Continue) => true,
+        Some(
+            StructuredNode::Return(_)
+            | StructuredNode::Break
+            | StructuredNode::Continue
+            | StructuredNode::Goto(_),
+        ) => true,
         Some(StructuredNode::Block { statements, .. }) => statements.iter().any(is_noreturn_call),
         Some(StructuredNode::Expr(e)) => is_noreturn_call(e),
         _ => false,
@@ -1615,6 +1620,35 @@ mod tests {
         assert_eq!(switch_labels(&out), Some(vec![7, 15]));
         let default_dump = find_default_dump(&out).expect("trap default for state 23+");
         assert!(default_dump.contains("__builtin_trap"));
+    }
+
+    #[test]
+    fn goto_terminated_outcome_does_not_append_suffix() {
+        // if (state == 9) X else { if (state==0)A else if (state==1)B else goto L
+        //                          ; suffix }
+        // An unmatched state hits `goto L`, which jumps away — the trailing
+        // `suffix` must NOT be appended after the goto in the default outcome.
+        use hexray_core::BasicBlockId;
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 9),
+            vec![block(vec![Expr::unknown("body_x")])],
+            vec![
+                iff(
+                    cmp(BinOpKind::Eq, state_access(), 0),
+                    vec![block(vec![Expr::unknown("body_a")])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, state_access(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![StructuredNode::Goto(BasicBlockId::new(7))],
+                    )],
+                ),
+                block(vec![Expr::unknown("suffix")]),
+            ],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 9]));
+        let default_dump = find_default_dump(&out).expect("goto default");
+        assert!(!default_dump.contains("suffix"));
     }
 
     #[test]
