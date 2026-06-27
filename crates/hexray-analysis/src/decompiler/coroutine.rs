@@ -686,7 +686,18 @@ fn eval_outcome(
                     .map(|b| eval_outcome(b, v, frame, state, &env))
                     .unwrap_or_default();
                 if !ends_noreturn(&outcome) {
-                    outcome.extend(eval_outcome(&nodes[i + 1..], v, frame, state, &env));
+                    // The taken branch may have reassigned a temp that held the
+                    // resume index; the fall-through siblings must not keep treating
+                    // it as the state value. Invalidate every temp the branch
+                    // assigned before evaluating the continuation.
+                    let mut sibling_env = env.clone();
+                    if let Some(b) = branch {
+                        for name in assigned_vars(b) {
+                            sibling_env.state_temps.remove(&name);
+                            sibling_env.slice_temps.remove(&name);
+                        }
+                    }
+                    outcome.extend(eval_outcome(&nodes[i + 1..], v, frame, state, &sibling_env));
                 }
                 return prepend_used_reloads(reloads, outcome);
             }
@@ -2081,6 +2092,43 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn branch_reassigned_temp_not_treated_as_state_in_fallthrough() {
+        // tmp = state;
+        // if (state == 0) A
+        // else {
+        //     if (state == 1) { tmp = 7; }       // case 1 reassigns tmp, falls through
+        //     if (tmp == 5) shared_b else shared_c   // compares the *reused* tmp
+        // }
+        // For state 1, tmp is 7 by the time the second if runs, so it must NOT be
+        // routed as `state == 5`; case 1 keeps the whole tmp-compare (both arms).
+        let tmp = || Expr::var(Variable::reg("rcx", 8));
+        let body = vec![
+            block(vec![Expr::assign(tmp(), state_access())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![
+                    iff(
+                        cmp(BinOpKind::Eq, state_access(), 1),
+                        vec![block(vec![Expr::assign(tmp(), Expr::int(7))])],
+                        vec![],
+                    ),
+                    iff(
+                        cmp(BinOpKind::Eq, tmp(), 5),
+                        vec![block(vec![Expr::unknown("shared_b")])],
+                        vec![block(vec![Expr::unknown("shared_c")])],
+                    ),
+                ],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        let case1 = case_body(&out, 1).expect("case 1");
+        let c1 = format!("{case1:?}");
+        assert!(c1.contains("shared_b"), "fall-through tmp-compare mis-routed: {c1}");
+        assert!(c1.contains("shared_c"), "{c1}");
     }
 
     #[test]
