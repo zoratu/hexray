@@ -59,7 +59,7 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
         return body;
     };
     let mut env = BindingEnv::default();
-    let rewritten = rewrite_nodes(body.clone(), &frame, &state, &mut env);
+    let rewritten = rewrite_nodes(body.clone(), &frame, &state, &mut env, &Domain::default());
     // The rewrite also renames the state field to `frame->__resume_index`; only
     // commit it when a dispatch actually flattened into a switch, so a field that
     // merely happened to be the most-compared one is never renamed in isolation.
@@ -412,11 +412,314 @@ fn int_lit(e: &Expr) -> Option<i128> {
     }
 }
 
+/// The set of state values that can reach a point, narrowed by the enclosing
+/// state conditions (parity from an even/odd `BITS(state,0,1)` split, and range
+/// bounds). Used to enumerate only the states that actually reach a dispatch so
+/// per-value fate evaluation never invents cases for impossible values.
+#[derive(Clone, Default)]
+struct Domain {
+    constraints: Vec<DomainConstraint>,
+}
+
+#[derive(Clone, Copy)]
+enum DomainConstraint {
+    /// `state <op> k`.
+    Cmp(BinOpKind, i128),
+    /// `BITS(state, start, width) == value` (e.g. the even/odd split is
+    /// `start = 0, width = 1`).
+    Slice { start: u8, width: u8, value: i128 },
+}
+
+impl Domain {
+    fn allows(&self, v: i128) -> bool {
+        self.constraints.iter().all(|c| match c {
+            DomainConstraint::Cmp(op, k) => apply_cmp(*op, v, *k),
+            DomainConstraint::Slice {
+                start,
+                width,
+                value,
+            } => (v >> start) & ((1i128 << width) - 1) == *value,
+        })
+    }
+
+    fn with(&self, c: DomainConstraint) -> Domain {
+        let mut constraints = self.constraints.clone();
+        constraints.push(c);
+        Domain { constraints }
+    }
+}
+
+fn apply_cmp(op: BinOpKind, a: i128, b: i128) -> bool {
+    match op {
+        BinOpKind::Eq => a == b,
+        BinOpKind::Ne => a != b,
+        BinOpKind::Lt | BinOpKind::ULt => a < b,
+        BinOpKind::Le | BinOpKind::ULe => a <= b,
+        BinOpKind::Gt | BinOpKind::UGt => a > b,
+        BinOpKind::Ge | BinOpKind::UGe => a >= b,
+        _ => false,
+    }
+}
+
+/// If `cond` constrains the state field, return the (then, else) domain
+/// constraints it imposes — a whole-state comparison or a bit-slice equality
+/// (e.g. the even/odd `state & 1 == k` split). Either side is `None` when that
+/// branch's constraint isn't expressible (e.g. `!=` on a multi-bit slice).
+fn cond_constraints(
+    cond: &Expr,
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> Option<(Option<DomainConstraint>, Option<DomainConstraint>)> {
+    let ExprKind::BinOp { op, left, right } = &cond.kind else {
+        return None;
+    };
+    if !is_comparison(*op) {
+        return None;
+    }
+    // Bit-slice equality: `BITS(state, s, w) <eq> k` (parity is s=0, w=1).
+    for (a, b, op) in [(left, right, *op), (right, left, flip_op(*op))] {
+        if let Some((start, width)) = env.state_slice(a, frame, state) {
+            let Some(k) = int_lit(b) else { continue };
+            let mask = (1i128 << width) - 1;
+            let value = k & mask;
+            return Some(match op {
+                BinOpKind::Eq => (
+                    Some(DomainConstraint::Slice { start, width, value }),
+                    // The complement is a single slice value only for width 1.
+                    (width == 1).then_some(DomainConstraint::Slice {
+                        start,
+                        width,
+                        value: value ^ 1,
+                    }),
+                ),
+                BinOpKind::Ne => (
+                    (width == 1).then_some(DomainConstraint::Slice {
+                        start,
+                        width,
+                        value: value ^ 1,
+                    }),
+                    Some(DomainConstraint::Slice { start, width, value }),
+                ),
+                _ => (None, None),
+            });
+        }
+    }
+    // Plain `state <op> k`.
+    if let Some((_, k, op)) = as_state_compare_expr(cond, frame, state, env) {
+        return Some((
+            Some(DomainConstraint::Cmp(op, k)),
+            Some(DomainConstraint::Cmp(negate_cmp(op), k)),
+        ));
+    }
+    None
+}
+
+/// `as_state_compare` returning the constant and field-left-oriented op.
+fn as_state_compare_expr(
+    cond: &Expr,
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> Option<((), i128, BinOpKind)> {
+    let ExprKind::BinOp { op, left, right } = &cond.kind else {
+        return None;
+    };
+    if !is_comparison(*op) {
+        return None;
+    }
+    if env.is_state(left, frame, state) {
+        return int_lit(right).map(|k| ((), k, *op));
+    }
+    if env.is_state(right, frame, state) {
+        return int_lit(left).map(|k| ((), k, flip_op(*op)));
+    }
+    None
+}
+
+fn negate_cmp(op: BinOpKind) -> BinOpKind {
+    match op {
+        BinOpKind::Eq => BinOpKind::Ne,
+        BinOpKind::Ne => BinOpKind::Eq,
+        BinOpKind::Lt => BinOpKind::Ge,
+        BinOpKind::Le => BinOpKind::Gt,
+        BinOpKind::Gt => BinOpKind::Le,
+        BinOpKind::Ge => BinOpKind::Lt,
+        BinOpKind::ULt => BinOpKind::UGe,
+        BinOpKind::ULe => BinOpKind::UGt,
+        BinOpKind::UGt => BinOpKind::ULe,
+        BinOpKind::UGe => BinOpKind::ULt,
+        other => other,
+    }
+}
+
+/// The outcome a single (unmatched) state value `v` executes when it flows
+/// through a dispatch If-tree: the trailing nodes it runs after navigating the
+/// bounds/equality checks — `[]` for a clean fall-through past the dispatch,
+/// `[trap]` for a noreturn leaf, or a live default body. Used to compute the
+/// switch's default/extra cases exactly per value, never conflating ranges.
+fn eval_outcome(
+    nodes: &[StructuredNode],
+    v: i128,
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> Vec<StructuredNode> {
+    let mut env = env.clone();
+    for (i, node) in nodes.iter().enumerate() {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                if is_state_reload_block(statements, frame, state, &env) {
+                    env.note_block(statements, frame, state);
+                    continue;
+                }
+                // A real (or trap) block: v runs it and the rest of this sibling
+                // list as its outcome.
+                return nodes[i..].to_vec();
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                let branch = match eval_state_cond(condition, v, frame, state, &env) {
+                    Some(true) => Some(then_body.as_slice()),
+                    Some(false) => else_body.as_deref(),
+                    // Non-state condition: v has reached ordinary code; its outcome
+                    // is this node onward (the whole region).
+                    None => return nodes[i..].to_vec(),
+                };
+                // v executes the taken branch; if that branch falls through (no
+                // trap/return), it then continues with the siblings after this If.
+                let mut outcome = branch
+                    .map(|b| eval_outcome(b, v, frame, state, &env))
+                    .unwrap_or_default();
+                if !ends_noreturn(&outcome) {
+                    outcome.extend(eval_outcome(&nodes[i + 1..], v, frame, state, &env));
+                }
+                return outcome;
+            }
+            _ => return nodes[i..].to_vec(),
+        }
+    }
+    Vec::new()
+}
+
+/// Whether the outcome's final statement halts control flow (trap / unreachable
+/// / return / break / continue), so following siblings don't run.
+fn ends_noreturn(nodes: &[StructuredNode]) -> bool {
+    match nodes.last() {
+        Some(StructuredNode::Return(_) | StructuredNode::Break | StructuredNode::Continue) => true,
+        Some(StructuredNode::Block { statements, .. }) => statements.iter().any(is_noreturn_call),
+        Some(StructuredNode::Expr(e)) => is_noreturn_call(e),
+        _ => false,
+    }
+}
+
+fn is_noreturn_call(e: &Expr) -> bool {
+    use super::expression::CallTarget;
+    match &e.kind {
+        ExprKind::Call { target, .. } => matches!(
+            target,
+            CallTarget::Named(n)
+                if matches!(
+                    n.as_str(),
+                    "__builtin_trap" | "__builtin_unreachable" | "abort" | "std::terminate"
+                )
+        ),
+        ExprKind::Unknown(s) => s.contains("__builtin_trap") || s.contains("__builtin_unreachable"),
+        _ => false,
+    }
+}
+
+/// Evaluate a state condition for a concrete value `v`. Handles `state <op> k`
+/// and the parity `BITS(state,0,1) <eq> k`. `None` if not a state condition.
+fn eval_state_cond(
+    cond: &Expr,
+    v: i128,
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> Option<bool> {
+    let ExprKind::BinOp { op, left, right } = &cond.kind else {
+        return None;
+    };
+    if !is_comparison(*op) {
+        return None;
+    }
+    if let Some(lv) = eval_state_operand(left, v, frame, state, env) {
+        if let Some(k) = int_lit(right) {
+            return Some(apply_cmp(*op, lv, k));
+        }
+    }
+    if let Some(rv) = eval_state_operand(right, v, frame, state, env) {
+        if let Some(k) = int_lit(left) {
+            return Some(apply_cmp(flip_op(*op), rv, k));
+        }
+    }
+    None
+}
+
+/// The integer value of a state-derived operand (the state itself, or a bitfield
+/// slice of it) for `state == v`.
+fn eval_state_operand(
+    e: &Expr,
+    v: i128,
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> Option<i128> {
+    if env.is_state(e, frame, state) {
+        return Some(v);
+    }
+    // A bit-slice of the state (directly `BITS(state,s,w)` or via a temp).
+    if let Some((start, width)) = env.state_slice(e, frame, state) {
+        return Some((v >> start) & ((1i128 << width) - 1));
+    }
+    None
+}
+
+/// The largest state constant compared anywhere in a dispatch tree (case labels
+/// and bound constants), so per-value enumeration covers every distinct range.
+fn max_state_constant(
+    nodes: &[StructuredNode],
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> i128 {
+    let mut max = 0;
+    let mut env = env.clone();
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => env.note_block(statements, frame, state),
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                if let Some((_, k, _)) = as_state_compare_expr(condition, frame, state, &env) {
+                    max = max.max(k);
+                }
+                max = max.max(max_state_constant(then_body, frame, state, &env));
+                if let Some(b) = else_body {
+                    max = max.max(max_state_constant(b, frame, state, &env));
+                }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 /// Scoped binding environment: temporaries currently holding the state value
-/// (`tmp = frame->state`, kept across zero-extending `tmp = (u16)tmp` copies).
+/// (`tmp = frame->state`, kept across zero-extending `tmp = (u16)tmp` copies) and
+/// bit-slice temporaries (`tmp = BITS(state, start, width)` — the even/odd
+/// resume/destroy split is `tmp = state & 1`).
 #[derive(Default, Clone)]
 struct BindingEnv {
     state_temps: HashSet<String>,
+    /// temp name -> (start, width) of the state bit-slice it holds.
+    slice_temps: HashMap<String, (u8, u8)>,
 }
 
 impl BindingEnv {
@@ -426,8 +729,13 @@ impl BindingEnv {
                 if let ExprKind::Var(v) = &lhs.kind {
                     if self.is_state(rhs, frame, state) {
                         self.state_temps.insert(v.name.clone());
+                        self.slice_temps.remove(&v.name);
+                    } else if let Some(slice) = self.state_slice(rhs, frame, state) {
+                        self.slice_temps.insert(v.name.clone(), slice);
+                        self.state_temps.remove(&v.name);
                     } else {
                         self.state_temps.remove(&v.name);
+                        self.slice_temps.remove(&v.name);
                     }
                 }
             }
@@ -443,6 +751,18 @@ impl BindingEnv {
             _ => false,
         }
     }
+
+    /// If `expr` is a bit-slice of the state (`BITS(state, s, w)` directly, or a
+    /// temp holding one), return `(start, width)`.
+    fn state_slice(&self, expr: &Expr, frame: &Frame, state: &StateField) -> Option<(u8, u8)> {
+        match &peel_cast(expr).kind {
+            ExprKind::BitField { expr, start, width } if self.is_state(expr, frame, state) => {
+                Some((*start, *width))
+            }
+            ExprKind::Var(v) => self.slice_temps.get(&v.name).copied(),
+            _ => None,
+        }
+    }
 }
 
 /// Walk the body, updating the binding environment over `Block`s and attempting
@@ -452,6 +772,7 @@ fn rewrite_nodes(
     frame: &Frame,
     state: &StateField,
     env: &mut BindingEnv,
+    domain: &Domain,
 ) -> Vec<StructuredNode> {
     let mut out = Vec::with_capacity(nodes.len());
     for node in nodes {
@@ -478,35 +799,50 @@ fn rewrite_nodes(
                 else_body,
             } => {
                 if let Some(switch_nodes) =
-                    try_flatten_switch(&condition, &then_body, &else_body, frame, state, env)
+                    try_flatten_switch(&condition, &then_body, &else_body, frame, state, env, domain)
                 {
                     out.extend(switch_nodes);
                     continue;
                 }
+                // Narrow the domain for each branch by the (state) condition, so a
+                // dispatch nested under an even/odd or range guard enumerates only
+                // the states that can reach it.
+                let narrow = |c: Option<DomainConstraint>| match c {
+                    Some(c) => domain.with(c),
+                    None => domain.clone(),
+                };
+                let (then_dom, else_dom) = match cond_constraints(&condition, frame, state, env) {
+                    Some((t, e)) => (narrow(t), narrow(e)),
+                    None => (domain.clone(), domain.clone()),
+                };
                 let condition = rename_state_in_expr(condition, frame, state);
-                let then_body = rewrite_nodes(then_body, frame, state, &mut env.clone());
-                let else_body = else_body.map(|b| rewrite_nodes(b, frame, state, &mut env.clone()));
+                let then_body = rewrite_nodes(then_body, frame, state, &mut env.clone(), &then_dom);
+                let else_body =
+                    else_body.map(|b| rewrite_nodes(b, frame, state, &mut env.clone(), &else_dom));
                 out.push(StructuredNode::If {
                     condition,
                     then_body,
                     else_body,
                 });
             }
-            other => out.push(rewrite_structural(other, frame, state, env)),
+            other => out.push(rewrite_structural(other, frame, state, env, domain)),
         }
     }
     out
 }
 
 /// Recurse into the structural children of loops/switch/etc. with a fresh env
-/// clone (these don't extend the linear binding scope meaningfully).
+/// clone (these don't extend the linear binding scope meaningfully). The domain
+/// isn't narrowed across these (a loop/switch body re-enters with the same
+/// reachable state set), which is conservative for fate evaluation.
 fn rewrite_structural(
     node: StructuredNode,
     frame: &Frame,
     state: &StateField,
     env: &BindingEnv,
+    domain: &Domain,
 ) -> StructuredNode {
-    let recur = |b: Vec<StructuredNode>| rewrite_nodes(b, frame, state, &mut env.clone());
+    let recur = |b: Vec<StructuredNode>| rewrite_nodes(b, frame, state, &mut env.clone(), domain);
     match node {
         StructuredNode::While {
             condition,
@@ -570,7 +906,9 @@ fn rewrite_structural(
 
 /// Attempt to flatten an `If` rooted state dispatch into a `Switch`. Returns
 /// `None` (leaving the if-tree untouched) unless ≥2 distinct equality cases are
-/// confidently recovered.
+/// confidently recovered. The unmatched-state behavior (default and any explicit
+/// trap cases) is computed by evaluating each reachable state value through the
+/// original tree, so trapping and fall-through states are emitted exactly.
 fn try_flatten_switch(
     condition: &Expr,
     then_body: &[StructuredNode],
@@ -578,48 +916,75 @@ fn try_flatten_switch(
     frame: &Frame,
     state: &StateField,
     env: &BindingEnv,
+    domain: &Domain,
 ) -> Option<Vec<StructuredNode>> {
     as_state_compare(condition, frame, state, env)?;
 
-    let mut acc = Dispatch::default();
-    collect_cases(condition, then_body, else_body, frame, state, env, &mut acc)?;
+    // 1. Collect the equality cases and their bodies.
+    let mut cases: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
+    collect_cases(condition, then_body, else_body, frame, state, env, &mut cases)?;
 
-    let mut seen = HashSet::new();
-    for (label, _) in &acc.cases {
-        if !seen.insert(*label) {
-            return None;
+    let mut labels = HashSet::new();
+    for (label, _) in &cases {
+        if !labels.insert(*label) {
+            return None; // duplicate case label — not a clean dispatch
         }
     }
-    if seen.len() < 2 {
+    if labels.len() < 2 {
         return None;
     }
 
-    // A `break` in a recovered body that targeted an enclosing loop/switch would
-    // be captured by the switch we're about to synthesize, changing its target.
-    // Decline the flatten if any case or the default has such a free break.
-    if acc
-        .cases
-        .iter()
-        .any(|(_, body)| contains_free_break(body))
-        || acc.default.as_deref().is_some_and(contains_free_break)
+    // 2. Determine the fate of every *unmatched* reachable state value by
+    //    evaluating the original tree per value. The tree is the root `If`.
+    let tree = vec![StructuredNode::If {
+        condition: condition.clone(),
+        then_body: then_body.to_vec(),
+        else_body: else_body.clone(),
+    }];
+    let max_const = max_state_constant(&tree, frame, state, env).max(*labels.iter().max().unwrap());
+    // A value beyond every compared constant (of an allowed parity) stands in for
+    // all larger states; its outcome is the switch default.
+    let beyond = (max_const + 1..=max_const + 3).find(|v| domain.allows(*v));
+    let beyond_outcome = beyond
+        .map(|v| eval_outcome(&tree, v, frame, state, env))
+        .unwrap_or_default();
+
+    // In-range unmatched values whose outcome differs from the default become
+    // explicit cases (grouped by identical outcome), so e.g. a single invalid
+    // index traps while the rest fall through.
+    let mut extra: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
+    for v in 0..=max_const {
+        if !domain.allows(v) || labels.contains(&v) {
+            continue;
+        }
+        let outcome = eval_outcome(&tree, v, frame, state, env);
+        if !bodies_equivalent(&outcome, &beyond_outcome) {
+            extra.push((v, outcome));
+        }
+    }
+
+    // 3. Safety: a free `break` in any emitted body would be recaptured by the
+    //    synthesized switch.
+    if cases.iter().chain(extra.iter()).any(|(_, b)| contains_free_break(b))
+        || contains_free_break(&beyond_outcome)
     {
         return None;
     }
 
-    acc.cases.sort_by_key(|(label, _)| *label);
-    let switch_cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = acc
-        .cases
+    // 4. Build the switch: real cases + explicit minority-outcome cases, with the
+    //    beyond outcome as the default (empty outcome => no default, fall through).
+    cases.extend(extra);
+    cases.sort_by_key(|(label, _)| *label);
+    let switch_cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = cases
         .into_iter()
-        .map(|(label, body)| (vec![label], rewrite_nodes(body, frame, state, &mut env.clone())))
+        .map(|(label, body)| (vec![label], rewrite_nodes(body, frame, state, &mut env.clone(), domain)))
         .collect();
-    let default = acc
-        .default
-        .map(|b| rewrite_nodes(b, frame, state, &mut env.clone()));
+    let default = if beyond_outcome.is_empty() {
+        None
+    } else {
+        Some(rewrite_nodes(beyond_outcome, frame, state, &mut env.clone(), domain))
+    };
 
-    // Any code that follows this dispatch at the SAME sibling level (shared by
-    // every case) stays after the switch — `rewrite_nodes` keeps those siblings
-    // in place. Code local to one branch is appended to that branch's cases in
-    // `collect_branch`, never hoisted, so semantics are preserved.
     Some(vec![StructuredNode::Switch {
         value: named_state_expr(frame, state),
         cases: switch_cases,
@@ -651,18 +1016,11 @@ fn contains_free_break(nodes: &[StructuredNode]) -> bool {
     })
 }
 
-/// Accumulator for a flattened dispatch: equality cases and the terminal default
-/// (a trap / unreachable / empty leaf).
-#[derive(Default)]
-struct Dispatch {
-    cases: Vec<(i128, Vec<StructuredNode>)>,
-    default: Option<Vec<StructuredNode>>,
-}
-
-/// Recursively gather `(label, body)` cases from a state-dispatch if-tree.
-/// `Eq`/`Ne` produce a case; inequality bound checks partition the state space
-/// so we recurse into both branches; a non-state terminal body becomes the
-/// default (a second one aborts the flatten — mixed control flow).
+/// Recursively gather `(label, body)` equality cases from a state-dispatch
+/// if-tree. `Eq`/`Ne` produce a case; inequality bound checks partition the
+/// state space so we recurse into both branches. Unmatched-state behavior
+/// (default / traps) is NOT tracked here — it's computed exactly per value by
+/// [`eval_outcome`] in `try_flatten_switch`.
 fn collect_cases(
     condition: &Expr,
     then_body: &[StructuredNode],
@@ -670,21 +1028,19 @@ fn collect_cases(
     frame: &Frame,
     state: &StateField,
     env: &BindingEnv,
-    acc: &mut Dispatch,
+    cases: &mut Vec<(i128, Vec<StructuredNode>)>,
 ) -> Option<()> {
     let (op, value) = as_state_compare(condition, frame, state, env)?;
     match op {
         BinOpKind::Eq => {
-            acc.cases.push((value, then_body.to_vec()));
-            collect_branch_opt(else_body, frame, state, env, acc)
+            cases.push((value, then_body.to_vec()));
+            collect_branch_opt(else_body, frame, state, env, cases)
         }
         BinOpKind::Ne => {
             // `state != N` guards the rest in `then`; the excluded value N takes
-            // the `else`. Always materialize case N — with the else body, or an
-            // empty body when there's no else (so state == N breaks to the shared
-            // post-dispatch flow instead of hitting the default).
-            acc.cases.push((value, else_body.clone().unwrap_or_default()));
-            collect_branch(then_body, frame, state, env, acc)
+            // the `else` (an empty body when there's no else).
+            cases.push((value, else_body.clone().unwrap_or_default()));
+            collect_branch(then_body, frame, state, env, cases)
         }
         BinOpKind::Lt
         | BinOpKind::Le
@@ -694,43 +1050,8 @@ fn collect_cases(
         | BinOpKind::ULe
         | BinOpKind::UGt
         | BinOpKind::UGe => {
-            // Each side of the bound covers only its own sub-range, so any default
-            // recovered from a branch is range-limited. A flat switch has a single
-            // default for ALL unmatched states, so a *live* (non-noreturn)
-            // range-limited default can't be represented — decline. A noreturn
-            // trap is uniform-enough (invalid states abort) and is merged.
-            let mut then_d = Dispatch::default();
-            collect_branch(then_body, frame, state, env, &mut then_d)?;
-            if matches!(&then_d.default, Some(d) if !body_is_noreturn(d)) {
-                return None;
-            }
-            acc.cases.extend(then_d.cases);
-
-            match else_body {
-                Some(else_nodes) => {
-                    // Both ranges are dispatched explicitly.
-                    let mut else_d = Dispatch::default();
-                    collect_branch(else_nodes, frame, state, env, &mut else_d)?;
-                    if matches!(&else_d.default, Some(d) if !body_is_noreturn(d)) {
-                        return None;
-                    }
-                    acc.cases.extend(else_d.cases);
-                    for d in [then_d.default, else_d.default].into_iter().flatten() {
-                        if acc.default.is_none() {
-                            acc.default = Some(d);
-                        }
-                    }
-                    Some(())
-                }
-                None => {
-                    // No else: states not satisfying the bound fall through past the
-                    // dispatch, so the taken range's noreturn trap (covering only
-                    // taken-range gaps, dead for a dense dispatch) must be dropped —
-                    // not promoted to a default that would trap those fall-through
-                    // states.
-                    Some(())
-                }
-            }
+            collect_branch(then_body, frame, state, env, cases)?;
+            collect_branch_opt(else_body, frame, state, env, cases)
         }
         _ => None,
     }
@@ -741,39 +1062,31 @@ fn collect_branch_opt(
     frame: &Frame,
     state: &StateField,
     env: &BindingEnv,
-    acc: &mut Dispatch,
+    cases: &mut Vec<(i128, Vec<StructuredNode>)>,
 ) -> Option<()> {
     match else_body {
         None => Some(()),
-        Some(nodes) => collect_branch(nodes, frame, state, env, acc),
+        Some(nodes) => collect_branch(nodes, frame, state, env, cases),
     }
 }
 
-/// Process a continuation branch: if its first node is a nested state dispatch,
-/// recurse, and treat any sibling nodes after it as the shared fall-through
-/// epilogue (post-switch code). A pure terminal body (a trap / unreachable /
-/// empty leaf) is the switch default; a second distinct default aborts.
+/// Process a continuation branch and collect any equality cases it introduces.
+/// A leading pure state-reload block (`tmp = frame->__resume_index`) is peeled as
+/// a shared prefix and prepended to each recovered case; sibling code after the
+/// nested dispatch is the fall-through suffix appended to each case. A terminal
+/// (non-dispatch) branch introduces no cases — its per-value fate is handled by
+/// `eval_outcome`.
 fn collect_branch(
     nodes: &[StructuredNode],
     frame: &Frame,
     state: &StateField,
     env: &BindingEnv,
-    acc: &mut Dispatch,
+    cases: &mut Vec<(i128, Vec<StructuredNode>)>,
 ) -> Option<()> {
-    // A nested dispatch may be preceded by leading `Block`s — typically a reload
-    // `tmp = frame->__resume_index` that feeds the comparisons. Peel them as a
-    // shared prefix (advancing the binding env so the reloaded temp resolves) and
-    // prepend them to each selected case below, so the reload still runs exactly
-    // once for the chosen state.
     let mut local_env = env.clone();
     let mut prefix: Vec<StructuredNode> = Vec::new();
     let mut tail = nodes;
     while let [block @ StructuredNode::Block { statements, .. }, more @ ..] = tail {
-        // Only peel a block that is purely state-reload plumbing
-        // (`tmp = frame->__resume_index`). Such a block is dead once the dispatch
-        // is a switch, so it's safe to skip on unmatched states; a block with any
-        // other effect must stay put (it becomes the terminal default body), so
-        // stop peeling.
         if !is_state_reload_block(statements, frame, state, &local_env) {
             break;
         }
@@ -789,74 +1102,23 @@ fn collect_branch(
     }, rest @ ..] = tail
     {
         if as_state_compare(condition, frame, state, &local_env).is_some() {
-            // Flatten the nested dispatch into a private accumulator first.
-            let mut sub = Dispatch::default();
+            let mut sub: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
             collect_cases(condition, then_body, else_body, frame, state, &local_env, &mut sub)?;
-            // Sibling code after the nested dispatch is the fall-through suffix for
-            // the states IT covered. It runs for each matched case AND for the
-            // states that fell through unmatched — so append it to the case bodies
-            // and to the default. When there is no explicit default, the unmatched
-            // states implicitly fall through to the suffix, so synthesize one from
-            // it; a noreturn (trap) default never falls through, so it is left as
-            // is. (Done before the prefix so the prefix wraps the synthesized
-            // default too.)
-            if !rest.is_empty() {
-                for (_, body) in &mut sub.cases {
+            // Each selected case runs: prefix (reload) ++ case body ++ suffix
+            // (sibling code that follows the nested dispatch for fall-through).
+            for (_, body) in &mut sub {
+                if !rest.is_empty() {
                     body.extend(rest.iter().cloned());
                 }
-                match &mut sub.default {
-                    None => sub.default = Some(rest.to_vec()),
-                    Some(default_body) if !body_is_noreturn(default_body) => {
-                        default_body.extend(rest.iter().cloned());
-                    }
-                    Some(_) => {}
-                }
-            }
-            // The peeled prefix is a pure state reload (see the peel loop), which
-            // becomes dead once the dispatch is a switch on the named field —
-            // prepend it to each matched case body (harmless, keeps any temp use
-            // defined) and to an existing default. Unmatched states skip it, which
-            // is safe precisely because it has no effect beyond feeding the
-            // dispatch we just replaced.
-            if !prefix.is_empty() {
-                for (_, body) in &mut sub.cases {
+                if !prefix.is_empty() {
                     let mut combined = prefix.clone();
                     combined.append(body);
                     *body = combined;
                 }
-                if let Some(default_body) = &mut sub.default {
-                    let mut combined = prefix.clone();
-                    combined.append(default_body);
-                    *default_body = combined;
-                }
             }
-            acc.cases.extend(sub.cases);
-            // Merge defaults. Two nested branches usually share the same
-            // unreachable trap leaf; keep one. But two *distinct, live* defaults
-            // mean states would reach different code than the original — abort the
-            // flatten rather than silently pick one.
-            match (acc.default.take(), sub.default) {
-                (None, d) | (d, None) => acc.default = d,
-                (Some(a), Some(b)) => {
-                    if bodies_equivalent(&a, &b)
-                        || (body_is_noreturn(&a) && body_is_noreturn(&b))
-                    {
-                        acc.default = Some(a);
-                    } else {
-                        return None;
-                    }
-                }
-            }
-            return Some(());
+            cases.extend(sub);
         }
     }
-    if nodes.is_empty() {
-        return Some(());
-    }
-    if acc.default.is_some() {
-        return None;
-    }
-    acc.default = Some(nodes.to_vec());
     Some(())
 }
 
@@ -882,41 +1144,6 @@ fn is_state_reload_block(
         }
     }
     true
-}
-
-/// True if a branch body cannot fall through to following code — its last
-/// statement is a `return`/`break`/`continue`, or a call to a noreturn builtin
-/// (`__builtin_trap`/`__builtin_unreachable`, `abort`). Used so a post-dispatch
-/// suffix is not appended (as dead code) after such a body.
-fn body_is_noreturn(nodes: &[StructuredNode]) -> bool {
-    match nodes.last() {
-        Some(StructuredNode::Return(_) | StructuredNode::Break | StructuredNode::Continue) => true,
-        Some(StructuredNode::Block { statements, .. }) => {
-            statements.iter().any(is_noreturn_call)
-        }
-        Some(StructuredNode::Expr(e)) => is_noreturn_call(e),
-        _ => false,
-    }
-}
-
-fn is_noreturn_call(e: &Expr) -> bool {
-    use super::expression::CallTarget;
-    match &e.kind {
-        ExprKind::Call { target, .. } => {
-            let name = match target {
-                CallTarget::Named(n) => Some(n.as_str()),
-                _ => None,
-            };
-            matches!(
-                name,
-                Some("__builtin_trap" | "__builtin_unreachable" | "abort" | "std::terminate")
-            )
-        }
-        // Some lifters surface a trap/unreachable as an opaque marker rather than
-        // a call (e.g. x86 `ud2`).
-        ExprKind::Unknown(s) => s.contains("__builtin_trap") || s.contains("__builtin_unreachable"),
-        _ => false,
-    }
 }
 
 /// If `cond` is `state <op> const`, return the op (oriented so `state` is the
@@ -1187,6 +1414,82 @@ mod tests {
         )];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    fn bits0(e: Expr) -> Expr {
+        Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(e),
+                start: 0,
+                width: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn parity_split_excludes_other_residue_from_cases() {
+        // tmp = state & 1;
+        // if (tmp == 0) { if (state <= 2) { if (state==0) A else if (state==2) B
+        //                                   else trap } }
+        // Only even states reach the even branch, so the `<= 2` gap value 1 (odd)
+        // must NOT be emitted as a trap case — parity restricts the domain.
+        let parity = || Expr::var(Variable::reg("rcx", 4));
+        let body = vec![
+            block(vec![Expr::assign(parity(), bits0(state_access()))]),
+            iff(
+                cmp(BinOpKind::Eq, parity(), 0),
+                vec![iff(
+                    cmp(BinOpKind::Le, state_access(), 2),
+                    vec![iff(
+                        cmp(BinOpKind::Eq, state_access(), 0),
+                        vec![block(vec![Expr::unknown("body_a")])],
+                        vec![iff(
+                            cmp(BinOpKind::Eq, state_access(), 2),
+                            vec![block(vec![Expr::unknown("body_b")])],
+                            vec![block(vec![Expr::call(
+                                crate::decompiler::expression::CallTarget::Named(
+                                    "__builtin_trap".to_string(),
+                                ),
+                                vec![],
+                            )])],
+                        )],
+                    )],
+                    vec![],
+                )],
+                vec![],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        // Even branch: only {0, 2}; the odd value 1 is not a case.
+        assert_eq!(switch_labels(&out), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn range_limited_trap_becomes_explicit_case_not_global_default() {
+        // if (state <= 1) { if (state == 0) A else trap } else { if (state == 2) B }
+        // state 1 traps; states > 2 fall through. The trap must be an explicit
+        // `case 1:` rather than a default that captures the fall-through states.
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![block(vec![Expr::call(
+                    crate::decompiler::expression::CallTarget::Named("__builtin_trap".to_string()),
+                    vec![],
+                )])],
+            )],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 2),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        // 0, 1 (trap), 2 are cases; no default (state > 2 falls through).
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
+        assert!(find_default_dump(&out).is_none());
+        assert!(format!("{out:?}").contains("__builtin_trap"));
     }
 
     #[test]
