@@ -658,6 +658,15 @@ fn ends_noreturn(nodes: &[StructuredNode]) -> bool {
         ) => true,
         Some(StructuredNode::Block { statements, .. }) => statements.iter().any(is_noreturn_call),
         Some(StructuredNode::Expr(e)) => is_noreturn_call(e),
+        // An `if` whose every branch halts (including the implicit empty else,
+        // which falls through) is itself terminating only when both arms exist and
+        // both halt.
+        Some(StructuredNode::If {
+            then_body,
+            else_body: Some(else_body),
+            ..
+        }) => ends_noreturn(then_body) && ends_noreturn(else_body),
+        Some(StructuredNode::Sequence(nodes)) => ends_noreturn(nodes),
         _ => false,
     }
 }
@@ -1001,9 +1010,9 @@ fn rewrite_structural(
             header,
             exit_block,
         } => StructuredNode::For {
-            init,
-            condition,
-            update,
+            init: init.map(|e| rename_state_in_expr(e, frame, state)),
+            condition: rename_state_in_expr(condition, frame, state),
+            update: update.map(|e| rename_state_in_expr(e, frame, state)),
             body: recur(body),
             header,
             exit_block,
@@ -1828,6 +1837,80 @@ mod tests {
         assert!(!format!("{case0:?}").contains("suffix"));
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"));
+    }
+
+    #[test]
+    fn exhaustive_terminating_if_does_not_append_suffix() {
+        // if (state <= 1) {
+        //     if (state == 0) { if (extern) return; else return; }   // exhaustive
+        //     suffix;                                                 // unreachable for 0
+        // } else if (state == 2) { body_c }
+        // For state 0 the inner if halts on every branch, so the sibling `suffix`
+        // must not be appended to case 0.
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![
+                iff(
+                    cmp(BinOpKind::Eq, state_access(), 0),
+                    vec![iff(
+                        Expr::unknown("extern_cond"),
+                        vec![StructuredNode::Return(None)],
+                        vec![StructuredNode::Return(None)],
+                    )],
+                    vec![],
+                ),
+                block(vec![Expr::unknown("suffix")]),
+            ],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 2),
+                vec![block(vec![Expr::unknown("body_c")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        assert!(
+            !format!("{case0:?}").contains("suffix"),
+            "case0 should not include the unreachable suffix: {case0:?}"
+        );
+        // The fall-through state 1 legitimately reaches the suffix.
+        let case1 = case_body(&out, 1).expect("case 1");
+        assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn for_loop_header_state_reference_is_renamed() {
+        // A dispatch that flattens plus a `for` whose condition references the
+        // state field: once the switch is recovered the for-header must be renamed
+        // to frame->__resume_index too (no leftover raw arg0[18] ArrayAccess).
+        let body = vec![
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+            StructuredNode::For {
+                init: None,
+                condition: cmp(BinOpKind::Lt, state_access(), 10),
+                update: None,
+                body: vec![block(vec![Expr::unknown("loop_body")])],
+                header: None,
+                exit_block: None,
+            },
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let dump = format!("{out:?}");
+        assert!(dump.contains("__resume_index"), "{dump}");
+        assert!(
+            !dump.contains("ArrayAccess"),
+            "for-header left a raw state access: {dump}"
+        );
     }
 
     #[test]
