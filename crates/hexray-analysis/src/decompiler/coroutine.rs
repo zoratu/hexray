@@ -868,6 +868,80 @@ fn collect_state_constants(
     out
 }
 
+/// The state-value period induced by any bit-slice (parity) condition anywhere
+/// in the tree: outcomes can repeat every `period` steps, so the tail-uniformity
+/// check must sample a full period. 1 when no slice condition appears.
+fn tree_slice_period(
+    nodes: &[StructuredNode],
+    frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> i128 {
+    let mut env = env.clone();
+    let mut period: i128 = 1;
+    for node in nodes {
+        match node {
+            StructuredNode::Block { statements, .. } => env.note_block(statements, frame, state),
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                period = period.max(cond_slice_period(condition, frame, state, &env));
+                period = period.max(tree_slice_period(then_body, frame, state, &env));
+                if let Some(b) = else_body {
+                    period = period.max(tree_slice_period(b, frame, state, &env));
+                }
+            }
+            StructuredNode::While { condition, body, .. }
+            | StructuredNode::DoWhile { condition, body, .. } => {
+                period = period.max(cond_slice_period(condition, frame, state, &env));
+                period = period.max(tree_slice_period(body, frame, state, &env));
+            }
+            StructuredNode::For { body, .. } | StructuredNode::Loop { body, .. } => {
+                period = period.max(tree_slice_period(body, frame, state, &env));
+            }
+            StructuredNode::Switch { cases, default, .. } => {
+                for (_, b) in cases {
+                    period = period.max(tree_slice_period(b, frame, state, &env));
+                }
+                if let Some(b) = default {
+                    period = period.max(tree_slice_period(b, frame, state, &env));
+                }
+            }
+            StructuredNode::Sequence(nodes) => {
+                period = period.max(tree_slice_period(nodes, frame, state, &env))
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                period = period.max(tree_slice_period(try_body, frame, state, &env));
+                for handler in catch_handlers {
+                    period = period.max(tree_slice_period(&handler.body, frame, state, &env));
+                }
+            }
+            _ => {}
+        }
+        period = period.min(4096);
+    }
+    period.min(4096)
+}
+
+/// The period contributed by a single condition: 2^(start+width) for a bit-slice
+/// constraint (parity etc.), else 1.
+fn cond_slice_period(cond: &Expr, frame: &Frame, state: &StateField, env: &BindingEnv) -> i128 {
+    let mut p: i128 = 1;
+    if let Some((a, b)) = cond_constraints(cond, frame, state, env) {
+        for c in [a, b].into_iter().flatten() {
+            if let DomainConstraint::Slice { start, width, .. } = c {
+                p = p.max(1i128 << (start as u32 + width as u32));
+            }
+        }
+    }
+    p
+}
+
 /// The largest state constant compared anywhere in a dispatch tree (case labels
 /// and bound constants), so per-value enumeration covers every distinct range.
 fn max_state_constant(
@@ -1182,9 +1256,9 @@ fn try_flatten_switch(
         then_body: then_body.to_vec(),
         else_body: else_body.clone(),
     }];
-    // Resume indices are small. Cap the dense enumeration at the largest equality
-    // case label (not the largest *bound* constant, which may be huge, e.g. an
-    // unsigned `state <= 0xffffffff` guard — enumerating to it would hang). A
+    // Resume indices are small. Cap the dense enumeration at the largest *bound*
+    // constant only up to ENUM_CAP — a bound may be huge (e.g. an unsigned
+    // `state <= 0xffffffff` guard) and enumerating to it would hang. An equality
     // label larger than the cap isn't a resume index — decline.
     const ENUM_CAP: i128 = 4096;
     let max_label = *labels.iter().max().unwrap();
@@ -1192,23 +1266,42 @@ fn try_flatten_switch(
         return None;
     }
     let max_const = max_state_constant(&tree, frame, state, env);
+    // The reachable state values are periodic when a bit-slice (parity) condition
+    // appears anywhere in the tree — the outcome can repeat every `period` steps.
+    let period = domain.period().max(tree_slice_period(&tree, frame, state, env));
 
-    // A value beyond every compared constant (of an allowed parity/slice) stands
-    // in for all larger states; its outcome is the switch default. Search a full
-    // slice period so periodic domains (e.g. `state & 1 == 0`, or a wider
-    // `BITS(state,s,w) == k`) still find their next reachable value. If none is
-    // found the domain is bounded above and there is no default.
-    let beyond = (max_const + 1..=max_const + domain.period()).find(|v| domain.allows(*v));
-    let beyond_outcome = beyond
-        .map(|v| eval_outcome(&tree, v, frame, state, env))
-        .unwrap_or_default();
+    // The "tail" is every reachable state above the densely-enumerated range. It
+    // becomes the single switch default, so it must be UNIFORM: a tail split by a
+    // range bound (e.g. `state <= N`) or a bit-slice/parity condition can't be one
+    // default and can't be enumerated as explicit cases (it's unbounded), so we
+    // decline. Sample one full slice period past the largest constant (catches
+    // parity splits) plus every range-bound boundary above the dense range.
+    let dense_limit = max_const.min(ENUM_CAP);
+    let mut tail_reps: Vec<i128> = ((max_const + 1)..=(max_const + period)).collect();
+    for c in collect_state_constants(&tree, frame, state, env) {
+        tail_reps.push(c);
+        tail_reps.push(c + 1);
+    }
+    tail_reps.retain(|v| *v > dense_limit && domain.allows(*v));
+    tail_reps.sort_unstable();
+    tail_reps.dedup();
+    let beyond_outcome = match tail_reps.first() {
+        Some(v) => eval_outcome(&tree, *v, frame, state, env),
+        None => Vec::new(),
+    };
+    for v in &tail_reps {
+        if !bodies_equivalent(&eval_outcome(&tree, *v, frame, state, env), &beyond_outcome) {
+            return None; // non-uniform tail — not representable as a single default
+        }
+    }
 
     // Build every case body by evaluating the tree per value (path-constraint
-    // aware). A candidate equality label always gets an explicit case; any other
-    // small value whose outcome differs from the default becomes an explicit case
-    // too (e.g. a single invalid index traps while the rest fall through).
+    // aware) over the dense range. A candidate equality label always gets an
+    // explicit case; any other in-range value whose outcome differs from the
+    // default becomes an explicit case too (e.g. a single invalid index traps
+    // while the rest fall through).
     let mut cases: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
-    for v in 0..=max_label {
+    for v in 0..=dense_limit {
         if !domain.allows(v) {
             continue;
         }
@@ -1223,22 +1316,6 @@ fn try_flatten_switch(
     // degenerate switch.
     if cases.iter().filter(|(v, _)| labels.contains(v)).count() < 2 {
         return None;
-    }
-
-    // Values above the largest case label that are still bounded by a (possibly
-    // huge) range guard form ranges we can't enumerate as explicit cases. Sample
-    // each range boundary (compared constants and their successors): every such
-    // value must share the default outcome, otherwise a non-uniform large range
-    // would need explicit cases we can't emit — decline.
-    for c in collect_state_constants(&tree, frame, state, env) {
-        for d in [c, c + 1] {
-            if d > max_label && domain.allows(d) && !labels.contains(&d) {
-                let outcome = eval_outcome(&tree, d, frame, state, env);
-                if !bodies_equivalent(&outcome, &beyond_outcome) {
-                    return None;
-                }
-            }
-        }
     }
 
     // 3. Safety: a free `break` in any emitted body would be recaptured by the
@@ -1413,7 +1490,7 @@ fn is_state_reload_block(
     for stmt in statements {
         match &stmt.kind {
             ExprKind::Assign { lhs, rhs }
-                if matches!(lhs.kind, ExprKind::Var(_)) && local.is_state(rhs, frame, state) =>
+                if is_scratch_dest(lhs) && local.is_state(rhs, frame, state) =>
             {
                 local.note_block(std::slice::from_ref(stmt), frame, state);
             }
@@ -1421,6 +1498,18 @@ fn is_state_reload_block(
         }
     }
     true
+}
+
+/// Whether an lvalue is a scratch destination — a register or a compiler temp.
+/// A reload into one of these is pure dispatch plumbing, droppable once the
+/// dispatch becomes a switch. A stack/global/arg destination might be read
+/// elsewhere (including after the switch), so a `local = frame->state` spill to
+/// one of those must NOT be treated as droppable plumbing.
+fn is_scratch_dest(lhs: &Expr) -> bool {
+    matches!(
+        &lhs.kind,
+        ExprKind::Var(v) if matches!(v.kind, VarKind::Register(_) | VarKind::Temp(_))
+    )
 }
 
 /// If `cond` is `state <op> const`, return the op (oriented so `state` is the
@@ -1966,6 +2055,64 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn stack_local_state_spill_is_not_dropped() {
+        // if (state == 0) { local_8 = state;   // spill to a named stack local
+        //                   body_a }           // (separate real block)
+        // else if (state == 1) { body_b }
+        // The spill targets a stack local (potentially read after the switch), so
+        // it is NOT droppable plumbing — case 0 must keep the assignment.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![
+                block(vec![Expr::assign(local(), state_access())]),
+                block(vec![Expr::unknown("body_a")]),
+            ],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("__resume_index"),
+            "stack-local spill dropped from case0: {c0}"
+        );
+        assert!(c0.contains("body_a"), "{c0}");
+    }
+
+    #[test]
+    fn parity_split_tail_is_not_collapsed_to_a_single_default() {
+        // if (state == 0) A
+        // else if (state == 1) B
+        // else if (BITS(state,0,1) == 0) trap   // even tail traps, odd falls through
+        // The tail above the cases is split by parity, so it can't be one switch
+        // default — the pass declines rather than trap odd states too.
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![block(vec![Expr::unknown("body_a")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, bits0(state_access()), 0),
+                    vec![block(vec![Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("__builtin_trap".to_string()),
+                        vec![],
+                    )])],
+                    vec![],
+                )],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
     }
 
     #[test]
