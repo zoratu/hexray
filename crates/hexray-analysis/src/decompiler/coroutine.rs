@@ -1195,9 +1195,11 @@ fn collect_branch(
             let mut sub: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
             collect_cases(condition, then_body, else_body, frame, state, &local_env, &mut sub)?;
             // Each selected case runs: prefix (reload) ++ case body ++ suffix
-            // (sibling code that follows the nested dispatch for fall-through).
+            // (sibling code that follows the nested dispatch). The suffix is only
+            // appended to a case that actually falls through — a case ending in a
+            // return/goto/trap never reaches it.
             for (_, body) in &mut sub {
-                if !rest.is_empty() {
+                if !rest.is_empty() && !ends_noreturn(body) {
                     body.extend(rest.iter().cloned());
                 }
                 if !prefix.is_empty() {
@@ -1620,6 +1622,61 @@ mod tests {
         assert_eq!(switch_labels(&out), Some(vec![7, 15]));
         let default_dump = find_default_dump(&out).expect("trap default for state 23+");
         assert!(default_dump.contains("__builtin_trap"));
+    }
+
+    #[test]
+    fn returning_case_does_not_get_unreachable_suffix() {
+        // if (state <= 1) { if (state == 0) return; else if (state == 1) body ;
+        //                   suffix }
+        // case 0 returns before the suffix, so the suffix must not be appended to
+        // it; case 1 falls through and does get it.
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 1),
+            vec![
+                iff(
+                    cmp(BinOpKind::Eq, state_access(), 0),
+                    vec![StructuredNode::Return(None)],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, state_access(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![],
+                    )],
+                ),
+                block(vec![Expr::unknown("suffix")]),
+            ],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        // Locate case 0's body and verify it has no suffix after the return.
+        let case0 = case_body(&out, 0).expect("case 0");
+        assert!(!format!("{case0:?}").contains("suffix"));
+        let case1 = case_body(&out, 1).expect("case 1");
+        assert!(format!("{case1:?}").contains("suffix"));
+    }
+
+    fn case_body(body: &[StructuredNode], label: i128) -> Option<Vec<StructuredNode>> {
+        for n in body {
+            match n {
+                StructuredNode::Switch { cases, .. } => {
+                    for (vals, b) in cases {
+                        if vals.contains(&label) {
+                            return Some(b.clone());
+                        }
+                    }
+                }
+                StructuredNode::If { then_body, else_body, .. } => {
+                    if let Some(b) = case_body(then_body, label) {
+                        return Some(b);
+                    }
+                    if let Some(b) = else_body.as_ref().and_then(|e| case_body(e, label)) {
+                        return Some(b);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 
     #[test]
