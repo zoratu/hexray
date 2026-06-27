@@ -1052,15 +1052,18 @@ fn try_flatten_switch(
 ) -> Option<Vec<StructuredNode>> {
     as_state_compare(condition, frame, state, env)?;
 
-    // 1. Collect the equality cases and their bodies.
-    let mut cases: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
-    collect_cases(condition, then_body, else_body, frame, state, env, &mut cases)?;
+    // 1. Discover the candidate equality case labels (the constants compared with
+    //    `==` anywhere in the tree). Their *bodies* are NOT taken from this raw
+    //    recursion — an equality test nested under an incompatible range guard
+    //    (e.g. `if (state==0)` inside the `state > 0` else-branch) would otherwise
+    //    contribute a body for a state that can never reach it. Bodies are instead
+    //    computed per value by `eval_outcome`, which honours the path constraints.
+    let mut label_cases: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
+    collect_cases(condition, then_body, else_body, frame, state, env, &mut label_cases)?;
 
     let mut labels = HashSet::new();
-    for (label, _) in &cases {
-        if !labels.insert(*label) {
-            return None; // duplicate case label — not a clean dispatch
-        }
+    for (label, _) in &label_cases {
+        labels.insert(*label);
     }
     if labels.len() < 2 {
         return None;
@@ -1094,18 +1097,26 @@ fn try_flatten_switch(
         .map(|v| eval_outcome(&tree, v, frame, state, env))
         .unwrap_or_default();
 
-    // Unmatched small values (0..=max_label) whose outcome differs from the
-    // default become explicit cases (e.g. a single invalid index traps while the
-    // rest fall through).
-    let mut extra: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
+    // Build every case body by evaluating the tree per value (path-constraint
+    // aware). A candidate equality label always gets an explicit case; any other
+    // small value whose outcome differs from the default becomes an explicit case
+    // too (e.g. a single invalid index traps while the rest fall through).
+    let mut cases: Vec<(i128, Vec<StructuredNode>)> = Vec::new();
     for v in 0..=max_label {
-        if !domain.allows(v) || labels.contains(&v) {
+        if !domain.allows(v) {
             continue;
         }
         let outcome = eval_outcome(&tree, v, frame, state, env);
-        if !bodies_equivalent(&outcome, &beyond_outcome) {
-            extra.push((v, outcome));
+        if labels.contains(&v) || !bodies_equivalent(&outcome, &beyond_outcome) {
+            cases.push((v, outcome));
         }
+    }
+    // A candidate label that survived to here only via an unreachable branch (its
+    // path-aware outcome matched nothing distinct and the domain excluded it) can
+    // drop the effective case count below two — decline rather than emit a
+    // degenerate switch.
+    if cases.iter().filter(|(v, _)| labels.contains(v)).count() < 2 {
+        return None;
     }
 
     // Values above the largest case label that are still bounded by a (possibly
@@ -1126,15 +1137,12 @@ fn try_flatten_switch(
 
     // 3. Safety: a free `break` in any emitted body would be recaptured by the
     //    synthesized switch.
-    if cases.iter().chain(extra.iter()).any(|(_, b)| contains_free_break(b))
-        || contains_free_break(&beyond_outcome)
-    {
+    if cases.iter().any(|(_, b)| contains_free_break(b)) || contains_free_break(&beyond_outcome) {
         return None;
     }
 
-    // 4. Build the switch: real cases + explicit minority-outcome cases, with the
+    // 4. Build the switch: every case (real + explicit minority-outcome) with the
     //    beyond outcome as the default (empty outcome => no default, fall through).
-    cases.extend(extra);
     cases.sort_by_key(|(label, _)| *label);
     let switch_cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = cases
         .into_iter()
@@ -1753,6 +1761,38 @@ mod tests {
         assert!(!format!("{case0:?}").contains("suffix"));
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"));
+    }
+
+    #[test]
+    fn equality_under_incompatible_range_guard_uses_reachable_body() {
+        // if (state <= 0) { if (state == 0) A }
+        // else            { if (state == 0) B; else if (state == 1) C }
+        // The else-branch's `state == 0` is unreachable (state > 0 there), so
+        // case 0 must be A (the reachable body), never B.
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 0),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![],
+            )],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_c")])],
+                    vec![],
+                )],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        assert!(format!("{case0:?}").contains("body_a"), "case0={case0:?}");
+        assert!(!format!("{case0:?}").contains("body_b"), "case0={case0:?}");
+        let case1 = case_body(&out, 1).expect("case 1");
+        assert!(format!("{case1:?}").contains("body_c"), "case1={case1:?}");
     }
 
     fn case_body(body: &[StructuredNode], label: i128) -> Option<Vec<StructuredNode>> {
