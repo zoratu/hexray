@@ -483,13 +483,21 @@ impl Domain {
 }
 
 fn apply_cmp(op: BinOpKind, a: i128, b: i128) -> bool {
+    // Unsigned guards must compare as unsigned: a `cmp ..., -1; jbe` lowers to
+    // `ULe` against a sign-extended `IntLit(-1)`, and signed `a <= -1` would send
+    // every non-negative resume index down the wrong branch. Reinterpret both
+    // operands' bits as unsigned for the U* comparisons.
     match op {
         BinOpKind::Eq => a == b,
         BinOpKind::Ne => a != b,
-        BinOpKind::Lt | BinOpKind::ULt => a < b,
-        BinOpKind::Le | BinOpKind::ULe => a <= b,
-        BinOpKind::Gt | BinOpKind::UGt => a > b,
-        BinOpKind::Ge | BinOpKind::UGe => a >= b,
+        BinOpKind::Lt => a < b,
+        BinOpKind::Le => a <= b,
+        BinOpKind::Gt => a > b,
+        BinOpKind::Ge => a >= b,
+        BinOpKind::ULt => (a as u128) < (b as u128),
+        BinOpKind::ULe => (a as u128) <= (b as u128),
+        BinOpKind::UGt => (a as u128) > (b as u128),
+        BinOpKind::UGe => (a as u128) >= (b as u128),
         _ => false,
     }
 }
@@ -1806,6 +1814,33 @@ mod tests {
         assert!(!format!("{case0:?}").contains("suffix"));
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"));
+    }
+
+    #[test]
+    fn unsigned_guard_against_sign_extended_immediate() {
+        // `cmp state, -1; jbe` lowers to `ULe` against a sign-extended -1, which
+        // is always true for unsigned (every non-negative index <= 0xffff...). The
+        // inner equality dispatch must still resolve correctly: case 0 -> A,
+        // case 1 -> B (not swallowed by a signed `state <= -1` misread).
+        let body = vec![iff(
+            cmp(BinOpKind::ULe, state_access(), -1),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            )],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        assert!(format!("{case0:?}").contains("body_a"), "case0={case0:?}");
+        let case1 = case_body(&out, 1).expect("case 1");
+        assert!(format!("{case1:?}").contains("body_b"), "case1={case1:?}");
     }
 
     #[test]
