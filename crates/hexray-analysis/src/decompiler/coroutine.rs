@@ -1409,7 +1409,52 @@ fn rename_state_in_expr(expr: Expr, frame: &Frame, state: &StateField) -> Expr {
                 .map(|a| rename_state_in_expr(a, frame, state))
                 .collect(),
         },
-        other => Expr { kind: other }.kind,
+        ExprKind::Deref { addr, size } => ExprKind::Deref {
+            addr: Box::new(rename_state_in_expr(*addr, frame, state)),
+            size,
+        },
+        ExprKind::AddressOf(inner) => {
+            ExprKind::AddressOf(Box::new(rename_state_in_expr(*inner, frame, state)))
+        }
+        ExprKind::ArrayAccess {
+            base,
+            index,
+            element_size,
+        } => ExprKind::ArrayAccess {
+            base: Box::new(rename_state_in_expr(*base, frame, state)),
+            index: Box::new(rename_state_in_expr(*index, frame, state)),
+            element_size,
+        },
+        ExprKind::FieldAccess {
+            base,
+            field_name,
+            offset,
+        } => ExprKind::FieldAccess {
+            base: Box::new(rename_state_in_expr(*base, frame, state)),
+            field_name,
+            offset,
+        },
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => ExprKind::Conditional {
+            cond: Box::new(rename_state_in_expr(*cond, frame, state)),
+            then_expr: Box::new(rename_state_in_expr(*then_expr, frame, state)),
+            else_expr: Box::new(rename_state_in_expr(*else_expr, frame, state)),
+        },
+        ExprKind::BitField { expr, start, width } => ExprKind::BitField {
+            expr: Box::new(rename_state_in_expr(*expr, frame, state)),
+            start,
+            width,
+        },
+        ExprKind::Phi(exprs) => ExprKind::Phi(
+            exprs
+                .into_iter()
+                .map(|e| rename_state_in_expr(e, frame, state))
+                .collect(),
+        ),
+        other => other,
     };
     Expr { kind }
 }
@@ -1761,6 +1806,36 @@ mod tests {
         assert!(!format!("{case0:?}").contains("suffix"));
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"));
+    }
+
+    #[test]
+    fn nested_state_wrapper_in_case_body_is_renamed() {
+        // A case body that references the state field wrapped in an expression the
+        // renamer must recurse through (here `&state`) must not leave a raw
+        // `arg0[18]` once the switch renames the dispatch to __resume_index.
+        let addr_of_state = Expr {
+            kind: ExprKind::AddressOf(Box::new(state_access())),
+        };
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                addr_of_state,
+            )])],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let dump = format!("{out:?}");
+        assert!(dump.contains("__resume_index"), "{dump}");
+        // The raw state access is `arg0[18]` (an ArrayAccess); after renaming the
+        // AddressOf body it must become a FieldAccess, leaving no ArrayAccess. The
+        // `arg0` base of `frame->__resume_index` itself is expected.
+        assert!(!dump.contains("ArrayAccess"), "leftover raw state access: {dump}");
     }
 
     #[test]
