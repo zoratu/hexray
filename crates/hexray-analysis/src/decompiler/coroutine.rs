@@ -843,10 +843,24 @@ fn rewrite_nodes(
                 then_body,
                 else_body,
             } => {
+                // A temp the branches reassign no longer holds the state after the
+                // `if`, so invalidate those bindings for the following siblings.
+                let mut reassigned = assigned_vars(&then_body);
+                if let Some(b) = &else_body {
+                    reassigned.extend(assigned_vars(b));
+                }
+                let kill = |env: &mut BindingEnv| {
+                    for n in &reassigned {
+                        env.state_temps.remove(n);
+                        env.slice_temps.remove(n);
+                    }
+                };
+
                 if let Some(switch_nodes) =
                     try_flatten_switch(&condition, &then_body, &else_body, frame, state, env, domain)
                 {
                     out.extend(switch_nodes);
+                    kill(env);
                     continue;
                 }
                 // Narrow the domain for each branch by the (state) condition, so a
@@ -869,8 +883,18 @@ fn rewrite_nodes(
                     then_body,
                     else_body,
                 });
+                kill(env);
             }
-            other => out.push(rewrite_structural(other, frame, state, env, domain)),
+            other => {
+                // Loops/switch/try-catch bodies may reassign a state temp; kill
+                // those bindings for the following siblings.
+                let reassigned = assigned_vars(std::slice::from_ref(&other));
+                out.push(rewrite_structural(other, frame, state, env, domain));
+                for n in &reassigned {
+                    env.state_temps.remove(n);
+                    env.slice_temps.remove(n);
+                }
+            }
         }
     }
     out
@@ -1314,6 +1338,19 @@ fn visit_assignments(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr, &Expr))
     });
 }
 
+/// Every variable/temp name assigned anywhere within `nodes` (the lhs of an
+/// assignment). Used to invalidate state/slice bindings that a conditional
+/// branch may have overwritten before continuing with the following siblings.
+fn assigned_vars(nodes: &[StructuredNode]) -> HashSet<String> {
+    let mut names = HashSet::new();
+    visit_assignments(nodes, &mut |lhs, _| {
+        if let ExprKind::Var(v) = &lhs.kind {
+            names.insert(v.name.clone());
+        }
+    });
+    names
+}
+
 /// Walk every expression (and sub-expression) appearing in the body.
 fn visit_exprs(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr)) {
     fn walk_expr(e: &Expr, f: &mut impl FnMut(&Expr)) {
@@ -1606,6 +1643,34 @@ mod tests {
         assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
         assert!(find_default_dump(&out).is_none());
         assert!(format!("{out:?}").contains("__builtin_trap"));
+    }
+
+    #[test]
+    fn stale_temp_reassigned_in_branch_is_not_a_dispatch() {
+        // tmp = state;
+        // if (flag == 0) { tmp = 99; }     // tmp no longer holds the state
+        // if (tmp == 0) A else if (tmp == 1) B   // must NOT become a switch
+        let tmp = || Expr::var(Variable::reg("rax", 4));
+        let flag = || Expr::var(Variable::reg("rbx", 4));
+        let body = vec![
+            block(vec![Expr::assign(tmp(), state_access())]),
+            iff(
+                cmp(BinOpKind::Eq, flag(), 0),
+                vec![block(vec![Expr::assign(tmp(), Expr::int(99))])],
+                vec![],
+            ),
+            iff(
+                cmp(BinOpKind::Eq, tmp(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, tmp(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
     }
 
     #[test]
