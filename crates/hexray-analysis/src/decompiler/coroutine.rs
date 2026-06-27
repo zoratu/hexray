@@ -276,22 +276,41 @@ fn bodies_equivalent(a: &[StructuredNode], b: &[StructuredNode]) -> bool {
 /// order and scoped per branch, so a temporary later reused for a different
 /// frame field doesn't retroactively re-attribute earlier comparisons.
 fn find_state_field(body: &[StructuredNode], frame: &Frame) -> Option<StateField> {
-    let mut counts: HashMap<i64, HashSet<i128>> = HashMap::new();
-    scan_state_compares(body, frame, &mut HashMap::new(), &mut counts);
-    counts
+    // Per offset: the set of equality constants it is compared against, and the
+    // shallowest nesting depth at which it is compared.
+    let mut stats: HashMap<i64, OffsetStat> = HashMap::new();
+    scan_state_compares(body, frame, &mut HashMap::new(), &mut stats, 0);
+    // The resume dispatch is the actor/resume clone's OUTERMOST branching, so its
+    // index field is compared at the shallowest depth; an unrelated frame field
+    // (e.g. a user enum switched on in resumed code) is nested inside a resume
+    // case body and therefore deeper. Prefer the shallowest field, breaking ties
+    // by the larger number of distinct case constants.
+    stats
         .into_iter()
-        .filter(|(_, vals)| vals.len() >= 2)
-        .max_by_key(|(_, vals)| vals.len())
+        .filter(|(_, s)| s.values.len() >= 2)
+        .min_by(|(_, a), (_, b)| {
+            a.min_depth
+                .cmp(&b.min_depth)
+                .then_with(|| b.values.len().cmp(&a.values.len()))
+        })
         .map(|(offset, _)| StateField { offset })
 }
 
-/// Ordered walk maintaining `temp -> frame offset` bindings; counts each
-/// comparison's `(offset, const)` against the binding live at that point.
+#[derive(Default)]
+struct OffsetStat {
+    values: HashSet<i128>,
+    min_depth: usize,
+}
+
+/// Ordered walk maintaining `temp -> frame offset` bindings; records each
+/// comparison's `(offset, const)` and the nesting depth against the binding live
+/// at that point.
 fn scan_state_compares(
     nodes: &[StructuredNode],
     frame: &Frame,
     temp_offset: &mut HashMap<String, i64>,
-    counts: &mut HashMap<i64, HashSet<i128>>,
+    stats: &mut HashMap<i64, OffsetStat>,
+    depth: usize,
 ) {
     for node in nodes {
         match node {
@@ -316,36 +335,44 @@ fn scan_state_compares(
                 then_body,
                 else_body,
             } => {
-                note_state_compare(condition, frame, temp_offset, counts);
-                scan_state_compares(then_body, frame, &mut temp_offset.clone(), counts);
+                note_state_compare(condition, frame, temp_offset, stats, depth);
+                scan_state_compares(then_body, frame, &mut temp_offset.clone(), stats, depth + 1);
                 if let Some(b) = else_body {
-                    scan_state_compares(b, frame, &mut temp_offset.clone(), counts);
+                    scan_state_compares(b, frame, &mut temp_offset.clone(), stats, depth + 1);
                 }
             }
             StructuredNode::While { condition, body, .. }
             | StructuredNode::DoWhile { condition, body, .. } => {
-                note_state_compare(condition, frame, temp_offset, counts);
-                scan_state_compares(body, frame, &mut temp_offset.clone(), counts);
+                note_state_compare(condition, frame, temp_offset, stats, depth);
+                scan_state_compares(body, frame, &mut temp_offset.clone(), stats, depth + 1);
             }
             StructuredNode::For { body, .. } | StructuredNode::Loop { body, .. } => {
-                scan_state_compares(body, frame, &mut temp_offset.clone(), counts);
+                scan_state_compares(body, frame, &mut temp_offset.clone(), stats, depth + 1);
             }
             StructuredNode::Switch { cases, default, .. } => {
                 for (_, b) in cases {
-                    scan_state_compares(b, frame, &mut temp_offset.clone(), counts);
+                    scan_state_compares(b, frame, &mut temp_offset.clone(), stats, depth + 1);
                 }
                 if let Some(b) = default {
-                    scan_state_compares(b, frame, &mut temp_offset.clone(), counts);
+                    scan_state_compares(b, frame, &mut temp_offset.clone(), stats, depth + 1);
                 }
             }
-            StructuredNode::Sequence(nodes) => scan_state_compares(nodes, frame, temp_offset, counts),
+            StructuredNode::Sequence(nodes) => {
+                scan_state_compares(nodes, frame, temp_offset, stats, depth)
+            }
             StructuredNode::TryCatch {
                 try_body,
                 catch_handlers,
             } => {
-                scan_state_compares(try_body, frame, &mut temp_offset.clone(), counts);
+                scan_state_compares(try_body, frame, &mut temp_offset.clone(), stats, depth + 1);
                 for handler in catch_handlers {
-                    scan_state_compares(&handler.body, frame, &mut temp_offset.clone(), counts);
+                    scan_state_compares(
+                        &handler.body,
+                        frame,
+                        &mut temp_offset.clone(),
+                        stats,
+                        depth + 1,
+                    );
                 }
             }
             _ => {}
@@ -357,14 +384,20 @@ fn note_state_compare(
     cond: &Expr,
     frame: &Frame,
     temp_offset: &HashMap<String, i64>,
-    counts: &mut HashMap<i64, HashSet<i128>>,
+    stats: &mut HashMap<i64, OffsetStat>,
+    depth: usize,
 ) {
     if let Some((off, value, op)) = compare_to_frame_offset(cond, frame, temp_offset) {
         // Only equality comparisons name an actual case; `<`/`<=` etc. are
         // binary-search navigation, so a frame field range-checked but never
         // switched on must not be mistaken for the resume index.
         if matches!(op, BinOpKind::Eq | BinOpKind::Ne) && (0..256).contains(&value) {
-            counts.entry(off).or_default().insert(value);
+            let entry = stats.entry(off).or_insert_with(|| OffsetStat {
+                values: HashSet::new(),
+                min_depth: depth,
+            });
+            entry.values.insert(value);
+            entry.min_depth = entry.min_depth.min(depth);
         }
     }
 }
@@ -1933,6 +1966,39 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn unrelated_deeper_frame_field_is_not_picked_as_state() {
+        // `arg0[10]` (offset 20) is a user enum compared against MORE constants
+        // than the resume index, but only inside a resume case body (deeper). The
+        // shallow resume index `arg0[18]` (compared at top level) must win.
+        let enum_field = || Expr::array_access(frame(), Expr::int(10), 2);
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            // case 0 body contains the user enum if-chain (3 constants, depth >= 1)
+            vec![iff(
+                cmp(BinOpKind::Eq, enum_field(), 5),
+                vec![block(vec![Expr::unknown("enum_x")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, enum_field(), 6),
+                    vec![block(vec![Expr::unknown("enum_y")])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, enum_field(), 7),
+                        vec![block(vec![Expr::unknown("enum_z")])],
+                        vec![],
+                    )],
+                )],
+            )],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        // The recovered switch is on the resume index (labels 0/1), not the enum.
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
     }
 
     #[test]
