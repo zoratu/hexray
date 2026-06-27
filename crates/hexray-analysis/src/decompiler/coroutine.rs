@@ -463,6 +463,23 @@ impl Domain {
         constraints.push(c);
         Domain { constraints }
     }
+
+    /// The repeat period of the bit-slice constraints (e.g. an even/odd parity
+    /// slice repeats every 2). A value satisfying the domain past some point
+    /// recurs within one period, so a "beyond" representative can always be found
+    /// within `period` steps. Capped to bound the search.
+    fn period(&self) -> i128 {
+        let mut period: i128 = 1;
+        for c in &self.constraints {
+            if let DomainConstraint::Slice { start, width, .. } = c {
+                period = period.saturating_mul(1i128 << (*start as u32 + *width as u32));
+                if period >= 4096 {
+                    return 4096;
+                }
+            }
+        }
+        period.max(1)
+    }
 }
 
 fn apply_cmp(op: BinOpKind, a: i128, b: i128) -> bool {
@@ -983,9 +1000,12 @@ fn try_flatten_switch(
         else_body: else_body.clone(),
     }];
     let max_const = max_state_constant(&tree, frame, state, env).max(*labels.iter().max().unwrap());
-    // A value beyond every compared constant (of an allowed parity) stands in for
-    // all larger states; its outcome is the switch default.
-    let beyond = (max_const + 1..=max_const + 3).find(|v| domain.allows(*v));
+    // A value beyond every compared constant (of an allowed parity/slice) stands
+    // in for all larger states; its outcome is the switch default. Search a full
+    // slice period so periodic domains (e.g. `state & 1 == 0`, or a wider
+    // `BITS(state,s,w) == k`) still find their next reachable value. If none is
+    // found the domain is bounded above and there is no default.
+    let beyond = (max_const + 1..=max_const + domain.period()).find(|v| domain.allows(*v));
     let beyond_outcome = beyond
         .map(|v| eval_outcome(&tree, v, frame, state, env))
         .unwrap_or_default();
@@ -1522,6 +1542,42 @@ mod tests {
         let out = recover_resume_dispatch(body);
         // Even branch: only {0, 2}; the odd value 1 is not a case.
         assert_eq!(switch_labels(&out), Some(vec![0, 2]));
+    }
+
+    #[test]
+    fn multi_bit_slice_guard_finds_beyond_for_default() {
+        // if (BITS(state,0,3) == 7) { if (state==7) A else if (state==15) B
+        //                             else trap }
+        // Reachable states are ≡ 7 (mod 8): 7, 15, 23, ... The next reachable
+        // value past the cases (23) is 8 steps beyond 15, so the default-search
+        // must span a full slice period to keep the trap default.
+        let bits = |start: u8, width: u8| Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(state_access()),
+                start,
+                width,
+            },
+        };
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, bits(0, 3), 7),
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 7),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 15),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![block(vec![Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("__builtin_trap".to_string()),
+                        vec![],
+                    )])],
+                )],
+            )],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![7, 15]));
+        let default_dump = find_default_dump(&out).expect("trap default for state 23+");
+        assert!(default_dump.contains("__builtin_trap"));
     }
 
     #[test]
