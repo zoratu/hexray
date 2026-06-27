@@ -1558,9 +1558,23 @@ fn visit_exprs(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr)) {
                 walk_expr(condition, f);
                 visit_exprs(body, f);
             }
-            StructuredNode::For { body, .. } | StructuredNode::Loop { body, .. } => {
-                visit_exprs(body, f)
+            StructuredNode::For {
+                init,
+                condition,
+                update,
+                body,
+                ..
+            } => {
+                if let Some(e) = init {
+                    walk_expr(e, f);
+                }
+                walk_expr(condition, f);
+                if let Some(e) = update {
+                    walk_expr(e, f);
+                }
+                visit_exprs(body, f);
             }
+            StructuredNode::Loop { body, .. } => visit_exprs(body, f),
             StructuredNode::Switch {
                 value,
                 cases,
@@ -1814,6 +1828,37 @@ mod tests {
         assert!(!format!("{case0:?}").contains("suffix"));
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"));
+    }
+
+    #[test]
+    fn for_loop_header_reassignment_kills_stale_state_temp() {
+        // tmp = state; for (...; ...; tmp = 0) { ... }
+        // if (tmp == 0) A else if (tmp == 1) B
+        // The for-update reassigns tmp, so after the loop it is no longer the
+        // resume index and the following if must NOT be flattened to a switch.
+        let tmp = || Expr::var(Variable::reg("rcx", 8));
+        let body = vec![
+            block(vec![Expr::assign(tmp(), state_access())]),
+            StructuredNode::For {
+                init: None,
+                condition: Expr::unknown("i < n"),
+                update: Some(Expr::assign(tmp(), Expr::int(0))),
+                body: vec![block(vec![Expr::unknown("loop_body")])],
+                header: None,
+                exit_block: None,
+            },
+            iff(
+                cmp(BinOpKind::Eq, tmp(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, tmp(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), None);
     }
 
     #[test]
