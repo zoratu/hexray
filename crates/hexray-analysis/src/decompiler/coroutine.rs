@@ -607,16 +607,22 @@ fn eval_outcome(
     env: &BindingEnv,
 ) -> Vec<StructuredNode> {
     let mut env = env.clone();
+    // Reload blocks (`tmp = frame->state`) are skipped for dispatch navigation,
+    // but a later case/default body may reuse that temp for ordinary code. Keep
+    // the skipped reloads and re-prepend any whose temp is referenced by the
+    // outcome we ultimately emit, so the switch body never drops their assignment.
+    let mut reloads: Vec<StructuredNode> = Vec::new();
     for (i, node) in nodes.iter().enumerate() {
         match node {
             StructuredNode::Block { statements, .. } => {
                 if is_state_reload_block(statements, frame, state, &env) {
                     env.note_block(statements, frame, state);
+                    reloads.push(node.clone());
                     continue;
                 }
                 // A real (or trap) block: v runs it and the rest of this sibling
                 // list as its outcome.
-                return nodes[i..].to_vec();
+                return prepend_used_reloads(reloads, nodes[i..].to_vec());
             }
             StructuredNode::If {
                 condition,
@@ -628,7 +634,7 @@ fn eval_outcome(
                     Some(false) => else_body.as_deref(),
                     // Non-state condition: v has reached ordinary code; its outcome
                     // is this node onward (the whole region).
-                    None => return nodes[i..].to_vec(),
+                    None => return prepend_used_reloads(reloads, nodes[i..].to_vec()),
                 };
                 // v executes the taken branch; if that branch falls through (no
                 // trap/return), it then continues with the siblings after this If.
@@ -638,12 +644,62 @@ fn eval_outcome(
                 if !ends_noreturn(&outcome) {
                     outcome.extend(eval_outcome(&nodes[i + 1..], v, frame, state, &env));
                 }
-                return outcome;
+                return prepend_used_reloads(reloads, outcome);
             }
-            _ => return nodes[i..].to_vec(),
+            _ => return prepend_used_reloads(reloads, nodes[i..].to_vec()),
         }
     }
     Vec::new()
+}
+
+/// Re-prepend the skipped reload blocks whose assigned temp is actually
+/// referenced by `outcome`, so a case/default body that reuses the reload value
+/// keeps its defining assignment (the reload is otherwise dropped, since the
+/// whole if-tree is replaced by the synthesized switch). Reloads whose temp is
+/// unused stay dropped — they were pure dispatch scaffolding.
+fn prepend_used_reloads(
+    reloads: Vec<StructuredNode>,
+    outcome: Vec<StructuredNode>,
+) -> Vec<StructuredNode> {
+    if reloads.is_empty() {
+        return outcome;
+    }
+    let used: Vec<StructuredNode> = reloads
+        .into_iter()
+        .filter(|r| reload_temps(r).iter().any(|k| outcome_uses_key(&outcome, k)))
+        .collect();
+    if used.is_empty() {
+        return outcome;
+    }
+    let mut combined = used;
+    combined.extend(outcome);
+    combined
+}
+
+/// The lvalue keys assigned by a reload block's statements.
+fn reload_temps(node: &StructuredNode) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let StructuredNode::Block { statements, .. } = node {
+        for s in statements {
+            if let ExprKind::Assign { lhs, .. } = &s.kind {
+                if let Some(k) = alias_key(lhs) {
+                    keys.push(k);
+                }
+            }
+        }
+    }
+    keys
+}
+
+/// Whether any expression in `outcome` references the lvalue `key`.
+fn outcome_uses_key(outcome: &[StructuredNode], key: &str) -> bool {
+    let mut found = false;
+    visit_exprs(outcome, &mut |e| {
+        if alias_key(e).as_deref() == Some(key) {
+            found = true;
+        }
+    });
+    found
 }
 
 /// Whether the outcome's final statement halts control flow (trap / unreachable
@@ -1877,6 +1933,49 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn reload_reused_by_case_body_is_preserved() {
+        // if (state <= 3) {
+        //     tmp = state;                       // branch-local reload
+        //     if (tmp == 0) { rdx = tmp; A }     // case 0 reuses tmp
+        //     else if (tmp == 1) { B }           // case 1 doesn't
+        // }
+        // case 0 must keep the reload assignment (renamed); case 1, which never
+        // references tmp, must not carry it.
+        let tmp = || Expr::var(Variable::reg("rcx", 8));
+        let body = vec![iff(
+            cmp(BinOpKind::Le, state_access(), 3),
+            vec![
+                block(vec![Expr::assign(tmp(), state_access())]),
+                iff(
+                    cmp(BinOpKind::Eq, tmp(), 0),
+                    vec![block(vec![
+                        Expr::assign(Expr::var(Variable::reg("rdx", 8)), tmp()),
+                        Expr::unknown("body_a"),
+                    ])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, tmp(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![],
+                    )],
+                ),
+            ],
+            vec![],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(c0.contains("__resume_index"), "reload dropped from case0: {c0}");
+        assert!(c0.contains("body_a"), "{c0}");
+        let case1 = case_body(&out, 1).expect("case 1");
+        let c1 = format!("{case1:?}");
+        assert!(
+            !c1.contains("__resume_index"),
+            "unused reload carried into case1: {c1}"
+        );
     }
 
     #[test]
