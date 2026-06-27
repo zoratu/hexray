@@ -90,6 +90,13 @@ fn contains_resume_switch(nodes: &[StructuredNode]) -> bool {
         | StructuredNode::For { body, .. }
         | StructuredNode::Loop { body, .. } => contains_resume_switch(body),
         StructuredNode::Sequence(nodes) => contains_resume_switch(nodes),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => {
+            contains_resume_switch(try_body)
+                || catch_handlers.iter().any(|h| contains_resume_switch(&h.body))
+        }
         _ => false,
     })
 }
@@ -332,6 +339,15 @@ fn scan_state_compares(
                 }
             }
             StructuredNode::Sequence(nodes) => scan_state_compares(nodes, frame, temp_offset, counts),
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                scan_state_compares(try_body, frame, &mut temp_offset.clone(), counts);
+                for handler in catch_handlers {
+                    scan_state_compares(&handler.body, frame, &mut temp_offset.clone(), counts);
+                }
+            }
             _ => {}
         }
     }
@@ -705,6 +721,18 @@ fn max_state_constant(
                     max = max.max(max_state_constant(b, frame, state, &env));
                 }
             }
+            StructuredNode::Sequence(nodes) => {
+                max = max.max(max_state_constant(nodes, frame, state, &env));
+            }
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                max = max.max(max_state_constant(try_body, frame, state, &env));
+                for handler in catch_handlers {
+                    max = max.max(max_state_constant(&handler.body, frame, state, &env));
+                }
+            }
             _ => {}
         }
     }
@@ -900,6 +928,19 @@ fn rewrite_structural(
             default: default.map(recur),
         },
         StructuredNode::Sequence(nodes) => StructuredNode::Sequence(recur(nodes)),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: recur(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|h| super::structurer::CatchHandler {
+                    body: rewrite_nodes(h.body, frame, state, &mut env.clone(), domain),
+                    ..h
+                })
+                .collect(),
+        },
         other => other,
     }
 }
@@ -1339,6 +1380,15 @@ fn visit_exprs(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr)) {
             }
             StructuredNode::Return(Some(e)) | StructuredNode::Expr(e) => walk_expr(e, f),
             StructuredNode::Sequence(nodes) => visit_exprs(nodes, f),
+            StructuredNode::TryCatch {
+                try_body,
+                catch_handlers,
+            } => {
+                visit_exprs(try_body, f);
+                for handler in catch_handlers {
+                    visit_exprs(&handler.body, f);
+                }
+            }
             _ => {}
         }
     }
@@ -1392,6 +1442,16 @@ mod tests {
                     }
                     if let Some(l) = else_body.as_ref().and_then(|b| switch_labels(b)) {
                         return Some(l);
+                    }
+                }
+                StructuredNode::TryCatch { try_body, catch_handlers } => {
+                    if let Some(l) = switch_labels(try_body) {
+                        return Some(l);
+                    }
+                    for h in catch_handlers {
+                        if let Some(l) = switch_labels(&h.body) {
+                            return Some(l);
+                        }
                     }
                 }
                 _ => {}
@@ -1490,6 +1550,27 @@ mod tests {
         assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
         assert!(find_default_dump(&out).is_none());
         assert!(format!("{out:?}").contains("__builtin_trap"));
+    }
+
+    #[test]
+    fn recovers_dispatch_nested_in_try_catch() {
+        // The resume dispatch can be wrapped in a try/catch for an EH coroutine;
+        // the scan and rewrite must descend into the try body.
+        let inner = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![block(vec![Expr::unknown("body_a")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let body = vec![StructuredNode::TryCatch {
+            try_body: inner,
+            catch_handlers: vec![],
+        }];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
     }
 
     #[test]
