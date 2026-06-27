@@ -694,27 +694,41 @@ fn collect_cases(
         | BinOpKind::ULe
         | BinOpKind::UGt
         | BinOpKind::UGe => {
+            // Each side of the bound covers only its own sub-range, so any default
+            // recovered from a branch is range-limited. A flat switch has a single
+            // default for ALL unmatched states, so a *live* (non-noreturn)
+            // range-limited default can't be represented — decline. A noreturn
+            // trap is uniform-enough (invalid states abort) and is merged.
+            let mut then_d = Dispatch::default();
+            collect_branch(then_body, frame, state, env, &mut then_d)?;
+            if matches!(&then_d.default, Some(d) if !body_is_noreturn(d)) {
+                return None;
+            }
+            acc.cases.extend(then_d.cases);
+
             match else_body {
                 Some(else_nodes) => {
                     // Both ranges are dispatched explicitly.
-                    collect_branch(then_body, frame, state, env, acc)?;
-                    collect_branch(else_nodes, frame, state, env, acc)
+                    let mut else_d = Dispatch::default();
+                    collect_branch(else_nodes, frame, state, env, &mut else_d)?;
+                    if matches!(&else_d.default, Some(d) if !body_is_noreturn(d)) {
+                        return None;
+                    }
+                    acc.cases.extend(else_d.cases);
+                    for d in [then_d.default, else_d.default].into_iter().flatten() {
+                        if acc.default.is_none() {
+                            acc.default = Some(d);
+                        }
+                    }
+                    Some(())
                 }
                 None => {
-                    // No else: states NOT satisfying the bound fall through past the
-                    // dispatch. Collect the taken range's cases, but its default
-                    // covers only taken-range gaps — for a dense coroutine dispatch
-                    // that's a dead trap, so drop it and let the complementary
-                    // states fall through. A *live* taken default can't be merged
-                    // with that implicit fallthrough in one switch default — abort.
-                    let mut taken = Dispatch::default();
-                    collect_branch(then_body, frame, state, env, &mut taken)?;
-                    acc.cases.extend(taken.cases);
-                    match taken.default {
-                        None => Some(()),
-                        Some(d) if body_is_noreturn(&d) => Some(()),
-                        Some(_) => None,
-                    }
+                    // No else: states not satisfying the bound fall through past the
+                    // dispatch, so the taken range's noreturn trap (covering only
+                    // taken-range gaps, dead for a dense dispatch) must be dropped —
+                    // not promoted to a default that would trap those fall-through
+                    // states.
+                    Some(())
                 }
             }
         }
@@ -887,17 +901,22 @@ fn body_is_noreturn(nodes: &[StructuredNode]) -> bool {
 
 fn is_noreturn_call(e: &Expr) -> bool {
     use super::expression::CallTarget;
-    if let ExprKind::Call { target, .. } = &e.kind {
-        let name = match target {
-            CallTarget::Named(n) => Some(n.as_str()),
-            _ => None,
-        };
-        return matches!(
-            name,
-            Some("__builtin_trap" | "__builtin_unreachable" | "abort" | "std::terminate")
-        );
+    match &e.kind {
+        ExprKind::Call { target, .. } => {
+            let name = match target {
+                CallTarget::Named(n) => Some(n.as_str()),
+                _ => None,
+            };
+            matches!(
+                name,
+                Some("__builtin_trap" | "__builtin_unreachable" | "abort" | "std::terminate")
+            )
+        }
+        // Some lifters surface a trap/unreachable as an opaque marker rather than
+        // a call (e.g. x86 `ud2`).
+        ExprKind::Unknown(s) => s.contains("__builtin_trap") || s.contains("__builtin_unreachable"),
+        _ => false,
     }
-    false
 }
 
 /// If `cond` is `state <op> const`, return the op (oriented so `state` is the
