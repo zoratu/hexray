@@ -1299,7 +1299,11 @@ fn try_flatten_switch(
     // label larger than the cap isn't a resume index — decline.
     const ENUM_CAP: i128 = 4096;
     let max_label = *labels.iter().max().unwrap();
-    if max_label > ENUM_CAP {
+    // Resume indices are small non-negatives. A negative sentinel label (e.g.
+    // `state == -1`) isn't enumerated by the `0..=dense_limit` case loop, so it
+    // would silently fall into the default — decline rather than change behavior.
+    // A label above the cap isn't a resume index either.
+    if max_label > ENUM_CAP || labels.iter().any(|&l| l < 0) {
         return None;
     }
     let max_const = max_state_constant(&tree, frame, state, env);
@@ -2092,6 +2096,33 @@ mod tests {
         // The fall-through state 1 legitimately reaches the suffix.
         let case1 = case_body(&out, 1).expect("case 1");
         assert!(format!("{case1:?}").contains("suffix"), "case1={case1:?}");
+    }
+
+    #[test]
+    fn negative_sentinel_label_declines() {
+        // if (state == -1) cleanup else if (state == 0) A else if (state == 1) B
+        // The negative sentinel can't be a small resume index and wouldn't be
+        // enumerated as a case — decline rather than route -1 into the default.
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), -1),
+            vec![block(vec![Expr::unknown("cleanup")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        // The outer `state == -1` sentinel declines (negative), so it stays as an
+        // `if` and its cleanup body is preserved; the inner non-negative dispatch
+        // still flattens. The -1 state is never silently routed into a default.
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let dump = format!("{out:?}");
+        assert!(dump.contains("cleanup"), "negative sentinel body dropped: {dump}");
     }
 
     #[test]
