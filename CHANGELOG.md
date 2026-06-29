@@ -5,6 +5,35 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.14] - 2026-06-29
+
+### Decompiler — C++20 coroutine state-machine recovery
+
+- **Coroutine resume-dispatch → `switch`.** In a gcc `[clone .actor]` / clang
+  `[clone .resume]` coroutine resume clone, the binary-search if-tree that
+  dispatches on the heap frame's suspend-index field is now recovered as a clean
+  `switch (frame->__resume_index) { case N: }`. The pass is gated strictly to
+  coroutine clone names, so ordinary functions are untouched. For example, a gcc
+  `-O0` actor flattens into two switches — resume states `{0, 2, 4, 6}` and
+  destroy states `{1, 3, 5, 7}` — recovered via the even/odd parity split.
+- The behavior of *unmatched* states is computed by per-value range/parity
+  analysis (evaluating each reachable state value through the original dispatch
+  tree over a parity/range domain), so trapping and fall-through states are
+  emitted exactly and never conflated into one incorrect default. The pass
+  declines rather than emit a lossy switch when it cannot represent the dispatch
+  faithfully — e.g. a tail split by a range bound or a bit-slice parity
+  condition, a negative sentinel label (`state == -1`), or a non-resume-index
+  field. The resume-index field is selected by the shallowest dispatch depth (the
+  resume dispatch is the clone's outermost branching), so a frame-stored enum
+  switched on in resumed code is never mistaken for it.
+- Hardened across ~18 reviewed edge cases: huge unsigned bound guards
+  (`state <= 0xffffffff`) no longer hang; case bodies are path-constraint aware;
+  state-field references are renamed through every expression wrapper and in
+  `for`-headers / `Expr` / `Return` nodes; unsigned guards compare as unsigned;
+  temp bindings are invalidated across compound assignments, branch
+  reassignments before fall-through, and `for`-loop headers; reload spills to
+  named stack locals (read after the switch) are preserved rather than dropped.
+
 ## [1.3.13] - 2026-06-26
 
 ### Decompiler — aarch64 variadic signatures
