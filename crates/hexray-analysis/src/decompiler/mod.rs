@@ -14,6 +14,7 @@ pub mod benchmark;
 pub mod comparison;
 pub mod config;
 mod constant_propagation;
+mod coroutine;
 mod cse;
 mod dead_store;
 mod emitter;
@@ -1351,6 +1352,20 @@ impl Decompiler {
         // Step 5: Format function name for C++ special members
         let display_name = self.format_cpp_function_name(func_name);
 
+        // Step 5b: In a C++ coroutine resume-stepper clone (gcc `.actor`, clang
+        // `.resume`), reconstruct the `frame->__resume_index` state dispatch into
+        // a `switch`. Gated on the clone name so ordinary functions are untouched.
+        let structured = if coroutine::is_coroutine_resume_clone(&display_name)
+            || coroutine::is_coroutine_resume_clone(func_name)
+        {
+            StructuredCfg {
+                body: coroutine::recover_resume_dispatch(structured.body),
+                cfg_entry: structured.cfg_entry,
+            }
+        } else {
+            structured
+        };
+
         // Step 6: Emit pseudo-code
         let mut emitter = PseudoCodeEmitter::new(&self.indent, self.emit_addresses)
             .with_string_table(self.string_table.clone())
@@ -1448,6 +1463,9 @@ impl Decompiler {
     fn generate_coroutine_header(display_name: &str) -> Option<String> {
         let (kind, friendly) = if display_name.contains("[clone .actor]") {
             ("actor", "state-machine stepper")
+        } else if display_name.contains("[clone .resume]") {
+            // clang's resume-stepper clone (gcc names it `.actor`).
+            ("resume", "state-machine stepper")
         } else if display_name.contains("[clone .destroy]") {
             ("destroy", "frame destructor")
         } else if display_name.contains("[clone .cleanup]") {
