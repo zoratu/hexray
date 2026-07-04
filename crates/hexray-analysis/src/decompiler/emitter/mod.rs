@@ -402,6 +402,11 @@ pub struct PseudoCodeEmitter {
     calling_convention: CallingConvention,
     /// Whether to use advanced signature recovery.
     use_signature_recovery: bool,
+    /// Whether the function being emitted is a C++20 coroutine clone
+    /// (`.actor` / `.resume` / `.destroy` / `.cleanup`). Enables rendering the
+    /// inlined promise/awaiter protocol calls as source-level coroutine keywords
+    /// (`co_return` / `co_yield`). Off for ordinary functions.
+    coroutine_clone: bool,
     /// Type database for struct field access and function prototypes.
     type_database: Option<Arc<TypeDatabase>>,
     /// Constant database for magic number recognition.
@@ -735,6 +740,7 @@ impl PseudoCodeEmitter {
             naming_ctx: RefCell::new(NamingContext::new()),
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
+            coroutine_clone: false,
             type_database: None,
             constant_database: None,
             summary_database: None,
@@ -1346,6 +1352,63 @@ impl PseudoCodeEmitter {
 
         Self::fold_terminal_tail_call_return(&mut rewritten, in_tail_return_path);
         rewritten
+    }
+
+    /// Resolve a call target to its display name (demangled, signature-stripped),
+    /// mirroring the resolution used when formatting the call. `Direct` targets
+    /// are looked up in the symbol table by their computed address.
+    fn resolved_call_target_name(&self, target: &CallTarget) -> Option<String> {
+        let raw: Option<String> = match target {
+            CallTarget::Named(name) => Some(name.clone()),
+            CallTarget::Direct { target, .. } => self
+                .symbol_table
+                .as_ref()
+                .and_then(|table| table.get(*target))
+                .map(|name| name.to_string()),
+            CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => None,
+        };
+        raw.map(|name| self.format_call_target_name(&name))
+    }
+
+    /// In a coroutine clone, recognize an inlined promise-protocol call statement
+    /// and render it as the source-level coroutine keyword it lowered from:
+    ///   `<Promise>::return_void(this)`        → `co_return`
+    ///   `<Promise>::return_value(this, v)`    → `co_return v`
+    ///   `<Promise>::yield_value(this, v)`     → `co_yield v`
+    /// The call may be wrapped in a dead assignment of its (void) return register
+    /// (`retN = <Promise>::return_void(this)`); that wrapper is dropped. Gated on
+    /// the coroutine-clone flag so ordinary functions are never affected.
+    fn coroutine_keyword_for_statement(&self, expr: &Expr) -> Option<String> {
+        if !self.coroutine_clone {
+            return None;
+        }
+        // Unwrap a dead assignment of the call's return register.
+        let call = match &expr.kind {
+            ExprKind::Assign { rhs, .. } => rhs.as_ref(),
+            _ => expr,
+        };
+        let ExprKind::Call { target, args } = &call.kind else {
+            return None;
+        };
+        let name = self.resolved_call_target_name(target)?;
+        // Require a class-qualified method name (`Class::method`); a bare free
+        // function named `return_void` is not a coroutine promise method.
+        let method = name.rsplit("::").next()?;
+        if method.len() == name.len() {
+            return None;
+        }
+        match method {
+            // return_void takes only the promise receiver — no returned value.
+            "return_void" if args.len() == 1 => Some("co_return".to_string()),
+            // return_value / yield_value take (promise this, value).
+            "return_value" if args.len() >= 2 => {
+                Some(format!("co_return {}", self.format_expr(&args[1])))
+            }
+            "yield_value" if args.len() >= 2 => {
+                Some(format!("co_yield {}", self.format_expr(&args[1])))
+            }
+            _ => None,
+        }
     }
 
     fn is_destructor_call_target(&self, target: &CallTarget) -> bool {
@@ -3497,6 +3560,13 @@ impl PseudoCodeEmitter {
     /// Enables or disables advanced signature recovery.
     pub fn with_signature_recovery(mut self, enabled: bool) -> Self {
         self.use_signature_recovery = enabled;
+        self
+    }
+
+    /// Marks the function as a C++20 coroutine clone, enabling coroutine-keyword
+    /// rendering (`co_return` / `co_yield`) for the inlined promise protocol.
+    pub fn with_coroutine_clone(mut self, is_clone: bool) -> Self {
+        self.coroutine_clone = is_clone;
         self
     }
 
@@ -8969,6 +9039,13 @@ impl PseudoCodeEmitter {
             writeln!(output, "{}{}", indent, comment).unwrap();
             return;
         }
+        // In a coroutine clone, render an inlined promise-protocol call as the
+        // `co_return` / `co_yield` keyword it lowered from (dropping any dead
+        // return-register assignment / inline declaration wrapping it).
+        if let Some(keyword) = self.coroutine_keyword_for_statement(expr) {
+            writeln!(output, "{}{};", indent, keyword).unwrap();
+            return;
+        }
         let expr_str = self.format_expr(expr);
 
         // Skip empty/nop statements and trivial literal statements
@@ -9719,6 +9796,13 @@ impl PseudoCodeEmitter {
         let indent = self.indent.repeat(depth);
         if let Some(comment) = Self::opaque_x86_integer_simd_statement(expr) {
             writeln!(output, "{}{}", indent, comment).unwrap();
+            return;
+        }
+        // In a coroutine clone, render an inlined promise-protocol call as the
+        // `co_return` / `co_yield` keyword it lowered from (dropping any dead
+        // return-register assignment / inline declaration wrapping it).
+        if let Some(keyword) = self.coroutine_keyword_for_statement(expr) {
+            writeln!(output, "{}{};", indent, keyword).unwrap();
             return;
         }
         let expr_str = self.format_expr(expr);
@@ -14651,6 +14735,86 @@ int sum(int n, ...)
         let mut ti = HashMap::new();
         ti.insert(var.to_string(), ty.to_string());
         PseudoCodeEmitter::new("    ", false).with_type_info(ti)
+    }
+
+    fn coro_call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::call(
+            super::super::expression::CallTarget::Named(name.to_string()),
+            args,
+        )
+    }
+
+    fn coro_recv() -> Expr {
+        Expr::var(super::super::expression::Variable::reg("rax", 8))
+    }
+
+    #[test]
+    fn coroutine_return_void_renders_co_return() {
+        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&call).as_deref(),
+            Some("co_return")
+        );
+        // The dead assignment of the void call's return register is unwrapped.
+        let wrapped = Expr::assign(
+            Expr::var(super::super::expression::Variable::reg("rdx", 8)),
+            call,
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&wrapped).as_deref(),
+            Some("co_return")
+        );
+    }
+
+    #[test]
+    fn coroutine_return_value_and_yield_value_render_keywords() {
+        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        let rv = coro_call(
+            "Gen::promise_type::return_value",
+            vec![coro_recv(), Expr::int(5)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&rv).as_deref(),
+            Some("co_return 5")
+        );
+        let yv = coro_call(
+            "Gen::promise_type::yield_value",
+            vec![coro_recv(), Expr::int(7)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&yv).as_deref(),
+            Some("co_yield 7")
+        );
+    }
+
+    #[test]
+    fn coroutine_keyword_is_gated_and_scoped() {
+        // Off outside coroutine clones.
+        let plain = PseudoCodeEmitter::new("    ", false);
+        let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        assert_eq!(plain.coroutine_keyword_for_statement(&call), None);
+
+        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        // A bare free function named `return_void` (no class qualifier) is not a
+        // promise method — not sugared.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call("return_void", vec![coro_recv()])),
+            None
+        );
+        // An unrelated method is untouched.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call("Foo::bar", vec![coro_recv()])),
+            None
+        );
+        // return_void with an unexpected extra arg (not a lone receiver) declines.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call(
+                "Task::promise_type::return_void",
+                vec![coro_recv(), Expr::int(1)]
+            )),
+            None
+        );
     }
 
     fn this_arg(var: &str) -> Vec<Expr> {

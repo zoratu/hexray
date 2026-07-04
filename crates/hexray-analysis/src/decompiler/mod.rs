@@ -1378,6 +1378,7 @@ impl Decompiler {
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery)
+            .with_coroutine_clone(Self::generate_coroutine_header(&display_name).is_some())
             .with_binary_data(self.binary_data.clone());
         if let Some(ref db) = self.summary_database {
             emitter = emitter.with_summary_database(db.clone());
@@ -1481,10 +1482,15 @@ impl Decompiler {
         ));
         lines.push("//   for a coroutine source function. Suspend/resume state lives".to_string());
         lines.push(
-            "//   in the heap-allocated frame pointed to by the first parameter;".to_string(),
+            "//   in the heap-allocated frame pointed to by the first parameter,".to_string(),
         );
-        lines.push("//   full `co_await` / `co_yield` / `co_return` reconstruction is".to_string());
-        lines.push("//   deferred (deferral #7 of the v1.3.8 roadmap).".to_string());
+        lines.push(
+            "//   dispatched by the recovered `switch (frame->__resume_index)`. The".to_string(),
+        );
+        lines.push(
+            "//   inlined promise protocol is rendered as `co_return` / `co_yield`;".to_string(),
+        );
+        lines.push("//   `co_await` suspend-point reconstruction is still deferred.".to_string());
         Some(lines.join("\n"))
     }
 
@@ -3356,8 +3362,9 @@ mod tests {
     fn coroutine_header_fires_for_known_clone_partitions() {
         // gcc/clang lower C++20 coroutines into `.actor` / `.destroy` /
         // `.cleanup` clones; the header just tells the user which
-        // partition they're looking at and that full co_await
-        // reconstruction is deferral #7. Each known suffix must be
+        // partition they're looking at, that the dispatch is the
+        // recovered resume-index switch, and that `co_await` suspend-point
+        // reconstruction is still deferred. Each known suffix must be
         // recognised; an unrelated function must produce no header at
         // all.
         let actor = Decompiler::generate_coroutine_header(
@@ -3366,7 +3373,9 @@ mod tests {
         .expect("actor header");
         assert!(actor.contains(".actor partition"));
         assert!(actor.contains("state-machine stepper"));
-        assert!(actor.contains("deferral #7"));
+        assert!(actor.contains("__resume_index"));
+        assert!(actor.contains("co_return"));
+        assert!(actor.contains("`co_await` suspend-point reconstruction is still deferred"));
 
         let destroy = Decompiler::generate_coroutine_header(
             "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .destroy]",
