@@ -1601,15 +1601,23 @@ impl PseudoCodeEmitter {
         if !self.coroutine_clone {
             return None;
         }
+        // Only the statements the emitter actually renders count: the prefix up to
+        // and including the first control exit (with `Sequence` wrappers flattened
+        // as `emit_node` does). Signals or exits in an unreachable tail are ignored.
+        let mut prefix: Vec<&StructuredNode> = Vec::new();
+        self.collect_emitted_prefix(then_body, &mut prefix);
         // A suspend branch RETURNS to the caller (suspends the actor). A branch
         // whose first control exit is break/continue/goto stays in the function —
         // not a suspend.
-        if !self.branch_returns_to_caller(then_body) {
+        if !prefix
+            .last()
+            .is_some_and(|n| self.exit_node_returns_to_caller(n))
+        {
             return None;
         }
         let mut resume_state: Option<i128> = None;
         let mut awaiter: Option<String> = None;
-        for node in then_body {
+        for node in &prefix {
             self.scan_suspend_signals(node, &mut resume_state, &mut awaiter);
         }
         // Require BOTH the resume-index save and an await_suspend call so ordinary
@@ -1623,32 +1631,51 @@ impl PseudoCodeEmitter {
     }
 
 
-    /// Whether a branch's control flow leaves by returning to the caller (a
-    /// coroutine suspend returns from the actor). Bases the decision on the FIRST
-    /// control exit reached (as the emitter does), not the final node — so a
-    /// `break`/`continue`/`goto` (or a noreturn trap) followed by an unreachable
-    /// trailing `return` does NOT qualify.
-    fn branch_returns_to_caller(&self, body: &[StructuredNode]) -> bool {
+    /// Collect the nodes the emitter actually renders for a branch: everything up
+    /// to and including the FIRST control exit, with `Sequence` wrappers flattened
+    /// (as `emit_node` does). Returns whether a control exit was reached.
+    fn collect_emitted_prefix<'a>(
+        &self,
+        body: &'a [StructuredNode],
+        out: &mut Vec<&'a StructuredNode>,
+    ) -> bool {
         for node in body {
-            if !self.is_control_exit(node) {
+            if let StructuredNode::Sequence(inner) = node {
+                if self.collect_emitted_prefix(inner, out) {
+                    return true;
+                }
                 continue;
             }
-            return match node {
-                StructuredNode::Return(_) => true,
-                StructuredNode::If {
-                    then_body,
-                    else_body: Some(else_body),
-                    ..
-                } => {
-                    self.branch_returns_to_caller(then_body)
-                        && self.branch_returns_to_caller(else_body)
-                }
-                // break / continue / goto, or a Block ending in a noreturn call —
-                // none return to the caller.
-                _ => false,
-            };
+            out.push(node);
+            if self.is_control_exit(node) {
+                return true;
+            }
         }
         false
+    }
+
+    /// Whether a first-control-exit node leaves by returning to the caller (a
+    /// coroutine suspend returns from the actor). `break`/`continue`/`goto` or a
+    /// noreturn trap do not qualify.
+    fn exit_node_returns_to_caller(&self, node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::Return(_) => true,
+            StructuredNode::If {
+                then_body,
+                else_body: Some(else_body),
+                ..
+            } => self.branch_returns_to_caller(then_body) && self.branch_returns_to_caller(else_body),
+            _ => false,
+        }
+    }
+
+    /// Whether a branch's control flow leaves by returning to the caller.
+    fn branch_returns_to_caller(&self, body: &[StructuredNode]) -> bool {
+        let mut prefix: Vec<&StructuredNode> = Vec::new();
+        self.collect_emitted_prefix(body, &mut prefix);
+        prefix
+            .last()
+            .is_some_and(|n| self.exit_node_returns_to_caller(n))
     }
 
     /// Scan the STRAIGHT-LINE statements of a suspend branch for the two signals.
@@ -15286,6 +15313,38 @@ int sum(int n, ...)
         break_then_return.push(StructuredNode::Break);
         break_then_return.push(StructuredNode::Return(None));
         assert_eq!(e.coroutine_suspend_annotation(&break_then_return), None);
+
+        // A Sequence-wrapped suspend branch IS annotated (emit_node flattens it).
+        let seq = vec![StructuredNode::Sequence(suspend_then_body(6))];
+        let note = e.coroutine_suspend_annotation(&seq).expect("sequence suspend");
+        assert!(note.contains("state 6"), "{note}");
+
+        // Signals living only in an UNREACHABLE tail (after the emitted return) are
+        // ignored — the emitted prefix is just a plain block + return.
+        let unreachable_tail = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::unknown("plain")],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(
+                        Expr::field_access(coro_recv(), "__resume_index", 36),
+                        Expr::int(9),
+                    ),
+                    coro_call(
+                        "std::suspend_always::await_suspend",
+                        vec![coro_recv(), coro_recv()],
+                    ),
+                ],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&unreachable_tail), None);
 
         // Signals split across two nested branches (no single path has both) must
         // NOT be annotated.
