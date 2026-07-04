@@ -1601,8 +1601,9 @@ impl PseudoCodeEmitter {
         if !self.coroutine_clone {
             return None;
         }
-        // A suspend branch returns (suspends the coroutine actor).
-        if !self.body_ends_with_control_exit(then_body) {
+        // A suspend branch RETURNS to the caller (suspends the actor). A branch
+        // ending in break/continue/goto stays in the function — not a suspend.
+        if !Self::body_ends_with_return(then_body) {
             return None;
         }
         let mut resume_state: Option<i128> = None;
@@ -1620,6 +1621,21 @@ impl PseudoCodeEmitter {
         ))
     }
 
+
+    /// Whether a branch ends by returning to the caller (a coroutine suspend
+    /// returns from the actor). A trailing break/continue/goto is local control
+    /// flow, not a suspend, so it does not qualify.
+    fn body_ends_with_return(body: &[StructuredNode]) -> bool {
+        match body.last() {
+            Some(StructuredNode::Return(_)) => true,
+            Some(StructuredNode::If {
+                then_body,
+                else_body: Some(else_body),
+                ..
+            }) => Self::body_ends_with_return(then_body) && Self::body_ends_with_return(else_body),
+            _ => false,
+        }
+    }
 
     /// Scan the STRAIGHT-LINE statements of a suspend branch for the two signals.
     /// Deliberately does NOT descend into nested conditionals/loops: a real
@@ -9448,11 +9464,6 @@ impl PseudoCodeEmitter {
                     return;
                 }
 
-                // Annotate a co_await suspend point carried by this `else if` arm.
-                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
-                    writeln!(output, "{}// {}", indent, note).unwrap();
-                }
-
                 // Emit as "} else if (cond) {" on one line
                 writeln!(
                     output,
@@ -9461,6 +9472,11 @@ impl PseudoCodeEmitter {
                     self.format_condition_expr(condition)
                 )
                 .unwrap();
+                // Annotate a co_await suspend point carried by this `else if` arm,
+                // inside the branch.
+                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
+                    writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+                }
                 self.emit_nodes(then_body, output, depth + 1);
 
                 // Recursively handle nested else clauses
@@ -9469,11 +9485,12 @@ impl PseudoCodeEmitter {
             }
         }
 
-        // Regular else block — annotate a co_await suspend point it carries.
-        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
-            writeln!(output, "{}// {}", indent, note).unwrap();
-        }
+        // Regular else block
         writeln!(output, "{}}} else {{", indent).unwrap();
+        // Annotate a co_await suspend point this `else` carries, inside the branch.
+        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
+            writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+        }
         self.emit_nodes(else_nodes, output, depth + 1);
     }
 
@@ -9507,13 +9524,6 @@ impl PseudoCodeEmitter {
                     return;
                 }
 
-                // Annotate a co_await suspend point carried by this `else if` arm
-                // (before the `} else if` line, so the note attaches to it and not
-                // the outer `if`). Deeper chains are covered by the recursion below.
-                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
-                    writeln!(output, "{}// {}", indent, note).unwrap();
-                }
-
                 // Emit as "} else if (cond) {" on one line
                 writeln!(
                     output,
@@ -9522,6 +9532,12 @@ impl PseudoCodeEmitter {
                     self.format_condition_expr(condition)
                 )
                 .unwrap();
+                // Annotate a co_await suspend point carried by this `else if` arm,
+                // inside the branch so it attaches to the suspending body. Deeper
+                // chains are covered by the recursion below.
+                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
+                    writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+                }
                 self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
 
                 // Recursively handle nested else clauses
@@ -9530,12 +9546,13 @@ impl PseudoCodeEmitter {
             }
         }
 
-        // Regular else block — annotate a co_await suspend point it carries
-        // (the terminal `else` of an await_ready test, or of an else-if chain).
-        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
-            writeln!(output, "{}// {}", indent, note).unwrap();
-        }
+        // Regular else block
         writeln!(output, "{}}} else {{", indent).unwrap();
+        // Annotate a co_await suspend point this `else` carries (the terminal
+        // `else` of an await_ready test or an else-if chain), inside the branch.
+        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
+            writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+        }
         self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
     }
 
@@ -15241,6 +15258,13 @@ int sum(int n, ...)
         no_return.pop(); // drop the Return
         assert_eq!(e.coroutine_suspend_annotation(&no_return), None);
 
+        // Ending in `break` (local control flow, not a return-to-caller suspend)
+        // is not annotated.
+        let mut with_break = suspend_then_body(3);
+        with_break.pop();
+        with_break.push(StructuredNode::Break);
+        assert_eq!(e.coroutine_suspend_annotation(&with_break), None);
+
         // Signals split across two nested branches (no single path has both) must
         // NOT be annotated.
         let split = vec![
@@ -15297,11 +15321,11 @@ int sum(int n, ...)
         e.emit_node(&outer, &mut out, 0);
         assert!(out.contains("co_await"), "{out}");
         assert!(out.contains("state 5"), "{out}");
-        // The annotation precedes the `} else if` line, not the outer `if (a)`.
+        // The annotation is inside the `else if` arm (after its header), not the
+        // outer `if (a)`.
         let note_pos = out.find("// co_await").unwrap();
         let else_if_pos = out.find("} else if").unwrap();
-        let outer_if_pos = out.find("if (a)").unwrap();
-        assert!(note_pos < else_if_pos && note_pos > outer_if_pos, "{out}");
+        assert!(note_pos > else_if_pos, "{out}");
     }
 
     #[test]
@@ -15324,10 +15348,10 @@ int sum(int n, ...)
         assert!(out.contains("state 4"), "{out}");
         // Exactly one annotation (no duplicate from the main-if hook).
         assert_eq!(out.matches("// co_await").count(), 1, "{out}");
+        // The note is inside the else branch (after its `} else {` header).
         let note_pos = out.find("// co_await").unwrap();
         let else_pos = out.find("} else").unwrap();
-        let if_pos = out.find("if (ready)").unwrap();
-        assert!(note_pos < else_pos && note_pos > if_pos, "{out}");
+        assert!(note_pos > else_pos, "{out}");
     }
 
     #[test]
