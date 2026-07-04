@@ -1386,12 +1386,6 @@ impl PseudoCodeEmitter {
         raw.map(|name| self.format_call_target_name(&name))
     }
 
-    /// The class qualifier of a `Class::method` name (everything before the final
-    /// `::`), or `None` for an unqualified name.
-    fn call_class_qualifier(name: &str) -> Option<&str> {
-        name.rsplit_once("::").map(|(class, _)| class)
-    }
-
     /// Scan a coroutine clone body for its promise type: the class whose
     /// `initial_suspend` / `final_suspend` (unambiguous promise-protocol methods)
     /// are called. Returns the class qualifier of the first such call found.
@@ -1477,7 +1471,7 @@ impl PseudoCodeEmitter {
         }
         if let ExprKind::Call { target, args } = &e.kind {
             if let Some(name) = self.resolved_call_target_name(target) {
-                if let Some((class, method)) = name.rsplit_once("::") {
+                if let Some((class, method)) = split_qualified_method(&name) {
                     let method = Self::method_base_name(method);
                     if method == "initial_suspend" || method == "final_suspend" {
                         *out = Some(class.to_string());
@@ -1564,12 +1558,14 @@ impl PseudoCodeEmitter {
             return None;
         };
         let name = self.resolved_call_target_name(target)?;
-        // Require the call's class to be exactly the coroutine's promise type.
-        let class = Self::call_class_qualifier(&name)?;
+        // Split at the top-level `::` (ignoring `::` inside template arguments such
+        // as `return_value<std::string>`); require the class to be exactly the
+        // coroutine's promise type.
+        let (class, method) = split_qualified_method(&name)?;
         if !whitespace_insensitive_eq(class, promise_type) {
             return None;
         }
-        let method = Self::method_base_name(&name[class.len() + 2..]);
+        let method = Self::method_base_name(method);
         // Method arities: `return_void(this)`, `return_value(this, v)`. Extra args
         // mean it isn't the promise method.
         match method {
@@ -14995,6 +14991,16 @@ int sum(int n, ...)
         assert_eq!(
             e.coroutine_keyword_for_statement(&rvt).as_deref(),
             Some("co_return 8")
+        );
+        // A namespaced template instantiation must split at the top-level `::`,
+        // not the one inside `<std::string>`.
+        let rvn = coro_call(
+            "Gen::promise_type::return_value<std::string>",
+            vec![coro_recv(), Expr::int(3)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&rvn).as_deref(),
+            Some("co_return 3")
         );
         // yield_value returns an awaiter consumed by the following await sequence,
         // so it is NOT sugared here (deferred to co_await recovery).

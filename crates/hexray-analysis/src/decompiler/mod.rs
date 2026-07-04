@@ -1378,7 +1378,13 @@ impl Decompiler {
             .with_dwarf_scope_ranges(self.dwarf_scope_ranges.clone())
             .with_calling_convention(self.calling_convention)
             .with_signature_recovery(self.enable_signature_recovery)
-            .with_coroutine_clone(Self::generate_coroutine_header(&display_name).is_some())
+            // Coroutine-keyword rendering (`co_return`) applies only to the
+            // resume steppers (`.actor` / `.resume`), where the promise body is
+            // inlined — not the `.destroy` / `.cleanup` teardown partitions.
+            .with_coroutine_clone(
+                coroutine::is_coroutine_resume_clone(&display_name)
+                    || coroutine::is_coroutine_resume_clone(func_name),
+            )
             .with_binary_data(self.binary_data.clone());
         if let Some(ref db) = self.summary_database {
             emitter = emitter.with_summary_database(db.clone());
