@@ -5,6 +5,31 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.15] - 2026-07-04
+
+### Decompiler — C++20 coroutine suspend-point recovery
+
+- **`co_return` keyword rendering.** In a coroutine resume stepper (gcc `.actor` /
+  clang `.resume`), the inlined promise-protocol calls now render as the
+  source-level keyword they lowered from: `<Promise>::return_void(this)` →
+  `co_return`, `<Promise>::return_value(this, v)` → `co_return v`. The wrapping
+  dead assignment of the (void) call's return register is dropped. Gated on the
+  resume-stepper clone *and* on the call's class matching the coroutine's detected
+  promise type (the class whose `initial_suspend` / `final_suspend` are called),
+  so ordinary functions and unrelated same-named methods are never rewritten.
+  `co_return` is treated as a faithful label, not a control-flow terminator — the
+  compiler's final-suspend lowering still executes after it.
+- **`co_await` suspend-point annotation.** A resume-stepper `if` whose branch
+  saves the resume index (`frame->__resume_index = N`), calls the awaiter's
+  `await_suspend`, and returns to suspend the actor is annotated with a
+  `// co_await <Awaiter>: suspends, resumes at state N` line naming the awaiter
+  type and resume state (e.g. `// co_await std::suspend_always: suspends, resumes
+  at state 2`). The state-machine structure is left intact — the `return` is real
+  control flow — so this recovers the suspend semantics as an annotation rather
+  than a control-flow-changing collapse. The recognizer requires both signals on
+  the same emitted straight-line path (Sequence-flattened, ignoring unreachable
+  tails and conditional-expression arms) and a genuine return-to-caller exit.
+
 ## [1.3.14] - 2026-06-29
 
 ### Decompiler — C++20 coroutine state-machine recovery
