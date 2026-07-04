@@ -1474,6 +1474,10 @@ impl Decompiler {
         } else {
             return None;
         };
+        // The resume-index `switch` reconstruction and `co_return` rendering only
+        // apply to the state-machine steppers (`.actor` / `.resume`); the
+        // `.destroy` / `.cleanup` partitions are frame teardown shown as-is.
+        let is_stepper = matches!(kind, "actor" | "resume");
         let mut lines = Vec::new();
         lines.push("// C++20 coroutine clone:".to_string());
         lines.push(format!(
@@ -1481,16 +1485,24 @@ impl Decompiler {
             kind, friendly
         ));
         lines.push("//   for a coroutine source function. Suspend/resume state lives".to_string());
-        lines.push(
-            "//   in the heap-allocated frame pointed to by the first parameter,".to_string(),
-        );
-        lines.push(
-            "//   dispatched by the recovered `switch (frame->__resume_index)`. The".to_string(),
-        );
-        lines.push(
-            "//   inlined promise protocol is rendered as `co_return` / `co_yield`;".to_string(),
-        );
-        lines.push("//   `co_await` suspend-point reconstruction is still deferred.".to_string());
+        if is_stepper {
+            lines.push(
+                "//   in the heap-allocated frame pointed to by the first parameter,".to_string(),
+            );
+            lines.push(
+                "//   dispatched by the recovered `switch (frame->__resume_index)`. The".to_string(),
+            );
+            lines.push(
+                "//   inlined promise `co_return` is rendered as the keyword; `co_await`".to_string(),
+            );
+            lines.push(
+                "//   / `co_yield` suspend-point reconstruction is still deferred.".to_string(),
+            );
+        } else {
+            lines.push(
+                "//   in the heap-allocated frame pointed to by the first parameter.".to_string(),
+            );
+        }
         Some(lines.join("\n"))
     }
 
@@ -3375,7 +3387,7 @@ mod tests {
         assert!(actor.contains("state-machine stepper"));
         assert!(actor.contains("__resume_index"));
         assert!(actor.contains("co_return"));
-        assert!(actor.contains("`co_await` suspend-point reconstruction is still deferred"));
+        assert!(actor.contains("suspend-point reconstruction is still deferred"));
 
         let destroy = Decompiler::generate_coroutine_header(
             "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .destroy]",
@@ -3383,6 +3395,10 @@ mod tests {
         .expect("destroy header");
         assert!(destroy.contains(".destroy partition"));
         assert!(destroy.contains("frame destructor"));
+        // The `.destroy` teardown partition has no recovered resume switch and no
+        // co_return rendering, so the header must not claim either.
+        assert!(!destroy.contains("__resume_index"));
+        assert!(!destroy.contains("co_return"));
 
         let cleanup = Decompiler::generate_coroutine_header("foo(foo()::Frame*) [clone .cleanup]")
             .expect("cleanup header");

@@ -1478,6 +1478,7 @@ impl PseudoCodeEmitter {
         if let ExprKind::Call { target, args } = &e.kind {
             if let Some(name) = self.resolved_call_target_name(target) {
                 if let Some((class, method)) = name.rsplit_once("::") {
+                    let method = Self::method_base_name(method);
                     if method == "initial_suspend" || method == "final_suspend" {
                         *out = Some(class.to_string());
                         return;
@@ -1568,7 +1569,7 @@ impl PseudoCodeEmitter {
         if !whitespace_insensitive_eq(class, promise_type) {
             return None;
         }
-        let method = &name[class.len() + 2..];
+        let method = Self::method_base_name(&name[class.len() + 2..]);
         // Method arities: `return_void(this)`, `return_value(this, v)`. Extra args
         // mean it isn't the promise method.
         match method {
@@ -1578,6 +1579,16 @@ impl PseudoCodeEmitter {
             }
             _ => None,
         }
+    }
+
+    /// The base method name with any template argument list stripped:
+    /// `return_value<int>` → `return_value`. Operator methods (which can legitimately
+    /// contain `<`) are left intact.
+    fn method_base_name(method: &str) -> &str {
+        if method.starts_with("operator") {
+            return method;
+        }
+        method.split_once('<').map_or(method, |(base, _)| base)
     }
 
     /// Whether an lvalue is a scratch register / compiler temp — the shape of a
@@ -14975,6 +14986,15 @@ int sum(int n, ...)
         assert_eq!(
             e.coroutine_keyword_for_statement(&rv).as_deref(),
             Some("co_return 5")
+        );
+        // A templated `return_value<int>` is the same promise pattern.
+        let rvt = coro_call(
+            "Gen::promise_type::return_value<int>",
+            vec![coro_recv(), Expr::int(8)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&rvt).as_deref(),
+            Some("co_return 8")
         );
         // yield_value returns an awaiter consumed by the following await sequence,
         // so it is NOT sugared here (deferred to co_await recovery).
