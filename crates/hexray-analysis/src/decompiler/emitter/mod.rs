@@ -1592,6 +1592,169 @@ impl PseudoCodeEmitter {
         }
     }
 
+    /// If `then_body` is a coroutine `co_await` suspend branch — it saves the
+    /// resume index (`frame->__resume_index = N`), calls the awaiter's
+    /// `await_suspend`, and exits (returns to suspend the actor) — return a
+    /// one-line annotation naming the awaiter and the resume state. Gated on the
+    /// coroutine-clone flag. The branch itself is left unchanged.
+    fn coroutine_suspend_annotation(&self, then_body: &[StructuredNode]) -> Option<String> {
+        if !self.coroutine_clone {
+            return None;
+        }
+        // Only the statements the emitter actually renders count: the prefix up to
+        // and including the first control exit (with `Sequence` wrappers flattened
+        // as `emit_node` does). Signals or exits in an unreachable tail are ignored.
+        let mut prefix: Vec<&StructuredNode> = Vec::new();
+        self.collect_emitted_prefix(then_body, &mut prefix);
+        // A suspend branch RETURNS to the caller (suspends the actor). A branch
+        // whose first control exit is break/continue/goto stays in the function —
+        // not a suspend.
+        if !prefix
+            .last()
+            .is_some_and(|n| self.exit_node_returns_to_caller(n))
+        {
+            return None;
+        }
+        let mut resume_state: Option<i128> = None;
+        let mut awaiter: Option<String> = None;
+        for node in &prefix {
+            self.scan_suspend_signals(node, &mut resume_state, &mut awaiter);
+        }
+        // Require BOTH the resume-index save and an await_suspend call so ordinary
+        // returning `if`s are never annotated.
+        let state = resume_state?;
+        let awaiter = awaiter?;
+        Some(format!(
+            "co_await {}: suspends, resumes at state {}",
+            awaiter, state
+        ))
+    }
+
+
+    /// Collect the nodes the emitter actually renders for a branch: everything up
+    /// to and including the FIRST control exit, with `Sequence` wrappers flattened
+    /// (as `emit_node` does). Returns whether a control exit was reached.
+    fn collect_emitted_prefix<'a>(
+        &self,
+        body: &'a [StructuredNode],
+        out: &mut Vec<&'a StructuredNode>,
+    ) -> bool {
+        for node in body {
+            if let StructuredNode::Sequence(inner) = node {
+                if self.collect_emitted_prefix(inner, out) {
+                    return true;
+                }
+                continue;
+            }
+            out.push(node);
+            if self.is_control_exit(node) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether a first-control-exit node leaves by returning to the caller (a
+    /// coroutine suspend returns from the actor). `break`/`continue`/`goto` or a
+    /// noreturn trap do not qualify.
+    fn exit_node_returns_to_caller(&self, node: &StructuredNode) -> bool {
+        match node {
+            StructuredNode::Return(_) => true,
+            StructuredNode::If {
+                then_body,
+                else_body: Some(else_body),
+                ..
+            } => self.branch_returns_to_caller(then_body) && self.branch_returns_to_caller(else_body),
+            _ => false,
+        }
+    }
+
+    /// Whether a branch's control flow leaves by returning to the caller.
+    fn branch_returns_to_caller(&self, body: &[StructuredNode]) -> bool {
+        let mut prefix: Vec<&StructuredNode> = Vec::new();
+        self.collect_emitted_prefix(body, &mut prefix);
+        prefix
+            .last()
+            .is_some_and(|n| self.exit_node_returns_to_caller(n))
+    }
+
+    /// Scan the STRAIGHT-LINE statements of a suspend branch for the two signals.
+    /// Deliberately does NOT descend into nested conditionals/loops: a real
+    /// `co_await` suspend saves the resume index and calls `await_suspend` on the
+    /// same straight-line path, so merging observations from different nested
+    /// branches would falsely annotate `if (x) { save } else { await_suspend }`.
+    fn scan_suspend_signals(
+        &self,
+        node: &StructuredNode,
+        resume_state: &mut Option<i128>,
+        awaiter: &mut Option<String>,
+    ) {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for s in statements {
+                    self.scan_suspend_signal_expr(s, resume_state, awaiter);
+                }
+            }
+            StructuredNode::Expr(e) | StructuredNode::Return(Some(e)) => {
+                self.scan_suspend_signal_expr(e, resume_state, awaiter)
+            }
+            StructuredNode::Sequence(nodes) => {
+                for n in nodes {
+                    self.scan_suspend_signals(n, resume_state, awaiter);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_suspend_signal_expr(
+        &self,
+        e: &Expr,
+        resume_state: &mut Option<i128>,
+        awaiter: &mut Option<String>,
+    ) {
+        match &e.kind {
+            ExprKind::Assign { lhs, rhs } => {
+                if resume_state.is_none() {
+                    if let ExprKind::FieldAccess { field_name, .. } = &lhs.kind {
+                        if field_name == "__resume_index" {
+                            if let ExprKind::IntLit(n) = &rhs.kind {
+                                *resume_state = Some(*n);
+                            }
+                        }
+                    }
+                }
+                // The await_suspend call may be assignment-wrapped
+                // (`ret_0 = awaiter.await_suspend(...)`); scan both sides.
+                self.scan_suspend_signal_expr(lhs, resume_state, awaiter);
+                self.scan_suspend_signal_expr(rhs, resume_state, awaiter);
+            }
+            ExprKind::Call { target, args } => {
+                if awaiter.is_none() {
+                    if let Some(name) = self.resolved_call_target_name(target) {
+                        if let Some((class, method)) = split_qualified_method(&name) {
+                            if Self::method_base_name(method) == "await_suspend" {
+                                *awaiter = Some(class.to_string());
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    self.scan_suspend_signal_expr(a, resume_state, awaiter);
+                }
+            }
+            // A conditional expression / phi represents mutually-exclusive paths;
+            // descending would merge the resume-index save from one arm with an
+            // await_suspend from the other, so don't scan into them.
+            ExprKind::Conditional { .. } | ExprKind::Phi(_) => {}
+            _ => {
+                for child in Self::expr_subexprs(e) {
+                    self.scan_suspend_signal_expr(child, resume_state, awaiter);
+                }
+            }
+        }
+    }
+
     /// The base method name with any template argument list stripped:
     /// `return_value<int>` → `return_value`. Operator methods (which can legitimately
     /// contain `<`) are left intact.
@@ -8873,6 +9036,11 @@ impl PseudoCodeEmitter {
                     (condition.clone(), then_body, else_body.as_ref())
                 };
 
+                // Coroutine `co_await` suspend point annotation (see emit_node).
+                if let Some(note) = self.coroutine_suspend_annotation(actual_then) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
+
                 writeln!(
                     output,
                     "{}if ({}) {{",
@@ -9051,6 +9219,11 @@ impl PseudoCodeEmitter {
                 } else {
                     (condition.clone(), then_body, else_body.as_ref())
                 };
+
+                // Coroutine `co_await` suspend point annotation (see emit_node).
+                if let Some(note) = self.coroutine_suspend_annotation(actual_then) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
 
                 writeln!(
                     output,
@@ -9344,6 +9517,11 @@ impl PseudoCodeEmitter {
                     self.format_condition_expr(condition)
                 )
                 .unwrap();
+                // Annotate a co_await suspend point carried by this `else if` arm,
+                // inside the branch.
+                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
+                    writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+                }
                 self.emit_nodes(then_body, output, depth + 1);
 
                 // Recursively handle nested else clauses
@@ -9354,6 +9532,10 @@ impl PseudoCodeEmitter {
 
         // Regular else block
         writeln!(output, "{}}} else {{", indent).unwrap();
+        // Annotate a co_await suspend point this `else` carries, inside the branch.
+        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
+            writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+        }
         self.emit_nodes(else_nodes, output, depth + 1);
     }
 
@@ -9395,6 +9577,12 @@ impl PseudoCodeEmitter {
                     self.format_condition_expr(condition)
                 )
                 .unwrap();
+                // Annotate a co_await suspend point carried by this `else if` arm,
+                // inside the branch so it attaches to the suspending body. Deeper
+                // chains are covered by the recursion below.
+                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
+                    writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+                }
                 self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
 
                 // Recursively handle nested else clauses
@@ -9405,6 +9593,11 @@ impl PseudoCodeEmitter {
 
         // Regular else block
         writeln!(output, "{}}} else {{", indent).unwrap();
+        // Annotate a co_await suspend point this `else` carries (the terminal
+        // `else` of an await_ready test or an else-if chain), inside the branch.
+        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
+            writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
+        }
         self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
     }
 
@@ -9809,6 +10002,14 @@ impl PseudoCodeEmitter {
                 } else {
                     (condition.clone(), then_body.clone(), else_body.clone())
                 };
+
+                // In a coroutine clone, mark a `co_await` suspend point: an `if`
+                // whose taken branch saves the resume index, calls `await_suspend`,
+                // and returns (suspends). The structure is left intact — that
+                // `return` is real state-machine control flow — but annotated.
+                if let Some(note) = self.coroutine_suspend_annotation(&actual_then) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
 
                 writeln!(
                     output,
@@ -15043,6 +15244,223 @@ int sum(int n, ...)
             vec![coro_recv(), Expr::int(7)],
         );
         assert_eq!(e.coroutine_keyword_for_statement(&yv), None);
+    }
+
+    fn suspend_then_body(state: i128) -> Vec<StructuredNode> {
+        vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![
+                    // frame->__resume_index = state;
+                    Expr::assign(
+                        Expr::field_access(coro_recv(), "__resume_index", 36),
+                        Expr::int(state),
+                    ),
+                    // awaiter.await_suspend(this, handle);
+                    coro_call(
+                        "std::suspend_always::await_suspend",
+                        vec![coro_recv(), coro_recv()],
+                    ),
+                ],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ]
+    }
+
+    #[test]
+    fn coroutine_suspend_point_is_annotated() {
+        let e = coro_emitter("Task::promise_type");
+        let note = e
+            .coroutine_suspend_annotation(&suspend_then_body(2))
+            .expect("annotation");
+        assert!(note.contains("co_await"), "{note}");
+        assert!(note.contains("std::suspend_always"), "{note}");
+        assert!(note.contains("state 2"), "{note}");
+
+        // Off outside coroutine clones.
+        let plain = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(plain.coroutine_suspend_annotation(&suspend_then_body(2)), None);
+
+        // An ordinary returning `if` (no resume-index save + await_suspend) is not
+        // annotated.
+        let plain_return = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::assign(
+                    Expr::var(super::super::expression::Variable::reg("rax", 8)),
+                    Expr::int(0),
+                )],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&plain_return), None);
+
+        // A resume-index save + await_suspend but NO exit (doesn't suspend) is not
+        // annotated.
+        let mut no_return = suspend_then_body(3);
+        no_return.pop(); // drop the Return
+        assert_eq!(e.coroutine_suspend_annotation(&no_return), None);
+
+        // Ending in `break` (local control flow, not a return-to-caller suspend)
+        // is not annotated.
+        let mut with_break = suspend_then_body(3);
+        with_break.pop();
+        with_break.push(StructuredNode::Break);
+        assert_eq!(e.coroutine_suspend_annotation(&with_break), None);
+
+        // A `break` before an UNREACHABLE trailing `return` still doesn't suspend
+        // (the first control exit is the break).
+        let mut break_then_return = suspend_then_body(3);
+        break_then_return.pop();
+        break_then_return.push(StructuredNode::Break);
+        break_then_return.push(StructuredNode::Return(None));
+        assert_eq!(e.coroutine_suspend_annotation(&break_then_return), None);
+
+        // A Sequence-wrapped suspend branch IS annotated (emit_node flattens it).
+        let seq = vec![StructuredNode::Sequence(suspend_then_body(6))];
+        let note = e.coroutine_suspend_annotation(&seq).expect("sequence suspend");
+        assert!(note.contains("state 6"), "{note}");
+
+        // Signals split across the two arms of a conditional expression
+        // (`cond ? save : await_suspend`) must NOT be merged.
+        let cond_split = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr {
+                    kind: ExprKind::Conditional {
+                        cond: Box::new(Expr::unknown("c")),
+                        then_expr: Box::new(Expr::assign(
+                            Expr::field_access(coro_recv(), "__resume_index", 36),
+                            Expr::int(2),
+                        )),
+                        else_expr: Box::new(coro_call(
+                            "std::suspend_always::await_suspend",
+                            vec![coro_recv(), coro_recv()],
+                        )),
+                    },
+                }],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&cond_split), None);
+
+        // Signals living only in an UNREACHABLE tail (after the emitted return) are
+        // ignored — the emitted prefix is just a plain block + return.
+        let unreachable_tail = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::unknown("plain")],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![
+                    Expr::assign(
+                        Expr::field_access(coro_recv(), "__resume_index", 36),
+                        Expr::int(9),
+                    ),
+                    coro_call(
+                        "std::suspend_always::await_suspend",
+                        vec![coro_recv(), coro_recv()],
+                    ),
+                ],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&unreachable_tail), None);
+
+        // Signals split across two nested branches (no single path has both) must
+        // NOT be annotated.
+        let split = vec![
+            StructuredNode::If {
+                condition: Expr::unknown("x"),
+                then_body: vec![
+                    StructuredNode::Block {
+                        id: hexray_core::BasicBlockId::new(0),
+                        statements: vec![Expr::assign(
+                            Expr::field_access(coro_recv(), "__resume_index", 36),
+                            Expr::int(2),
+                        )],
+                        address_range: (0, 0),
+                    },
+                    StructuredNode::Return(None),
+                ],
+                else_body: Some(vec![
+                    StructuredNode::Block {
+                        id: hexray_core::BasicBlockId::new(0),
+                        statements: vec![coro_call(
+                            "std::suspend_always::await_suspend",
+                            vec![coro_recv(), coro_recv()],
+                        )],
+                        address_range: (0, 0),
+                    },
+                    StructuredNode::Return(None),
+                ]),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&split), None);
+    }
+
+    #[test]
+    fn coroutine_suspend_point_annotated_in_else_if_chain() {
+        // if (a) { work } else if (!ready) { suspend }
+        // The suspend is the else-if arm; the note must attach to the `} else if`,
+        // not the outer `if (a)`.
+        let e = coro_emitter("Task::promise_type");
+        let outer = StructuredNode::If {
+            condition: Expr::unknown("a"),
+            then_body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::unknown("work")],
+                address_range: (0, 0),
+            }],
+            else_body: Some(vec![StructuredNode::If {
+                condition: Expr::unknown("not_ready"),
+                then_body: suspend_then_body(5),
+                else_body: None,
+            }]),
+        };
+        let mut out = String::new();
+        e.emit_node(&outer, &mut out, 0);
+        assert!(out.contains("co_await"), "{out}");
+        assert!(out.contains("state 5"), "{out}");
+        // The annotation is inside the `else if` arm (after its header), not the
+        // outer `if (a)`.
+        let note_pos = out.find("// co_await").unwrap();
+        let else_if_pos = out.find("} else if").unwrap();
+        assert!(note_pos > else_if_pos, "{out}");
+    }
+
+    #[test]
+    fn coroutine_suspend_point_annotated_in_else_arm() {
+        // `if (ready) { resume-path } else { suspend }` — the suspend arm is the
+        // terminal else; the note must attach to the `} else {`, not the `if`.
+        let e = coro_emitter("Task::promise_type");
+        let node = StructuredNode::If {
+            condition: Expr::unknown("ready"),
+            then_body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::unknown("resume_work")],
+                address_range: (0, 0),
+            }],
+            else_body: Some(suspend_then_body(4)),
+        };
+        let mut out = String::new();
+        e.emit_node(&node, &mut out, 0);
+        assert!(out.contains("co_await"), "{out}");
+        assert!(out.contains("state 4"), "{out}");
+        // Exactly one annotation (no duplicate from the main-if hook).
+        assert_eq!(out.matches("// co_await").count(), 1, "{out}");
+        // The note is inside the else branch (after its `} else {` header).
+        let note_pos = out.find("// co_await").unwrap();
+        let else_pos = out.find("} else").unwrap();
+        assert!(note_pos > else_pos, "{out}");
     }
 
     #[test]
