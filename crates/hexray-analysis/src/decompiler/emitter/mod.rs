@@ -407,6 +407,12 @@ pub struct PseudoCodeEmitter {
     /// inlined promise/awaiter protocol calls as source-level coroutine keywords
     /// (`co_return` / `co_yield`). Off for ordinary functions.
     coroutine_clone: bool,
+    /// The coroutine's promise type (the class whose `initial_suspend` /
+    /// `final_suspend` are called in this clone), detected at emit start when
+    /// `coroutine_clone` is set. `co_return` / `co_yield` sugar only fires on
+    /// `return_void` / `return_value` / `yield_value` calls of this exact class,
+    /// so an unrelated method that happens to share the name is never rewritten.
+    coroutine_promise_type: RefCell<Option<String>>,
     /// Type database for struct field access and function prototypes.
     type_database: Option<Arc<TypeDatabase>>,
     /// Constant database for magic number recognition.
@@ -741,6 +747,7 @@ impl PseudoCodeEmitter {
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
             coroutine_clone: false,
+            coroutine_promise_type: RefCell::new(None),
             type_database: None,
             constant_database: None,
             summary_database: None,
@@ -1355,19 +1362,167 @@ impl PseudoCodeEmitter {
     }
 
     /// Resolve a call target to its display name (demangled, signature-stripped),
-    /// mirroring the resolution used when formatting the call. `Direct` targets
-    /// are looked up in the symbol table by their computed address.
+    /// mirroring the resolution the formatter uses. For `Direct` targets the
+    /// call-site relocation is authoritative (preferred), then the symbol at the
+    /// computed target address.
     fn resolved_call_target_name(&self, target: &CallTarget) -> Option<String> {
         let raw: Option<String> = match target {
             CallTarget::Named(name) => Some(name.clone()),
-            CallTarget::Direct { target, .. } => self
-                .symbol_table
-                .as_ref()
-                .and_then(|table| table.get(*target))
-                .map(|name| name.to_string()),
+            CallTarget::Direct { target, call_site } => {
+                let from_reloc = self
+                    .relocation_table
+                    .as_ref()
+                    .and_then(|r| r.get(*call_site))
+                    .map(|n| n.to_string());
+                from_reloc.or_else(|| {
+                    self.symbol_table
+                        .as_ref()
+                        .and_then(|s| s.get(*target))
+                        .map(|n| n.to_string())
+                })
+            }
             CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => None,
         };
         raw.map(|name| self.format_call_target_name(&name))
+    }
+
+    /// The class qualifier of a `Class::method` name (everything before the final
+    /// `::`), or `None` for an unqualified name.
+    fn call_class_qualifier(name: &str) -> Option<&str> {
+        name.rsplit_once("::").map(|(class, _)| class)
+    }
+
+    /// Scan a coroutine clone body for its promise type: the class whose
+    /// `initial_suspend` / `final_suspend` (unambiguous promise-protocol methods)
+    /// are called. Returns the class qualifier of the first such call found.
+    fn detect_coroutine_promise_type(&self, nodes: &[StructuredNode]) -> Option<String> {
+        let mut out = None;
+        self.scan_promise_type_nodes(nodes, &mut out);
+        out
+    }
+
+    fn scan_promise_type_nodes(&self, nodes: &[StructuredNode], out: &mut Option<String>) {
+        for node in nodes {
+            if out.is_some() {
+                return;
+            }
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.scan_promise_type_expr(stmt, out);
+                    }
+                }
+                StructuredNode::Expr(e) | StructuredNode::Return(Some(e)) => {
+                    self.scan_promise_type_expr(e, out)
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    self.scan_promise_type_expr(condition, out);
+                    self.scan_promise_type_nodes(then_body, out);
+                    if let Some(b) = else_body {
+                        self.scan_promise_type_nodes(b, out);
+                    }
+                }
+                StructuredNode::While { condition, body, .. }
+                | StructuredNode::DoWhile { condition, body, .. } => {
+                    self.scan_promise_type_expr(condition, out);
+                    self.scan_promise_type_nodes(body, out);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(e) = init {
+                        self.scan_promise_type_expr(e, out);
+                    }
+                    self.scan_promise_type_expr(condition, out);
+                    if let Some(e) = update {
+                        self.scan_promise_type_expr(e, out);
+                    }
+                    self.scan_promise_type_nodes(body, out);
+                }
+                StructuredNode::Loop { body, .. } => self.scan_promise_type_nodes(body, out),
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, b) in cases {
+                        self.scan_promise_type_nodes(b, out);
+                    }
+                    if let Some(b) = default {
+                        self.scan_promise_type_nodes(b, out);
+                    }
+                }
+                StructuredNode::Sequence(inner) => self.scan_promise_type_nodes(inner, out),
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    self.scan_promise_type_nodes(try_body, out);
+                    for h in catch_handlers {
+                        self.scan_promise_type_nodes(&h.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_promise_type_expr(&self, e: &Expr, out: &mut Option<String>) {
+        if out.is_some() {
+            return;
+        }
+        if let ExprKind::Call { target, args } = &e.kind {
+            if let Some(name) = self.resolved_call_target_name(target) {
+                if let Some((class, method)) = name.rsplit_once("::") {
+                    if method == "initial_suspend" || method == "final_suspend" {
+                        *out = Some(class.to_string());
+                        return;
+                    }
+                }
+            }
+            for arg in args {
+                self.scan_promise_type_expr(arg, out);
+            }
+        }
+        for child in Self::expr_subexprs(e) {
+            self.scan_promise_type_expr(child, out);
+        }
+    }
+
+    /// The direct sub-expressions of `e` (for recursive scanning).
+    fn expr_subexprs(e: &Expr) -> Vec<&Expr> {
+        match &e.kind {
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => vec![left, right],
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => vec![operand],
+            ExprKind::ArrayAccess { base, index, .. } => vec![base, index],
+            ExprKind::FieldAccess { base, .. } => vec![base],
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => vec![cond, then_expr, else_expr],
+            ExprKind::Phi(values) => values.iter().collect(),
+            // Call args are scanned by the caller; the target sub-expr (for
+            // indirect calls) isn't a promise-method name source.
+            _ => Vec::new(),
+        }
     }
 
     /// In a coroutine clone, recognize an inlined promise-protocol call statement
@@ -1377,11 +1532,14 @@ impl PseudoCodeEmitter {
     ///   `<Promise>::yield_value(this, v)`     → `co_yield v`
     /// The call may be wrapped in a dead assignment of its (void) return register
     /// (`retN = <Promise>::return_void(this)`); that wrapper is dropped. Gated on
-    /// the coroutine-clone flag so ordinary functions are never affected.
+    /// the coroutine-clone flag AND on the call's class matching the coroutine's
+    /// detected promise type, so an unrelated same-named method is never rewritten.
     fn coroutine_keyword_for_statement(&self, expr: &Expr) -> Option<String> {
         if !self.coroutine_clone {
             return None;
         }
+        let promise_type = self.coroutine_promise_type.borrow();
+        let promise_type = promise_type.as_deref()?;
         // Unwrap a dead assignment of the call's return register.
         let call = match &expr.kind {
             ExprKind::Assign { rhs, .. } => rhs.as_ref(),
@@ -1391,20 +1549,20 @@ impl PseudoCodeEmitter {
             return None;
         };
         let name = self.resolved_call_target_name(target)?;
-        // Require a class-qualified method name (`Class::method`); a bare free
-        // function named `return_void` is not a coroutine promise method.
-        let method = name.rsplit("::").next()?;
-        if method.len() == name.len() {
+        // Require the call's class to be exactly the coroutine's promise type.
+        let class = Self::call_class_qualifier(&name)?;
+        if !whitespace_insensitive_eq(class, promise_type) {
             return None;
         }
+        let method = &name[class.len() + 2..];
+        // Method arities: `return_void(this)`, `return_value(this, v)`,
+        // `yield_value(this, v)`. Extra args mean it isn't the promise method.
         match method {
-            // return_void takes only the promise receiver — no returned value.
             "return_void" if args.len() == 1 => Some("co_return".to_string()),
-            // return_value / yield_value take (promise this, value).
-            "return_value" if args.len() >= 2 => {
+            "return_value" if args.len() == 2 => {
                 Some(format!("co_return {}", self.format_expr(&args[1])))
             }
-            "yield_value" if args.len() >= 2 => {
+            "yield_value" if args.len() == 2 => {
                 Some(format!("co_yield {}", self.format_expr(&args[1])))
             }
             _ => None,
@@ -6504,6 +6662,10 @@ impl PseudoCodeEmitter {
     /// Emits pseudo-code for a structured CFG.
     pub fn emit(&self, cfg: &StructuredCfg, func_name: &str) -> String {
         let mut output = String::new();
+        if self.coroutine_clone {
+            *self.coroutine_promise_type.borrow_mut() =
+                self.detect_coroutine_promise_type(&cfg.body);
+        }
         let is_main_like = matches!(func_name, "main" | "_main");
         let rename_main_param = |name: &str, idx: usize| -> String {
             if is_main_like {
@@ -6859,6 +7021,11 @@ impl PseudoCodeEmitter {
                 name.to_string()
             }
         };
+
+        if self.coroutine_clone {
+            *self.coroutine_promise_type.borrow_mut() =
+                self.detect_coroutine_promise_type(&cfg.body);
+        }
 
         let display_body = self.rewrite_small_aggregate_slots_for_emission(
             &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
@@ -14748,9 +14915,15 @@ int sum(int n, ...)
         Expr::var(super::super::expression::Variable::reg("rax", 8))
     }
 
+    fn coro_emitter(promise_type: &str) -> PseudoCodeEmitter {
+        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        *e.coroutine_promise_type.borrow_mut() = Some(promise_type.to_string());
+        e
+    }
+
     #[test]
     fn coroutine_return_void_renders_co_return() {
-        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        let e = coro_emitter("Task::promise_type");
         let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
         assert_eq!(
             e.coroutine_keyword_for_statement(&call).as_deref(),
@@ -14769,7 +14942,7 @@ int sum(int n, ...)
 
     #[test]
     fn coroutine_return_value_and_yield_value_render_keywords() {
-        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        let e = coro_emitter("Gen::promise_type");
         let rv = coro_call(
             "Gen::promise_type::return_value",
             vec![coro_recv(), Expr::int(5)],
@@ -14795,7 +14968,7 @@ int sum(int n, ...)
         let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
         assert_eq!(plain.coroutine_keyword_for_statement(&call), None);
 
-        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        let e = coro_emitter("Task::promise_type");
         // A bare free function named `return_void` (no class qualifier) is not a
         // promise method — not sugared.
         assert_eq!(
@@ -14812,6 +14985,15 @@ int sum(int n, ...)
             e.coroutine_keyword_for_statement(&coro_call(
                 "Task::promise_type::return_void",
                 vec![coro_recv(), Expr::int(1)]
+            )),
+            None
+        );
+        // A method of the RIGHT name but a DIFFERENT class than the promise type
+        // (e.g. an unrelated `Other::return_value(obj, v)`) is not rewritten.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call(
+                "Other::return_value",
+                vec![coro_recv(), Expr::int(9)]
             )),
             None
         );
