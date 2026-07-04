@@ -1602,9 +1602,12 @@ impl PseudoCodeEmitter {
         method.split_once('<').map_or(method, |(base, _)| base)
     }
 
-    /// Whether an lvalue is a scratch register / compiler temp — the shape of a
-    /// dead call-return-register assignment (safe to drop). A memory store or
-    /// named stack/global local is not, since it may be read elsewhere.
+    /// Whether an lvalue is the dead ABI return-register capture of a void call —
+    /// the only place a `void`-returning promise method's "result" artifactually
+    /// lands, so the assignment is safe to drop. This is either the structurer's
+    /// call-return temp (`ret` / `ret_N`) or an actual integer return register
+    /// (`rax`/`eax`/`x0`/…). A callee-saved register (`rbx`), an unrelated temp,
+    /// or any memory / named store is NOT eligible — it may be read later.
     fn is_scratch_return_register(lhs: &Expr) -> bool {
         matches!(
             &lhs.kind,
@@ -1612,7 +1615,9 @@ impl PseudoCodeEmitter {
                 if matches!(
                     v.kind,
                     super::expression::VarKind::Register(_) | super::expression::VarKind::Temp(_)
-                )
+                ) && (v.name == "ret"
+                    || v.name.starts_with("ret_")
+                    || crate::decompiler::abi::is_return_register(&v.name))
         )
     }
 
@@ -14983,9 +14988,10 @@ int sum(int n, ...)
             e.coroutine_keyword_for_statement(&call).as_deref(),
             Some("co_return")
         );
-        // The dead assignment of the void call's return register is unwrapped.
+        // The dead assignment of the void call's return-register capture is
+        // unwrapped (`ret_N` is the structurer's call-return temp).
         let wrapped = Expr::assign(
-            Expr::var(super::super::expression::Variable::reg("rdx", 8)),
+            Expr::var(super::super::expression::Variable::reg("ret_0", 8)),
             call,
         );
         assert_eq!(
@@ -15043,6 +15049,30 @@ int sum(int n, ...)
             call,
         );
         assert_eq!(e.coroutine_keyword_for_statement(&stack_store), None);
+
+        // A callee-saved register (rbx) is not a dead return-register capture, so
+        // its assignment is not dropped either.
+        let call2 = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        let rbx_store = Expr::assign(
+            Expr::var(super::super::expression::Variable::reg("rbx", 8)),
+            call2,
+        );
+        assert_eq!(e.coroutine_keyword_for_statement(&rbx_store), None);
+
+        // The structurer's call-return temp `ret_10` and the ABI return register
+        // `rax` ARE recognized as the dead capture.
+        for reg in ["ret_10", "rax"] {
+            let c = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+            let store = Expr::assign(
+                Expr::var(super::super::expression::Variable::reg(reg, 8)),
+                c,
+            );
+            assert_eq!(
+                e.coroutine_keyword_for_statement(&store).as_deref(),
+                Some("co_return"),
+                "reg {reg}"
+            );
+        }
     }
 
     #[test]
