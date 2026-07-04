@@ -9464,6 +9464,11 @@ impl PseudoCodeEmitter {
                     return;
                 }
 
+                // Annotate a co_await suspend point carried by this `else if` arm.
+                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
+
                 // Emit as "} else if (cond) {" on one line
                 writeln!(
                     output,
@@ -9513,6 +9518,13 @@ impl PseudoCodeEmitter {
                 // Skip stack canary checks in else-if
                 if self.is_guarded_stack_canary_branch(condition, then_body) {
                     return;
+                }
+
+                // Annotate a co_await suspend point carried by this `else if` arm
+                // (before the `} else if` line, so the note attaches to it and not
+                // the outer `if`). Deeper chains are covered by the recursion below.
+                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
                 }
 
                 // Emit as "} else if (cond) {" on one line
@@ -15271,6 +15283,36 @@ int sum(int n, ...)
             StructuredNode::Return(None),
         ];
         assert_eq!(e.coroutine_suspend_annotation(&split), None);
+    }
+
+    #[test]
+    fn coroutine_suspend_point_annotated_in_else_if_chain() {
+        // if (a) { work } else if (!ready) { suspend }
+        // The suspend is the else-if arm; the note must attach to the `} else if`,
+        // not the outer `if (a)`.
+        let e = coro_emitter("Task::promise_type");
+        let outer = StructuredNode::If {
+            condition: Expr::unknown("a"),
+            then_body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::unknown("work")],
+                address_range: (0, 0),
+            }],
+            else_body: Some(vec![StructuredNode::If {
+                condition: Expr::unknown("not_ready"),
+                then_body: suspend_then_body(5),
+                else_body: None,
+            }]),
+        };
+        let mut out = String::new();
+        e.emit_node(&outer, &mut out, 0);
+        assert!(out.contains("co_await"), "{out}");
+        assert!(out.contains("state 5"), "{out}");
+        // The annotation precedes the `} else if` line, not the outer `if (a)`.
+        let note_pos = out.find("// co_await").unwrap();
+        let else_if_pos = out.find("} else if").unwrap();
+        let outer_if_pos = out.find("if (a)").unwrap();
+        assert!(note_pos < else_if_pos && note_pos > outer_if_pos, "{out}");
     }
 
     #[test]
