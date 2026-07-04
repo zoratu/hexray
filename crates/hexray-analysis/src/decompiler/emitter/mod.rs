@@ -1743,6 +1743,10 @@ impl PseudoCodeEmitter {
                     self.scan_suspend_signal_expr(a, resume_state, awaiter);
                 }
             }
+            // A conditional expression / phi represents mutually-exclusive paths;
+            // descending would merge the resume-index save from one arm with an
+            // await_suspend from the other, so don't scan into them.
+            ExprKind::Conditional { .. } | ExprKind::Phi(_) => {}
             _ => {
                 for child in Self::expr_subexprs(e) {
                     self.scan_suspend_signal_expr(child, resume_state, awaiter);
@@ -15318,6 +15322,30 @@ int sum(int n, ...)
         let seq = vec![StructuredNode::Sequence(suspend_then_body(6))];
         let note = e.coroutine_suspend_annotation(&seq).expect("sequence suspend");
         assert!(note.contains("state 6"), "{note}");
+
+        // Signals split across the two arms of a conditional expression
+        // (`cond ? save : await_suspend`) must NOT be merged.
+        let cond_split = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr {
+                    kind: ExprKind::Conditional {
+                        cond: Box::new(Expr::unknown("c")),
+                        then_expr: Box::new(Expr::assign(
+                            Expr::field_access(coro_recv(), "__resume_index", 36),
+                            Expr::int(2),
+                        )),
+                        else_expr: Box::new(coro_call(
+                            "std::suspend_always::await_suspend",
+                            vec![coro_recv(), coro_recv()],
+                        )),
+                    },
+                }],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&cond_split), None);
 
         // Signals living only in an UNREACHABLE tail (after the emitted return) are
         // ignored — the emitted prefix is just a plain block + return.
