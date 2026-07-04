@@ -1676,6 +1676,10 @@ impl PseudoCodeEmitter {
                         }
                     }
                 }
+                // The await_suspend call may be assignment-wrapped
+                // (`ret_0 = awaiter.await_suspend(...)`); scan both sides.
+                self.scan_suspend_signal_expr(lhs, resume_state, awaiter);
+                self.scan_suspend_signal_expr(rhs, resume_state, awaiter);
             }
             ExprKind::Call { target, args } => {
                 if awaiter.is_none() {
@@ -8980,6 +8984,11 @@ impl PseudoCodeEmitter {
                     (condition.clone(), then_body, else_body.as_ref())
                 };
 
+                // Coroutine `co_await` suspend point annotation (see emit_node).
+                if let Some(note) = self.coroutine_suspend_annotation(actual_then) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
+
                 writeln!(
                     output,
                     "{}if ({}) {{",
@@ -9158,6 +9167,11 @@ impl PseudoCodeEmitter {
                 } else {
                     (condition.clone(), then_body, else_body.as_ref())
                 };
+
+                // Coroutine `co_await` suspend point annotation (see emit_node).
+                if let Some(note) = self.coroutine_suspend_annotation(actual_then) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
 
                 writeln!(
                     output,
