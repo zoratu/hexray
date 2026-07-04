@@ -1609,16 +1609,22 @@ impl PseudoCodeEmitter {
     /// (`rax`/`eax`/`x0`/…). A callee-saved register (`rbx`), an unrelated temp,
     /// or any memory / named store is NOT eligible — it may be read later.
     fn is_scratch_return_register(lhs: &Expr) -> bool {
-        matches!(
-            &lhs.kind,
+        // The capture appears either as a register/temp `Var` or as an
+        // `Unknown("ret_N")` textual placeholder (both forms occur in structured
+        // input); accept either, keyed on the return-register name.
+        let name = match &lhs.kind {
             ExprKind::Var(v)
                 if matches!(
                     v.kind,
                     super::expression::VarKind::Register(_) | super::expression::VarKind::Temp(_)
-                ) && (v.name == "ret"
-                    || v.name.starts_with("ret_")
-                    || crate::decompiler::abi::is_return_register(&v.name))
-        )
+                ) =>
+            {
+                v.name.as_str()
+            }
+            ExprKind::Unknown(name) => name.as_str(),
+            _ => return false,
+        };
+        name == "ret" || name.starts_with("ret_") || crate::decompiler::abi::is_return_register(name)
     }
 
     fn is_destructor_call_target(&self, target: &CallTarget) -> bool {
@@ -15073,6 +15079,14 @@ int sum(int n, ...)
                 "reg {reg}"
             );
         }
+
+        // The capture can also be a textual `Unknown("ret_0")` placeholder.
+        let c = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        let unknown_store = Expr::assign(Expr::unknown("ret_0"), c);
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&unknown_store).as_deref(),
+            Some("co_return")
+        );
     }
 
     #[test]
