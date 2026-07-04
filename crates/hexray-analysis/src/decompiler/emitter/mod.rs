@@ -1525,24 +1525,38 @@ impl PseudoCodeEmitter {
         }
     }
 
-    /// In a coroutine clone, recognize an inlined promise-protocol call statement
-    /// and render it as the source-level coroutine keyword it lowered from:
+    /// In a coroutine clone, recognize an inlined promise `co_return` lowering and
+    /// render it as the source-level keyword:
     ///   `<Promise>::return_void(this)`        → `co_return`
     ///   `<Promise>::return_value(this, v)`    → `co_return v`
-    ///   `<Promise>::yield_value(this, v)`     → `co_yield v`
-    /// The call may be wrapped in a dead assignment of its (void) return register
-    /// (`retN = <Promise>::return_void(this)`); that wrapper is dropped. Gated on
-    /// the coroutine-clone flag AND on the call's class matching the coroutine's
-    /// detected promise type, so an unrelated same-named method is never rewritten.
+    /// Both promise methods return `void`, so a wrapping assignment can only be of
+    /// the (dead) return register (`retN = <Promise>::return_void(this)`); that
+    /// wrapper is dropped, but only when its destination is a scratch register /
+    /// temp — never a memory or named store, which could be read later.
+    ///
+    /// `yield_value` is deliberately NOT handled here: it returns an *awaiter*
+    /// that the following `await_ready` / `await_suspend` statements consume, so
+    /// `co_yield` is part of the (still-deferred) co_await suspend-sequence
+    /// recovery, not a standalone dead-store statement.
+    ///
+    /// Gated on the coroutine-clone flag AND on the call's class matching the
+    /// coroutine's detected promise type, so an unrelated same-named method is
+    /// never rewritten.
     fn coroutine_keyword_for_statement(&self, expr: &Expr) -> Option<String> {
         if !self.coroutine_clone {
             return None;
         }
         let promise_type = self.coroutine_promise_type.borrow();
         let promise_type = promise_type.as_deref()?;
-        // Unwrap a dead assignment of the call's return register.
+        // Unwrap a dead assignment of the (void) call's return register only when
+        // the destination is a scratch register/temp.
         let call = match &expr.kind {
-            ExprKind::Assign { rhs, .. } => rhs.as_ref(),
+            ExprKind::Assign { lhs, rhs } => {
+                if !Self::is_scratch_return_register(lhs) {
+                    return None;
+                }
+                rhs.as_ref()
+            }
             _ => expr,
         };
         let ExprKind::Call { target, args } = &call.kind else {
@@ -1555,18 +1569,29 @@ impl PseudoCodeEmitter {
             return None;
         }
         let method = &name[class.len() + 2..];
-        // Method arities: `return_void(this)`, `return_value(this, v)`,
-        // `yield_value(this, v)`. Extra args mean it isn't the promise method.
+        // Method arities: `return_void(this)`, `return_value(this, v)`. Extra args
+        // mean it isn't the promise method.
         match method {
             "return_void" if args.len() == 1 => Some("co_return".to_string()),
             "return_value" if args.len() == 2 => {
                 Some(format!("co_return {}", self.format_expr(&args[1])))
             }
-            "yield_value" if args.len() == 2 => {
-                Some(format!("co_yield {}", self.format_expr(&args[1])))
-            }
             _ => None,
         }
+    }
+
+    /// Whether an lvalue is a scratch register / compiler temp — the shape of a
+    /// dead call-return-register assignment (safe to drop). A memory store or
+    /// named stack/global local is not, since it may be read elsewhere.
+    fn is_scratch_return_register(lhs: &Expr) -> bool {
+        matches!(
+            &lhs.kind,
+            ExprKind::Var(v)
+                if matches!(
+                    v.kind,
+                    super::expression::VarKind::Register(_) | super::expression::VarKind::Temp(_)
+                )
+        )
     }
 
     fn is_destructor_call_target(&self, target: &CallTarget) -> bool {
@@ -14941,7 +14966,7 @@ int sum(int n, ...)
     }
 
     #[test]
-    fn coroutine_return_value_and_yield_value_render_keywords() {
+    fn coroutine_return_value_renders_co_return_value() {
         let e = coro_emitter("Gen::promise_type");
         let rv = coro_call(
             "Gen::promise_type::return_value",
@@ -14951,14 +14976,25 @@ int sum(int n, ...)
             e.coroutine_keyword_for_statement(&rv).as_deref(),
             Some("co_return 5")
         );
+        // yield_value returns an awaiter consumed by the following await sequence,
+        // so it is NOT sugared here (deferred to co_await recovery).
         let yv = coro_call(
             "Gen::promise_type::yield_value",
             vec![coro_recv(), Expr::int(7)],
         );
-        assert_eq!(
-            e.coroutine_keyword_for_statement(&yv).as_deref(),
-            Some("co_yield 7")
+        assert_eq!(e.coroutine_keyword_for_statement(&yv), None);
+    }
+
+    #[test]
+    fn coroutine_keyword_only_unwraps_scratch_return_register() {
+        let e = coro_emitter("Task::promise_type");
+        let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        // A store into a named stack local (potentially read later) is NOT dropped.
+        let stack_store = Expr::assign(
+            Expr::var(super::super::expression::Variable::stack(-8, 8)),
+            call,
         );
+        assert_eq!(e.coroutine_keyword_for_statement(&stack_store), None);
     }
 
     #[test]
