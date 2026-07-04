@@ -402,6 +402,17 @@ pub struct PseudoCodeEmitter {
     calling_convention: CallingConvention,
     /// Whether to use advanced signature recovery.
     use_signature_recovery: bool,
+    /// Whether the function being emitted is a C++20 coroutine clone
+    /// (`.actor` / `.resume` / `.destroy` / `.cleanup`). Enables rendering the
+    /// inlined promise/awaiter protocol calls as source-level coroutine keywords
+    /// (`co_return` / `co_yield`). Off for ordinary functions.
+    coroutine_clone: bool,
+    /// The coroutine's promise type (the class whose `initial_suspend` /
+    /// `final_suspend` are called in this clone), detected at emit start when
+    /// `coroutine_clone` is set. `co_return` / `co_yield` sugar only fires on
+    /// `return_void` / `return_value` / `yield_value` calls of this exact class,
+    /// so an unrelated method that happens to share the name is never rewritten.
+    coroutine_promise_type: RefCell<Option<String>>,
     /// Type database for struct field access and function prototypes.
     type_database: Option<Arc<TypeDatabase>>,
     /// Constant database for magic number recognition.
@@ -735,6 +746,8 @@ impl PseudoCodeEmitter {
             naming_ctx: RefCell::new(NamingContext::new()),
             calling_convention: CallingConvention::default(),
             use_signature_recovery: true,
+            coroutine_clone: false,
+            coroutine_promise_type: RefCell::new(None),
             type_database: None,
             constant_database: None,
             summary_database: None,
@@ -1346,6 +1359,272 @@ impl PseudoCodeEmitter {
 
         Self::fold_terminal_tail_call_return(&mut rewritten, in_tail_return_path);
         rewritten
+    }
+
+    /// Resolve a call target to its display name (demangled, signature-stripped),
+    /// mirroring the resolution the formatter uses. For `Direct` targets the
+    /// call-site relocation is authoritative (preferred), then the symbol at the
+    /// computed target address.
+    fn resolved_call_target_name(&self, target: &CallTarget) -> Option<String> {
+        let raw: Option<String> = match target {
+            CallTarget::Named(name) => Some(name.clone()),
+            CallTarget::Direct { target, call_site } => {
+                let from_reloc = self
+                    .relocation_table
+                    .as_ref()
+                    .and_then(|r| r.get(*call_site))
+                    .map(|n| n.to_string());
+                from_reloc.or_else(|| {
+                    self.symbol_table
+                        .as_ref()
+                        .and_then(|s| s.get(*target))
+                        .map(|n| n.to_string())
+                })
+            }
+            // A GOT/PLT-routed call: resolve via the GOT relocation, then the
+            // symbol at the GOT address (mirrors the formatter).
+            CallTarget::IndirectGot { got_address, .. } => {
+                let from_got = self
+                    .relocation_table
+                    .as_ref()
+                    .and_then(|r| r.get_got(*got_address))
+                    .map(|n| n.to_string());
+                from_got.or_else(|| {
+                    self.symbol_table
+                        .as_ref()
+                        .and_then(|s| s.get(*got_address))
+                        .map(|n| n.to_string())
+                })
+            }
+            CallTarget::Indirect(_) => None,
+        };
+        raw.map(|name| self.format_call_target_name(&name))
+    }
+
+    /// Scan a coroutine clone body for its promise type: the class whose
+    /// `initial_suspend` / `final_suspend` (unambiguous promise-protocol methods)
+    /// are called. Returns the class qualifier of the first such call found.
+    fn detect_coroutine_promise_type(&self, nodes: &[StructuredNode]) -> Option<String> {
+        let mut out = None;
+        self.scan_promise_type_nodes(nodes, &mut out);
+        out
+    }
+
+    fn scan_promise_type_nodes(&self, nodes: &[StructuredNode], out: &mut Option<String>) {
+        for node in nodes {
+            if out.is_some() {
+                return;
+            }
+            match node {
+                StructuredNode::Block { statements, .. } => {
+                    for stmt in statements {
+                        self.scan_promise_type_expr(stmt, out);
+                    }
+                }
+                StructuredNode::Expr(e) | StructuredNode::Return(Some(e)) => {
+                    self.scan_promise_type_expr(e, out)
+                }
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    self.scan_promise_type_expr(condition, out);
+                    self.scan_promise_type_nodes(then_body, out);
+                    if let Some(b) = else_body {
+                        self.scan_promise_type_nodes(b, out);
+                    }
+                }
+                StructuredNode::While { condition, body, .. }
+                | StructuredNode::DoWhile { condition, body, .. } => {
+                    self.scan_promise_type_expr(condition, out);
+                    self.scan_promise_type_nodes(body, out);
+                }
+                StructuredNode::For {
+                    init,
+                    condition,
+                    update,
+                    body,
+                    ..
+                } => {
+                    if let Some(e) = init {
+                        self.scan_promise_type_expr(e, out);
+                    }
+                    self.scan_promise_type_expr(condition, out);
+                    if let Some(e) = update {
+                        self.scan_promise_type_expr(e, out);
+                    }
+                    self.scan_promise_type_nodes(body, out);
+                }
+                StructuredNode::Loop { body, .. } => self.scan_promise_type_nodes(body, out),
+                StructuredNode::Switch { cases, default, .. } => {
+                    for (_, b) in cases {
+                        self.scan_promise_type_nodes(b, out);
+                    }
+                    if let Some(b) = default {
+                        self.scan_promise_type_nodes(b, out);
+                    }
+                }
+                StructuredNode::Sequence(inner) => self.scan_promise_type_nodes(inner, out),
+                StructuredNode::TryCatch {
+                    try_body,
+                    catch_handlers,
+                } => {
+                    self.scan_promise_type_nodes(try_body, out);
+                    for h in catch_handlers {
+                        self.scan_promise_type_nodes(&h.body, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn scan_promise_type_expr(&self, e: &Expr, out: &mut Option<String>) {
+        if out.is_some() {
+            return;
+        }
+        if let ExprKind::Call { target, args } = &e.kind {
+            if let Some(name) = self.resolved_call_target_name(target) {
+                if let Some((class, method)) = split_qualified_method(&name) {
+                    let method = Self::method_base_name(method);
+                    if method == "initial_suspend" || method == "final_suspend" {
+                        *out = Some(class.to_string());
+                        return;
+                    }
+                }
+            }
+            for arg in args {
+                self.scan_promise_type_expr(arg, out);
+            }
+        }
+        for child in Self::expr_subexprs(e) {
+            self.scan_promise_type_expr(child, out);
+        }
+    }
+
+    /// The direct sub-expressions of `e` (for recursive scanning).
+    fn expr_subexprs(e: &Expr) -> Vec<&Expr> {
+        match &e.kind {
+            ExprKind::BinOp { left, right, .. }
+            | ExprKind::Assign {
+                lhs: left,
+                rhs: right,
+            }
+            | ExprKind::CompoundAssign {
+                lhs: left,
+                rhs: right,
+                ..
+            } => vec![left, right],
+            ExprKind::UnaryOp { operand, .. }
+            | ExprKind::Deref { addr: operand, .. }
+            | ExprKind::AddressOf(operand)
+            | ExprKind::Cast { expr: operand, .. }
+            | ExprKind::BitField { expr: operand, .. } => vec![operand],
+            ExprKind::ArrayAccess { base, index, .. } => vec![base, index],
+            ExprKind::FieldAccess { base, .. } => vec![base],
+            ExprKind::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => vec![cond, then_expr, else_expr],
+            ExprKind::Phi(values) => values.iter().collect(),
+            // Call args are scanned by the caller; the target sub-expr (for
+            // indirect calls) isn't a promise-method name source.
+            _ => Vec::new(),
+        }
+    }
+
+    /// In a coroutine clone, recognize an inlined promise `co_return` lowering and
+    /// render it as the source-level keyword:
+    ///   `<Promise>::return_void(this)`        → `co_return`
+    ///   `<Promise>::return_value(this, v)`    → `co_return v`
+    /// Both promise methods return `void`, so a wrapping assignment can only be of
+    /// the (dead) return register (`retN = <Promise>::return_void(this)`); that
+    /// wrapper is dropped, but only when its destination is a scratch register /
+    /// temp — never a memory or named store, which could be read later.
+    ///
+    /// `yield_value` is deliberately NOT handled here: it returns an *awaiter*
+    /// that the following `await_ready` / `await_suspend` statements consume, so
+    /// `co_yield` is part of the (still-deferred) co_await suspend-sequence
+    /// recovery, not a standalone dead-store statement.
+    ///
+    /// Gated on the coroutine-clone flag AND on the call's class matching the
+    /// coroutine's detected promise type, so an unrelated same-named method is
+    /// never rewritten.
+    fn coroutine_keyword_for_statement(&self, expr: &Expr) -> Option<String> {
+        if !self.coroutine_clone {
+            return None;
+        }
+        let promise_type = self.coroutine_promise_type.borrow();
+        let promise_type = promise_type.as_deref()?;
+        // Unwrap a dead assignment of the (void) call's return register only when
+        // the destination is a scratch register/temp.
+        let call = match &expr.kind {
+            ExprKind::Assign { lhs, rhs } => {
+                if !Self::is_scratch_return_register(lhs) {
+                    return None;
+                }
+                rhs.as_ref()
+            }
+            _ => expr,
+        };
+        let ExprKind::Call { target, args } = &call.kind else {
+            return None;
+        };
+        let name = self.resolved_call_target_name(target)?;
+        // Split at the top-level `::` (ignoring `::` inside template arguments such
+        // as `return_value<std::string>`); require the class to be exactly the
+        // coroutine's promise type.
+        let (class, method) = split_qualified_method(&name)?;
+        if !whitespace_insensitive_eq(class, promise_type) {
+            return None;
+        }
+        let method = Self::method_base_name(method);
+        // Method arities: `return_void(this)`, `return_value(this, v)`. Extra args
+        // mean it isn't the promise method.
+        match method {
+            "return_void" if args.len() == 1 => Some("co_return".to_string()),
+            "return_value" if args.len() == 2 => {
+                Some(format!("co_return {}", self.format_expr(&args[1])))
+            }
+            _ => None,
+        }
+    }
+
+    /// The base method name with any template argument list stripped:
+    /// `return_value<int>` → `return_value`. Operator methods (which can legitimately
+    /// contain `<`) are left intact.
+    fn method_base_name(method: &str) -> &str {
+        if method.starts_with("operator") {
+            return method;
+        }
+        method.split_once('<').map_or(method, |(base, _)| base)
+    }
+
+    /// Whether an lvalue is the dead ABI return-register capture of a void call —
+    /// the only place a `void`-returning promise method's "result" artifactually
+    /// lands, so the assignment is safe to drop. This is either the structurer's
+    /// call-return temp (`ret` / `ret_N`) or an actual integer return register
+    /// (`rax`/`eax`/`x0`/…). A callee-saved register (`rbx`), an unrelated temp,
+    /// or any memory / named store is NOT eligible — it may be read later.
+    fn is_scratch_return_register(lhs: &Expr) -> bool {
+        // The capture appears either as a register/temp `Var` or as an
+        // `Unknown("ret_N")` textual placeholder (both forms occur in structured
+        // input); accept either, keyed on the return-register name.
+        let name = match &lhs.kind {
+            ExprKind::Var(v)
+                if matches!(
+                    v.kind,
+                    super::expression::VarKind::Register(_) | super::expression::VarKind::Temp(_)
+                ) =>
+            {
+                v.name.as_str()
+            }
+            ExprKind::Unknown(name) => name.as_str(),
+            _ => return false,
+        };
+        name == "ret" || name.starts_with("ret_") || crate::decompiler::abi::is_return_register(name)
     }
 
     fn is_destructor_call_target(&self, target: &CallTarget) -> bool {
@@ -3497,6 +3776,13 @@ impl PseudoCodeEmitter {
     /// Enables or disables advanced signature recovery.
     pub fn with_signature_recovery(mut self, enabled: bool) -> Self {
         self.use_signature_recovery = enabled;
+        self
+    }
+
+    /// Marks the function as a C++20 coroutine clone, enabling coroutine-keyword
+    /// rendering (`co_return` / `co_yield`) for the inlined promise protocol.
+    pub fn with_coroutine_clone(mut self, is_clone: bool) -> Self {
+        self.coroutine_clone = is_clone;
         self
     }
 
@@ -6434,6 +6720,10 @@ impl PseudoCodeEmitter {
     /// Emits pseudo-code for a structured CFG.
     pub fn emit(&self, cfg: &StructuredCfg, func_name: &str) -> String {
         let mut output = String::new();
+        if self.coroutine_clone {
+            *self.coroutine_promise_type.borrow_mut() =
+                self.detect_coroutine_promise_type(&cfg.body);
+        }
         let is_main_like = matches!(func_name, "main" | "_main");
         let rename_main_param = |name: &str, idx: usize| -> String {
             if is_main_like {
@@ -6789,6 +7079,11 @@ impl PseudoCodeEmitter {
                 name.to_string()
             }
         };
+
+        if self.coroutine_clone {
+            *self.coroutine_promise_type.borrow_mut() =
+                self.detect_coroutine_promise_type(&cfg.body);
+        }
 
         let display_body = self.rewrite_small_aggregate_slots_for_emission(
             &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
@@ -8969,6 +9264,13 @@ impl PseudoCodeEmitter {
             writeln!(output, "{}{}", indent, comment).unwrap();
             return;
         }
+        // In a coroutine clone, render an inlined promise-protocol call as the
+        // `co_return` / `co_yield` keyword it lowered from (dropping any dead
+        // return-register assignment / inline declaration wrapping it).
+        if let Some(keyword) = self.coroutine_keyword_for_statement(expr) {
+            writeln!(output, "{}{};", indent, keyword).unwrap();
+            return;
+        }
         let expr_str = self.format_expr(expr);
 
         // Skip empty/nop statements and trivial literal statements
@@ -9133,6 +9435,13 @@ impl PseudoCodeEmitter {
                 then_exits && else_exits
             }
             // Check for noreturn function calls or recovered throw markers.
+            //
+            // A recovered `co_return` is deliberately NOT treated as a control
+            // exit: in the actor/resume state machine the promise `return_void` /
+            // `return_value` call it renders is followed by the compiler's
+            // final-suspend lowering, which still executes, so `co_return` here is
+            // a faithful label for that promise call — not a function terminator.
+            // Suppressing following statements would drop live code.
             StructuredNode::Expr(expr) => {
                 Self::is_noreturn_call(expr) || Self::is_throw_marker_expr(expr)
             }
@@ -9719,6 +10028,13 @@ impl PseudoCodeEmitter {
         let indent = self.indent.repeat(depth);
         if let Some(comment) = Self::opaque_x86_integer_simd_statement(expr) {
             writeln!(output, "{}{}", indent, comment).unwrap();
+            return;
+        }
+        // In a coroutine clone, render an inlined promise-protocol call as the
+        // `co_return` / `co_yield` keyword it lowered from (dropping any dead
+        // return-register assignment / inline declaration wrapping it).
+        if let Some(keyword) = self.coroutine_keyword_for_statement(expr) {
+            writeln!(output, "{}{};", indent, keyword).unwrap();
             return;
         }
         let expr_str = self.format_expr(expr);
@@ -14651,6 +14967,164 @@ int sum(int n, ...)
         let mut ti = HashMap::new();
         ti.insert(var.to_string(), ty.to_string());
         PseudoCodeEmitter::new("    ", false).with_type_info(ti)
+    }
+
+    fn coro_call(name: &str, args: Vec<Expr>) -> Expr {
+        Expr::call(
+            super::super::expression::CallTarget::Named(name.to_string()),
+            args,
+        )
+    }
+
+    fn coro_recv() -> Expr {
+        Expr::var(super::super::expression::Variable::reg("rax", 8))
+    }
+
+    fn coro_emitter(promise_type: &str) -> PseudoCodeEmitter {
+        let e = PseudoCodeEmitter::new("    ", false).with_coroutine_clone(true);
+        *e.coroutine_promise_type.borrow_mut() = Some(promise_type.to_string());
+        e
+    }
+
+    #[test]
+    fn coroutine_return_void_renders_co_return() {
+        let e = coro_emitter("Task::promise_type");
+        let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&call).as_deref(),
+            Some("co_return")
+        );
+        // The dead assignment of the void call's return-register capture is
+        // unwrapped (`ret_N` is the structurer's call-return temp).
+        let wrapped = Expr::assign(
+            Expr::var(super::super::expression::Variable::reg("ret_0", 8)),
+            call,
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&wrapped).as_deref(),
+            Some("co_return")
+        );
+    }
+
+    #[test]
+    fn coroutine_return_value_renders_co_return_value() {
+        let e = coro_emitter("Gen::promise_type");
+        let rv = coro_call(
+            "Gen::promise_type::return_value",
+            vec![coro_recv(), Expr::int(5)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&rv).as_deref(),
+            Some("co_return 5")
+        );
+        // A templated `return_value<int>` is the same promise pattern.
+        let rvt = coro_call(
+            "Gen::promise_type::return_value<int>",
+            vec![coro_recv(), Expr::int(8)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&rvt).as_deref(),
+            Some("co_return 8")
+        );
+        // A namespaced template instantiation must split at the top-level `::`,
+        // not the one inside `<std::string>`.
+        let rvn = coro_call(
+            "Gen::promise_type::return_value<std::string>",
+            vec![coro_recv(), Expr::int(3)],
+        );
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&rvn).as_deref(),
+            Some("co_return 3")
+        );
+        // yield_value returns an awaiter consumed by the following await sequence,
+        // so it is NOT sugared here (deferred to co_await recovery).
+        let yv = coro_call(
+            "Gen::promise_type::yield_value",
+            vec![coro_recv(), Expr::int(7)],
+        );
+        assert_eq!(e.coroutine_keyword_for_statement(&yv), None);
+    }
+
+    #[test]
+    fn coroutine_keyword_only_unwraps_scratch_return_register() {
+        let e = coro_emitter("Task::promise_type");
+        let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        // A store into a named stack local (potentially read later) is NOT dropped.
+        let stack_store = Expr::assign(
+            Expr::var(super::super::expression::Variable::stack(-8, 8)),
+            call,
+        );
+        assert_eq!(e.coroutine_keyword_for_statement(&stack_store), None);
+
+        // A callee-saved register (rbx) is not a dead return-register capture, so
+        // its assignment is not dropped either.
+        let call2 = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        let rbx_store = Expr::assign(
+            Expr::var(super::super::expression::Variable::reg("rbx", 8)),
+            call2,
+        );
+        assert_eq!(e.coroutine_keyword_for_statement(&rbx_store), None);
+
+        // The structurer's call-return temp `ret_10` and the ABI return register
+        // `rax` ARE recognized as the dead capture.
+        for reg in ["ret_10", "rax"] {
+            let c = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+            let store = Expr::assign(
+                Expr::var(super::super::expression::Variable::reg(reg, 8)),
+                c,
+            );
+            assert_eq!(
+                e.coroutine_keyword_for_statement(&store).as_deref(),
+                Some("co_return"),
+                "reg {reg}"
+            );
+        }
+
+        // The capture can also be a textual `Unknown("ret_0")` placeholder.
+        let c = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        let unknown_store = Expr::assign(Expr::unknown("ret_0"), c);
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&unknown_store).as_deref(),
+            Some("co_return")
+        );
+    }
+
+    #[test]
+    fn coroutine_keyword_is_gated_and_scoped() {
+        // Off outside coroutine clones.
+        let plain = PseudoCodeEmitter::new("    ", false);
+        let call = coro_call("Task::promise_type::return_void", vec![coro_recv()]);
+        assert_eq!(plain.coroutine_keyword_for_statement(&call), None);
+
+        let e = coro_emitter("Task::promise_type");
+        // A bare free function named `return_void` (no class qualifier) is not a
+        // promise method — not sugared.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call("return_void", vec![coro_recv()])),
+            None
+        );
+        // An unrelated method is untouched.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call("Foo::bar", vec![coro_recv()])),
+            None
+        );
+        // return_void with an unexpected extra arg (not a lone receiver) declines.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call(
+                "Task::promise_type::return_void",
+                vec![coro_recv(), Expr::int(1)]
+            )),
+            None
+        );
+        // A method of the RIGHT name but a DIFFERENT class than the promise type
+        // (e.g. an unrelated `Other::return_value(obj, v)`) is not rewritten.
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&coro_call(
+                "Other::return_value",
+                vec![coro_recv(), Expr::int(9)]
+            )),
+            None
+        );
     }
 
     fn this_arg(var: &str) -> Vec<Expr> {
