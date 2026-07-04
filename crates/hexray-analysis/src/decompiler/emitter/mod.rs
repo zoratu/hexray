@@ -1602,8 +1602,9 @@ impl PseudoCodeEmitter {
             return None;
         }
         // A suspend branch RETURNS to the caller (suspends the actor). A branch
-        // ending in break/continue/goto stays in the function — not a suspend.
-        if !Self::body_ends_with_return(then_body) {
+        // whose first control exit is break/continue/goto stays in the function —
+        // not a suspend.
+        if !self.branch_returns_to_caller(then_body) {
             return None;
         }
         let mut resume_state: Option<i128> = None;
@@ -1622,19 +1623,32 @@ impl PseudoCodeEmitter {
     }
 
 
-    /// Whether a branch ends by returning to the caller (a coroutine suspend
-    /// returns from the actor). A trailing break/continue/goto is local control
-    /// flow, not a suspend, so it does not qualify.
-    fn body_ends_with_return(body: &[StructuredNode]) -> bool {
-        match body.last() {
-            Some(StructuredNode::Return(_)) => true,
-            Some(StructuredNode::If {
-                then_body,
-                else_body: Some(else_body),
-                ..
-            }) => Self::body_ends_with_return(then_body) && Self::body_ends_with_return(else_body),
-            _ => false,
+    /// Whether a branch's control flow leaves by returning to the caller (a
+    /// coroutine suspend returns from the actor). Bases the decision on the FIRST
+    /// control exit reached (as the emitter does), not the final node — so a
+    /// `break`/`continue`/`goto` (or a noreturn trap) followed by an unreachable
+    /// trailing `return` does NOT qualify.
+    fn branch_returns_to_caller(&self, body: &[StructuredNode]) -> bool {
+        for node in body {
+            if !self.is_control_exit(node) {
+                continue;
+            }
+            return match node {
+                StructuredNode::Return(_) => true,
+                StructuredNode::If {
+                    then_body,
+                    else_body: Some(else_body),
+                    ..
+                } => {
+                    self.branch_returns_to_caller(then_body)
+                        && self.branch_returns_to_caller(else_body)
+                }
+                // break / continue / goto, or a Block ending in a noreturn call —
+                // none return to the caller.
+                _ => false,
+            };
         }
+        false
     }
 
     /// Scan the STRAIGHT-LINE statements of a suspend branch for the two signals.
@@ -15264,6 +15278,14 @@ int sum(int n, ...)
         with_break.pop();
         with_break.push(StructuredNode::Break);
         assert_eq!(e.coroutine_suspend_annotation(&with_break), None);
+
+        // A `break` before an UNREACHABLE trailing `return` still doesn't suspend
+        // (the first control exit is the break).
+        let mut break_then_return = suspend_then_body(3);
+        break_then_return.pop();
+        break_then_return.push(StructuredNode::Break);
+        break_then_return.push(StructuredNode::Return(None));
+        assert_eq!(e.coroutine_suspend_annotation(&break_then_return), None);
 
         // Signals split across two nested branches (no single path has both) must
         // NOT be annotated.
