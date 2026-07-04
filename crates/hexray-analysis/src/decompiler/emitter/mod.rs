@@ -1620,18 +1620,6 @@ impl PseudoCodeEmitter {
         ))
     }
 
-    /// The suspend annotation for either arm of an `if` — the suspend branch may
-    /// be the `then` (`if (!ready) { suspend }`) or the `else`
-    /// (`if (ready) { ... } else { suspend }`), depending on how the compiler laid
-    /// out the `await_ready` test.
-    fn coroutine_suspend_annotation_for_if(
-        &self,
-        then_body: &[StructuredNode],
-        else_body: Option<&[StructuredNode]>,
-    ) -> Option<String> {
-        self.coroutine_suspend_annotation(then_body)
-            .or_else(|| else_body.and_then(|e| self.coroutine_suspend_annotation(e)))
-    }
 
     /// Scan the STRAIGHT-LINE statements of a suspend branch for the two signals.
     /// Deliberately does NOT descend into nested conditionals/loops: a real
@@ -8988,9 +8976,7 @@ impl PseudoCodeEmitter {
                 };
 
                 // Coroutine `co_await` suspend point annotation (see emit_node).
-                if let Some(note) = self
-                    .coroutine_suspend_annotation_for_if(actual_then, actual_else.map(|v| v.as_slice()))
-                {
+                if let Some(note) = self.coroutine_suspend_annotation(actual_then) {
                     writeln!(output, "{}// {}", indent, note).unwrap();
                 }
 
@@ -9174,9 +9160,7 @@ impl PseudoCodeEmitter {
                 };
 
                 // Coroutine `co_await` suspend point annotation (see emit_node).
-                if let Some(note) = self
-                    .coroutine_suspend_annotation_for_if(actual_then, actual_else.map(|v| v.as_slice()))
-                {
+                if let Some(note) = self.coroutine_suspend_annotation(actual_then) {
                     writeln!(output, "{}// {}", indent, note).unwrap();
                 }
 
@@ -9485,7 +9469,10 @@ impl PseudoCodeEmitter {
             }
         }
 
-        // Regular else block
+        // Regular else block — annotate a co_await suspend point it carries.
+        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
+            writeln!(output, "{}// {}", indent, note).unwrap();
+        }
         writeln!(output, "{}}} else {{", indent).unwrap();
         self.emit_nodes(else_nodes, output, depth + 1);
     }
@@ -9543,7 +9530,11 @@ impl PseudoCodeEmitter {
             }
         }
 
-        // Regular else block
+        // Regular else block — annotate a co_await suspend point it carries
+        // (the terminal `else` of an await_ready test, or of an else-if chain).
+        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
+            writeln!(output, "{}// {}", indent, note).unwrap();
+        }
         writeln!(output, "{}}} else {{", indent).unwrap();
         self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
     }
@@ -9954,9 +9945,7 @@ impl PseudoCodeEmitter {
                 // whose taken branch saves the resume index, calls `await_suspend`,
                 // and returns (suspends). The structure is left intact — that
                 // `return` is real state-machine control flow — but annotated.
-                if let Some(note) =
-                    self.coroutine_suspend_annotation_for_if(&actual_then, actual_else.as_deref())
-                {
+                if let Some(note) = self.coroutine_suspend_annotation(&actual_then) {
                     writeln!(output, "{}// {}", indent, note).unwrap();
                 }
 
@@ -15318,18 +15307,27 @@ int sum(int n, ...)
     #[test]
     fn coroutine_suspend_point_annotated_in_else_arm() {
         // `if (ready) { resume-path } else { suspend }` — the suspend arm is the
-        // else, so the whole-if helper must still find it.
+        // terminal else; the note must attach to the `} else {`, not the `if`.
         let e = coro_emitter("Task::promise_type");
-        let ready_path = vec![StructuredNode::Block {
-            id: hexray_core::BasicBlockId::new(0),
-            statements: vec![Expr::unknown("resume_work")],
-            address_range: (0, 0),
-        }];
-        let note = e
-            .coroutine_suspend_annotation_for_if(&ready_path, Some(&suspend_then_body(4)))
-            .expect("else-arm annotation");
-        assert!(note.contains("co_await"), "{note}");
-        assert!(note.contains("state 4"), "{note}");
+        let node = StructuredNode::If {
+            condition: Expr::unknown("ready"),
+            then_body: vec![StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::unknown("resume_work")],
+                address_range: (0, 0),
+            }],
+            else_body: Some(suspend_then_body(4)),
+        };
+        let mut out = String::new();
+        e.emit_node(&node, &mut out, 0);
+        assert!(out.contains("co_await"), "{out}");
+        assert!(out.contains("state 4"), "{out}");
+        // Exactly one annotation (no duplicate from the main-if hook).
+        assert_eq!(out.matches("// co_await").count(), 1, "{out}");
+        let note_pos = out.find("// co_await").unwrap();
+        let else_pos = out.find("} else").unwrap();
+        let if_pos = out.find("if (ready)").unwrap();
+        assert!(note_pos < else_pos && note_pos > if_pos, "{out}");
     }
 
     #[test]
