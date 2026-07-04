@@ -9408,15 +9408,29 @@ impl PseudoCodeEmitter {
                     .is_some_and(|body| self.body_ends_with_control_exit(body));
                 then_exits && else_exits
             }
-            // Check for noreturn function calls or recovered throw markers.
+            // Check for noreturn function calls, recovered throw markers, or a
+            // recovered `co_return` (the coroutine returns; no synthetic trailing
+            // `return` should be appended after it).
             StructuredNode::Expr(expr) => {
-                Self::is_noreturn_call(expr) || Self::is_throw_marker_expr(expr)
+                Self::is_noreturn_call(expr)
+                    || Self::is_throw_marker_expr(expr)
+                    || self.stmt_renders_as_co_return(expr)
             }
-            StructuredNode::Block { statements, .. } => statements
-                .last()
-                .is_some_and(|s| Self::is_noreturn_call(s) || Self::is_throw_marker_expr(s)),
+            StructuredNode::Block { statements, .. } => statements.last().is_some_and(|s| {
+                Self::is_noreturn_call(s)
+                    || Self::is_throw_marker_expr(s)
+                    || self.stmt_renders_as_co_return(s)
+            }),
             _ => false,
         }
+    }
+
+    /// Whether a statement renders as a `co_return` in a coroutine clone (so it
+    /// terminates the coroutine's control flow for emission purposes). `co_yield`
+    /// / `co_await` are NOT terminators, so this only matches `co_return`.
+    fn stmt_renders_as_co_return(&self, expr: &Expr) -> bool {
+        self.coroutine_keyword_for_statement(expr)
+            .is_some_and(|kw| kw == "co_return" || kw.starts_with("co_return "))
     }
 
     /// Recognise the recovered-throw `Expr::unknown` shapes (cold-clone

@@ -70,6 +70,13 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
     }
 }
 
+/// Whether a (recovered) body contains the resume-index `switch` — i.e. the
+/// dispatch reconstruction actually fired. Used to keep the coroutine header from
+/// claiming a recovered switch on steppers where the pass declined.
+pub fn body_has_resume_switch(nodes: &[StructuredNode]) -> bool {
+    contains_resume_switch(nodes)
+}
+
 /// True if the body contains a `switch` whose value is the recovered
 /// `frame->__resume_index` field (i.e. this pass flattened a dispatch).
 fn contains_resume_switch(nodes: &[StructuredNode]) -> bool {

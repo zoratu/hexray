@@ -1355,15 +1355,22 @@ impl Decompiler {
         // Step 5b: In a C++ coroutine resume-stepper clone (gcc `.actor`, clang
         // `.resume`), reconstruct the `frame->__resume_index` state dispatch into
         // a `switch`. Gated on the clone name so ordinary functions are untouched.
-        let structured = if coroutine::is_coroutine_resume_clone(&display_name)
+        let (structured, resume_switch_recovered) = if coroutine::is_coroutine_resume_clone(
+            &display_name,
+        )
             || coroutine::is_coroutine_resume_clone(func_name)
         {
-            StructuredCfg {
-                body: coroutine::recover_resume_dispatch(structured.body),
-                cfg_entry: structured.cfg_entry,
-            }
+            let body = coroutine::recover_resume_dispatch(structured.body);
+            let recovered = coroutine::body_has_resume_switch(&body);
+            (
+                StructuredCfg {
+                    body,
+                    cfg_entry: structured.cfg_entry,
+                },
+                recovered,
+            )
         } else {
-            structured
+            (structured, false)
         };
 
         // Step 6: Emit pseudo-code
@@ -1447,7 +1454,9 @@ impl Decompiler {
         // partition. Tells the user upfront that they're looking at a
         // state-machine body rather than the source coroutine, and
         // points at the deferral for the rest.
-        if let Some(coro_header) = Self::generate_coroutine_header(&display_name) {
+        if let Some(coro_header) =
+            Self::generate_coroutine_header(&display_name, resume_switch_recovered)
+        {
             output.push_str(&coro_header);
             output.push('\n');
         }
@@ -1467,7 +1476,7 @@ impl Decompiler {
     /// post-v1.3.8 roadmap); for now the header simply makes the
     /// shape explicit and points downstream readers at the deferral
     /// so they don't mistake the state-machine body for the source.
-    fn generate_coroutine_header(display_name: &str) -> Option<String> {
+    fn generate_coroutine_header(display_name: &str, resume_switch_recovered: bool) -> Option<String> {
         let (kind, friendly) = if display_name.contains("[clone .actor]") {
             ("actor", "state-machine stepper")
         } else if display_name.contains("[clone .resume]") {
@@ -1481,9 +1490,9 @@ impl Decompiler {
             return None;
         };
         // The resume-index `switch` reconstruction and `co_return` rendering only
-        // apply to the state-machine steppers (`.actor` / `.resume`); the
+        // apply to the state-machine steppers (`.actor` / `.resume`), and only
+        // when the dispatch actually flattened (`resume_switch_recovered`); the
         // `.destroy` / `.cleanup` partitions are frame teardown shown as-is.
-        let is_stepper = matches!(kind, "actor" | "resume");
         let mut lines = Vec::new();
         lines.push("// C++20 coroutine clone:".to_string());
         lines.push(format!(
@@ -1491,7 +1500,7 @@ impl Decompiler {
             kind, friendly
         ));
         lines.push("//   for a coroutine source function. Suspend/resume state lives".to_string());
-        if is_stepper {
+        if resume_switch_recovered {
             lines.push(
                 "//   in the heap-allocated frame pointed to by the first parameter,".to_string(),
             );
@@ -3387,6 +3396,7 @@ mod tests {
         // all.
         let actor = Decompiler::generate_coroutine_header(
             "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .actor]",
+            true,
         )
         .expect("actor header");
         assert!(actor.contains(".actor partition"));
@@ -3395,8 +3405,19 @@ mod tests {
         assert!(actor.contains("co_return"));
         assert!(actor.contains("suspend-point reconstruction is still deferred"));
 
+        // A stepper where the resume switch did NOT recover must not claim it.
+        let actor_declined = Decompiler::generate_coroutine_header(
+            "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .actor]",
+            false,
+        )
+        .expect("actor header");
+        assert!(actor_declined.contains(".actor partition"));
+        assert!(!actor_declined.contains("__resume_index"));
+        assert!(!actor_declined.contains("co_return"));
+
         let destroy = Decompiler::generate_coroutine_header(
             "simple_coro(simple_coro(int)::_Z11simple_coroi.Frame*) [clone .destroy]",
+            false,
         )
         .expect("destroy header");
         assert!(destroy.contains(".destroy partition"));
@@ -3406,19 +3427,20 @@ mod tests {
         assert!(!destroy.contains("__resume_index"));
         assert!(!destroy.contains("co_return"));
 
-        let cleanup = Decompiler::generate_coroutine_header("foo(foo()::Frame*) [clone .cleanup]")
-            .expect("cleanup header");
+        let cleanup =
+            Decompiler::generate_coroutine_header("foo(foo()::Frame*) [clone .cleanup]", false)
+                .expect("cleanup header");
         assert!(cleanup.contains(".cleanup partition"));
         assert!(cleanup.contains("early-cleanup partition"));
 
         assert!(
-            Decompiler::generate_coroutine_header("ordinary_function(int)").is_none(),
+            Decompiler::generate_coroutine_header("ordinary_function(int)", false).is_none(),
             "non-coroutine names must not trigger the coroutine header"
         );
         // `[clone .cold]` is a gcc cold-clone partition (unrelated to
         // coroutines) — must not match.
         assert!(
-            Decompiler::generate_coroutine_header("foo(int) [clone .cold]").is_none(),
+            Decompiler::generate_coroutine_header("foo(int) [clone .cold]", false).is_none(),
             "the cold-clone partition is not a coroutine clone"
         );
     }
