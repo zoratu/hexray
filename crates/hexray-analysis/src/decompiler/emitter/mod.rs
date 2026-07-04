@@ -1381,7 +1381,22 @@ impl PseudoCodeEmitter {
                         .map(|n| n.to_string())
                 })
             }
-            CallTarget::Indirect(_) | CallTarget::IndirectGot { .. } => None,
+            // A GOT/PLT-routed call: resolve via the GOT relocation, then the
+            // symbol at the GOT address (mirrors the formatter).
+            CallTarget::IndirectGot { got_address, .. } => {
+                let from_got = self
+                    .relocation_table
+                    .as_ref()
+                    .and_then(|r| r.get_got(*got_address))
+                    .map(|n| n.to_string());
+                from_got.or_else(|| {
+                    self.symbol_table
+                        .as_ref()
+                        .and_then(|s| s.get(*got_address))
+                        .map(|n| n.to_string())
+                })
+            }
+            CallTarget::Indirect(_) => None,
         };
         raw.map(|name| self.format_call_target_name(&name))
     }
