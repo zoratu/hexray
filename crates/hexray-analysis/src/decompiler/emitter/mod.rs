@@ -1592,6 +1592,113 @@ impl PseudoCodeEmitter {
         }
     }
 
+    /// If `then_body` is a coroutine `co_await` suspend branch — it saves the
+    /// resume index (`frame->__resume_index = N`), calls the awaiter's
+    /// `await_suspend`, and exits (returns to suspend the actor) — return a
+    /// one-line annotation naming the awaiter and the resume state. Gated on the
+    /// coroutine-clone flag. The branch itself is left unchanged.
+    fn coroutine_suspend_annotation(&self, then_body: &[StructuredNode]) -> Option<String> {
+        if !self.coroutine_clone {
+            return None;
+        }
+        // A suspend branch returns (suspends the coroutine actor).
+        if !self.body_ends_with_control_exit(then_body) {
+            return None;
+        }
+        let mut resume_state: Option<i128> = None;
+        let mut awaiter: Option<String> = None;
+        for node in then_body {
+            self.scan_suspend_signals(node, &mut resume_state, &mut awaiter);
+        }
+        // Require BOTH the resume-index save and an await_suspend call so ordinary
+        // returning `if`s are never annotated.
+        let state = resume_state?;
+        let awaiter = awaiter?;
+        Some(format!(
+            "co_await {}: suspends, resumes at state {}",
+            awaiter, state
+        ))
+    }
+
+    fn scan_suspend_signals(
+        &self,
+        node: &StructuredNode,
+        resume_state: &mut Option<i128>,
+        awaiter: &mut Option<String>,
+    ) {
+        match node {
+            StructuredNode::Block { statements, .. } => {
+                for s in statements {
+                    self.scan_suspend_signal_expr(s, resume_state, awaiter);
+                }
+            }
+            StructuredNode::Expr(e) | StructuredNode::Return(Some(e)) => {
+                self.scan_suspend_signal_expr(e, resume_state, awaiter)
+            }
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                self.scan_suspend_signal_expr(condition, resume_state, awaiter);
+                for n in then_body {
+                    self.scan_suspend_signals(n, resume_state, awaiter);
+                }
+                if let Some(b) = else_body {
+                    for n in b {
+                        self.scan_suspend_signals(n, resume_state, awaiter);
+                    }
+                }
+            }
+            StructuredNode::Sequence(nodes) => {
+                for n in nodes {
+                    self.scan_suspend_signals(n, resume_state, awaiter);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn scan_suspend_signal_expr(
+        &self,
+        e: &Expr,
+        resume_state: &mut Option<i128>,
+        awaiter: &mut Option<String>,
+    ) {
+        match &e.kind {
+            ExprKind::Assign { lhs, rhs } => {
+                if resume_state.is_none() {
+                    if let ExprKind::FieldAccess { field_name, .. } = &lhs.kind {
+                        if field_name == "__resume_index" {
+                            if let ExprKind::IntLit(n) = &rhs.kind {
+                                *resume_state = Some(*n);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Call { target, args } => {
+                if awaiter.is_none() {
+                    if let Some(name) = self.resolved_call_target_name(target) {
+                        if let Some((class, method)) = split_qualified_method(&name) {
+                            if Self::method_base_name(method) == "await_suspend" {
+                                *awaiter = Some(class.to_string());
+                            }
+                        }
+                    }
+                }
+                for a in args {
+                    self.scan_suspend_signal_expr(a, resume_state, awaiter);
+                }
+            }
+            _ => {
+                for child in Self::expr_subexprs(e) {
+                    self.scan_suspend_signal_expr(child, resume_state, awaiter);
+                }
+            }
+        }
+    }
+
     /// The base method name with any template argument list stripped:
     /// `return_value<int>` → `return_value`. Operator methods (which can legitimately
     /// contain `<`) are left intact.
@@ -9810,6 +9917,14 @@ impl PseudoCodeEmitter {
                     (condition.clone(), then_body.clone(), else_body.clone())
                 };
 
+                // In a coroutine clone, mark a `co_await` suspend point: an `if`
+                // whose taken branch saves the resume index, calls `await_suspend`,
+                // and returns (suspends). The structure is left intact — that
+                // `return` is real state-machine control flow — but annotated.
+                if let Some(note) = self.coroutine_suspend_annotation(&actual_then) {
+                    writeln!(output, "{}// {}", indent, note).unwrap();
+                }
+
                 writeln!(
                     output,
                     "{}if ({}) {{",
@@ -15043,6 +15158,64 @@ int sum(int n, ...)
             vec![coro_recv(), Expr::int(7)],
         );
         assert_eq!(e.coroutine_keyword_for_statement(&yv), None);
+    }
+
+    fn suspend_then_body(state: i128) -> Vec<StructuredNode> {
+        vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![
+                    // frame->__resume_index = state;
+                    Expr::assign(
+                        Expr::field_access(coro_recv(), "__resume_index", 36),
+                        Expr::int(state),
+                    ),
+                    // awaiter.await_suspend(this, handle);
+                    coro_call(
+                        "std::suspend_always::await_suspend",
+                        vec![coro_recv(), coro_recv()],
+                    ),
+                ],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ]
+    }
+
+    #[test]
+    fn coroutine_suspend_point_is_annotated() {
+        let e = coro_emitter("Task::promise_type");
+        let note = e
+            .coroutine_suspend_annotation(&suspend_then_body(2))
+            .expect("annotation");
+        assert!(note.contains("co_await"), "{note}");
+        assert!(note.contains("std::suspend_always"), "{note}");
+        assert!(note.contains("state 2"), "{note}");
+
+        // Off outside coroutine clones.
+        let plain = PseudoCodeEmitter::new("    ", false);
+        assert_eq!(plain.coroutine_suspend_annotation(&suspend_then_body(2)), None);
+
+        // An ordinary returning `if` (no resume-index save + await_suspend) is not
+        // annotated.
+        let plain_return = vec![
+            StructuredNode::Block {
+                id: hexray_core::BasicBlockId::new(0),
+                statements: vec![Expr::assign(
+                    Expr::var(super::super::expression::Variable::reg("rax", 8)),
+                    Expr::int(0),
+                )],
+                address_range: (0, 0),
+            },
+            StructuredNode::Return(None),
+        ];
+        assert_eq!(e.coroutine_suspend_annotation(&plain_return), None);
+
+        // A resume-index save + await_suspend but NO exit (doesn't suspend) is not
+        // annotated.
+        let mut no_return = suspend_then_body(3);
+        no_return.pop(); // drop the Return
+        assert_eq!(e.coroutine_suspend_annotation(&no_return), None);
     }
 
     #[test]
