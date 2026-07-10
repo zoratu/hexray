@@ -5,6 +5,17 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.17] - 2026-07-10
+
+### Documentation
+
+- **README refresh.** Added a "C++ Semantic Recovery" section to the decompiler
+  capabilities (exceptions/`try`/`catch` from LSDA, C++20 coroutines with
+  `co_return` / `co_await` recovery, `std::optional` / `std::variant`, smart
+  pointers, SSE/AAPCS float ABI + variadics, devirtualization and demangling) —
+  these shipped over recent releases but weren't advertised on the front page.
+  Corrected the stale workspace test count (1300+ → 3700+). No code changes.
+
 ## [1.3.16] - 2026-07-10
 
 ### Internal
