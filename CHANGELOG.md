@@ -5,6 +5,18 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.16] - 2026-07-10
+
+### Internal
+
+- **Emitter DRY refactor.** Merged the two near-identical else-clause emitters
+  (`emit_else_clause` and `emit_else_clause_with_decls`) into a single
+  `emit_else_clause` that takes `declared_vars: Option<&mut HashSet<String>>` and
+  branches on `Some`/`None` at the child-emit and recursive call sites. Pure
+  refactor with no behavior change (else / else-if chaining, inline-declaration
+  threading, and coroutine suspend annotations all render identically); ~55 lines
+  of duplication removed. No user-facing changes.
+
 ## [1.3.15] - 2026-07-04
 
 ### Decompiler — C++20 coroutine suspend-point recovery
