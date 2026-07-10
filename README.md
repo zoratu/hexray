@@ -58,6 +58,14 @@ Every component is hand-written in Rust for full transparency and hackability:
 - Array and struct field access recovery
 - Constant propagation and dead code elimination
 
+### C++ Semantic Recovery
+High-level reconstruction of modern C++ from optimized binaries:
+- **Exceptions**: `try`/`catch` blocks recovered from LSDA (including -O2 multi-catch ladders)
+- **C++20 coroutines**: `switch (frame->__resume_index)` state dispatch, `co_return` keyword rendering, and `co_await` suspend-point annotation in `.actor`/`.resume` clones
+- **Standard library**: `std::optional` / `std::variant` engaged-state recovery, smart-pointer type binding (`shared_ptr` / `unique_ptr` / `weak_ptr`)
+- **Calling conventions**: SSE and AArch64 AAPCS float ABI, variadic (`va_arg`) recovery
+- **Types & symbols**: stack-struct reconstruction, virtual-call devirtualization, Itanium/MSVC name demangling
+
 ### Analysis Capabilities
 - **Data flow queries**: Trace values forward/backward through code
 - **Function signatures**: FLIRT-like pattern matching for library identification
@@ -215,7 +223,7 @@ hexray/
 ## Development
 
 ```bash
-# Run tests (1300+ tests across all crates)
+# Run tests (3700+ tests across all crates)
 cargo test --workspace
 
 # Tiered local CI (hook-aligned)
