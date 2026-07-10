@@ -9050,12 +9050,12 @@ impl PseudoCodeEmitter {
                 .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
                 // Emit else clause (handles else-if chains recursively)
-                self.emit_else_clause_with_decls(
+                self.emit_else_clause(
                     &actual_else.map(|v| v.to_vec()),
                     output,
                     depth,
                     &indent,
-                    declared_vars,
+                    Some(declared_vars),
                 );
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -9234,12 +9234,12 @@ impl PseudoCodeEmitter {
                 .unwrap();
                 self.emit_nodes_with_decls(actual_then, output, depth + 1, declared_vars);
                 // Emit else clause (handles else-if chains recursively)
-                self.emit_else_clause_with_decls(
+                self.emit_else_clause(
                     &actual_else.map(|v| v.to_vec()),
                     output,
                     depth,
                     &indent,
-                    declared_vars,
+                    Some(declared_vars),
                 );
                 writeln!(output, "{}}}", indent).unwrap();
             }
@@ -9481,72 +9481,18 @@ impl PseudoCodeEmitter {
     }
 
     /// Emit an else clause, handling else-if chains without extra indentation.
+    /// Emit an else clause, handling else-if chains. When `declared_vars` is
+    /// `Some`, inline declarations are threaded through the body emission
+    /// (`emit_nodes_with_decls`); when `None`, the plain `emit_nodes` path is
+    /// used. This is the single implementation behind the former
+    /// `emit_else_clause` / `emit_else_clause_with_decls` pair.
     fn emit_else_clause(
         &self,
         else_body: &Option<Vec<StructuredNode>>,
         output: &mut String,
         depth: usize,
         indent: &str,
-    ) {
-        let Some(else_nodes) = else_body else {
-            return;
-        };
-
-        if self.is_body_empty(else_nodes) {
-            return;
-        }
-
-        // Check for else-if pattern: single If node in else body
-        if else_nodes.len() == 1 {
-            if let StructuredNode::If {
-                condition,
-                then_body,
-                else_body: nested_else,
-            } = &else_nodes[0]
-            {
-                // Skip stack canary checks in else-if
-                if self.is_guarded_stack_canary_branch(condition, then_body) {
-                    return;
-                }
-
-                // Emit as "} else if (cond) {" on one line
-                writeln!(
-                    output,
-                    "{}}} else if ({}) {{",
-                    indent,
-                    self.format_condition_expr(condition)
-                )
-                .unwrap();
-                // Annotate a co_await suspend point carried by this `else if` arm,
-                // inside the branch.
-                if let Some(note) = self.coroutine_suspend_annotation(then_body) {
-                    writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
-                }
-                self.emit_nodes(then_body, output, depth + 1);
-
-                // Recursively handle nested else clauses
-                self.emit_else_clause(nested_else, output, depth, indent);
-                return;
-            }
-        }
-
-        // Regular else block
-        writeln!(output, "{}}} else {{", indent).unwrap();
-        // Annotate a co_await suspend point this `else` carries, inside the branch.
-        if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
-            writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
-        }
-        self.emit_nodes(else_nodes, output, depth + 1);
-    }
-
-    /// Emit an else clause with variable declarations, handling else-if chains.
-    fn emit_else_clause_with_decls(
-        &self,
-        else_body: &Option<Vec<StructuredNode>>,
-        output: &mut String,
-        depth: usize,
-        indent: &str,
-        declared_vars: &mut HashSet<String>,
+        mut declared_vars: Option<&mut HashSet<String>>,
     ) {
         let Some(else_nodes) = else_body else {
             return;
@@ -9583,10 +9529,13 @@ impl PseudoCodeEmitter {
                 if let Some(note) = self.coroutine_suspend_annotation(then_body) {
                     writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
                 }
-                self.emit_nodes_with_decls(then_body, output, depth + 1, declared_vars);
+                match declared_vars.as_deref_mut() {
+                    Some(dv) => self.emit_nodes_with_decls(then_body, output, depth + 1, dv),
+                    None => self.emit_nodes(then_body, output, depth + 1),
+                }
 
                 // Recursively handle nested else clauses
-                self.emit_else_clause_with_decls(nested_else, output, depth, indent, declared_vars);
+                self.emit_else_clause(nested_else, output, depth, indent, declared_vars);
                 return;
             }
         }
@@ -9598,7 +9547,10 @@ impl PseudoCodeEmitter {
         if let Some(note) = self.coroutine_suspend_annotation(else_nodes) {
             writeln!(output, "{}{}// {}", indent, self.indent, note).unwrap();
         }
-        self.emit_nodes_with_decls(else_nodes, output, depth + 1, declared_vars);
+        match declared_vars {
+            Some(dv) => self.emit_nodes_with_decls(else_nodes, output, depth + 1, dv),
+            None => self.emit_nodes(else_nodes, output, depth + 1),
+        }
     }
 
     /// Checks if a body (list of nodes) ends with a control flow exit.
@@ -10021,7 +9973,7 @@ impl PseudoCodeEmitter {
                 self.emit_nodes(&actual_then, output, depth + 1);
 
                 // Emit else clause (handles else-if chains recursively)
-                self.emit_else_clause(&actual_else, output, depth, &indent);
+                self.emit_else_clause(&actual_else, output, depth, &indent, None);
 
                 writeln!(output, "{}}}", indent).unwrap();
             }
