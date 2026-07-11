@@ -41,6 +41,31 @@ use super::structurer::StructuredNode;
 struct Frame {
     aliases: HashSet<String>,
     base_expr: Expr,
+    /// Target pointer width in bytes, derived from a frame-pointer home's width
+    /// (a slot holding the whole frame pointer is exactly pointer-sized). Used to
+    /// tell a full-width register copy (`reg = frame`, establishes an alias) from a
+    /// partial one (`eax = frame` on a 64-bit target). Defaults to 8 when no
+    /// sized home is found.
+    pointer_size: u8,
+}
+
+impl Frame {
+    /// A copy of this frame with extra register names (flow-sensitively found to
+    /// currently hold a frame-pointer copy) added to the alias set, so a store
+    /// through such a register — `ret[18] = N` after `ret = frame_copy` — is
+    /// recognized as a frame field access. See [`BindingEnv::frame_ptr_regs`].
+    fn with_frame_ptr_regs(&self, reg_names: &HashSet<String>) -> Frame {
+        if reg_names.is_empty() {
+            return self.clone();
+        }
+        let mut aliases = self.aliases.clone();
+        aliases.extend(reg_names.iter().map(|n| format!("V:{n}")));
+        Frame {
+            aliases,
+            base_expr: self.base_expr.clone(),
+            pointer_size: self.pointer_size,
+        }
+    }
 }
 
 /// The recovered resume-index field, identified by its byte offset in the frame.
@@ -119,11 +144,19 @@ fn build_frame(body: &[StructuredNode]) -> Option<Frame> {
     // registers excluded since they get reused), the alias key of every value
     // ever assigned to it (`None` for a non-aliasable RHS such as a call result).
     let mut assigns: HashMap<String, Vec<Option<String>>> = HashMap::new();
+    // Widths of sized (stack-slot `Var`) frame homes, keyed like `aliases`. A slot
+    // that stably holds the frame pointer is exactly pointer-wide, so once the
+    // fixpoint below confirms a home is a frame alias, its width gives the target
+    // pointer size (see `Frame::pointer_size`).
+    let mut home_sizes: HashMap<String, u8> = HashMap::new();
     visit_assignments(body, &mut |lhs, rhs| {
         if !is_stable_frame_home(lhs) {
             return;
         }
         if let Some(lk) = alias_key(lhs) {
+            if let Some(w) = frame_home_width(lhs) {
+                home_sizes.insert(lk.clone(), w);
+            }
             assigns.entry(lk).or_default().push(alias_key(rhs));
         }
     });
@@ -151,7 +184,26 @@ fn build_frame(body: &[StructuredNode]) -> Option<Frame> {
             break;
         }
     }
-    Some(Frame { aliases, base_expr })
+    // Derive the target pointer width from a confirmed frame-alias home's slot
+    // width (all hold the whole pointer, so they agree), falling back to the frame
+    // parameter's own width when it is a sized `Var` — so an optimized 32-bit
+    // coroutine that keeps the frame in a register with no stack spill is still
+    // recognized. Default to 8 only when nothing sized is available.
+    let base_width = match &base_expr.kind {
+        ExprKind::Var(v) if v.size > 0 => Some(v.size),
+        _ => None,
+    };
+    let pointer_size = aliases
+        .iter()
+        .filter_map(|k| home_sizes.get(k).copied())
+        .chain(base_width)
+        .max()
+        .unwrap_or(8);
+    Some(Frame {
+        aliases,
+        base_expr,
+        pointer_size,
+    })
 }
 
 /// Find a representative frame-parameter base expression (the first
@@ -194,12 +246,312 @@ fn is_stable_frame_home(e: &Expr) -> bool {
     )
 }
 
+/// The store width (bytes) of a frame-pointer home, when it directly encodes the
+/// pointer size: a stack-slot `Var`'s size, or a memory `Deref`'s access size —
+/// both equal the target pointer width for a slot that holds the whole frame
+/// pointer. Returns `None` for homes whose width is not a reliable pointer size
+/// (`ArrayAccess` element size / `FieldAccess`), so `pointer_size` only ever
+/// tightens the full-copy gate on evidence we trust.
+fn frame_home_width(e: &Expr) -> Option<u8> {
+    match &e.kind {
+        ExprKind::Var(v) if v.size > 0 => Some(v.size),
+        ExprKind::Deref { size, .. } if *size > 0 => Some(*size),
+        _ => None,
+    }
+}
+
+/// Update the block-local set of registers currently holding a frame-pointer
+/// copy for one straight-line statement: `reg = <frame value>` marks `reg`; any
+/// other assignment (or compound assignment) to `reg` clears it; and a call
+/// clobbers every caller-saved register (a callee-saved one survives). Tracked
+/// only within a single `Block`'s straight-line statements, so no stale alias can
+/// ever leak across a branch/loop/call boundary.
+fn note_frame_ptr_reg(regs: &mut HashSet<String>, stmt: &Expr, frame: &Frame) {
+    // (The call clobber is applied by the caller BEFORE this statement's rename,
+    // so it covers a call in the statement itself; here we only handle the
+    // statement's effect on the tracked registers.)
+    //
+    // First invalidate the alias of every register written ANYWHERE in the
+    // statement — not just a top-level assignment, but nested mutations such as
+    // `foo(++rbx)` or a conditional containing `rbx += 8` — since after such a
+    // write the register no longer holds the frame.
+    clear_mutated_regs(regs, stmt);
+    // Then, a top-level FULL-WIDTH `reg = <frame value>` (re)establishes the alias.
+    // A partial write only defines part of the pointer, so it can't be trusted as
+    // the frame (and was already invalidated above). Width is checked by size
+    // because a sub-register may be lifted under its 64-bit name (e.g. `eax` as
+    // name `rax`, size 4); `pointer_size` is the target pointer width (4 on 32-bit,
+    // 8 on 64-bit), so a full copy is recognized on every architecture.
+    if let ExprKind::Assign { lhs, rhs } = &stmt.kind {
+        if let ExprKind::Var(v) = &lhs.kind {
+            if holds_frame_ptr(regs, rhs, frame) && v.size >= frame.pointer_size {
+                regs.insert(canon_reg(&v.name));
+            }
+        }
+    }
+}
+
+/// Like [`clear_mutated_regs`], but for computing the effective frame of a single
+/// statement: a top-level assignment/compound-assignment writes its target only
+/// AFTER the RHS (and LHS address) are evaluated, so the target still holds the
+/// frame while those are inspected — `eax = rax[18]` must keep `rax`. Only NESTED
+/// mutations (whose evaluation order relative to sibling subexpressions is
+/// unspecified) are cleared. The top-level target's clobber for the FOLLOWING
+/// statements is applied separately by `note_frame_ptr_reg`.
+fn clear_intra_stmt_mutated_regs(regs: &mut HashSet<String>, stmt: &Expr) {
+    match &stmt.kind {
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            // Skip the top-level target itself; still clear nested mutations in the
+            // LHS (e.g. `arr[++i] = ...`) and anywhere in the RHS.
+            clear_mutated_regs(regs, lhs);
+            clear_mutated_regs(regs, rhs);
+        }
+        _ => clear_mutated_regs(regs, stmt),
+    }
+}
+
+/// Remove from `regs` the alias of every register that is written (assigned,
+/// compound-assigned, or inc/dec'd) anywhere in `e`, recursing through the whole
+/// expression tree so a mutation nested inside a call argument, binary operand,
+/// or conditional is not missed.
+fn clear_mutated_regs(regs: &mut HashSet<String>, e: &Expr) {
+    use super::expression::UnaryOpKind;
+    let clear_target = |regs: &mut HashSet<String>, t: &Expr| {
+        if let ExprKind::Var(v) = &t.kind {
+            regs.remove(&canon_reg(&v.name));
+        }
+    };
+    match &e.kind {
+        ExprKind::Assign { lhs, rhs } | ExprKind::CompoundAssign { lhs, rhs, .. } => {
+            clear_target(regs, lhs);
+            clear_mutated_regs(regs, lhs);
+            clear_mutated_regs(regs, rhs);
+        }
+        ExprKind::UnaryOp { op, operand } => {
+            if matches!(op, UnaryOpKind::Inc | UnaryOpKind::Dec) {
+                clear_target(regs, operand);
+            }
+            clear_mutated_regs(regs, operand);
+        }
+        ExprKind::BinOp { left, right, .. } => {
+            clear_mutated_regs(regs, left);
+            clear_mutated_regs(regs, right);
+        }
+        ExprKind::Deref { addr, .. } => clear_mutated_regs(regs, addr),
+        ExprKind::AddressOf(o)
+        | ExprKind::Cast { expr: o, .. }
+        | ExprKind::BitField { expr: o, .. } => clear_mutated_regs(regs, o),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            clear_mutated_regs(regs, base);
+            clear_mutated_regs(regs, index);
+        }
+        ExprKind::FieldAccess { base, .. } => clear_mutated_regs(regs, base),
+        ExprKind::Call { target, args } => {
+            match target {
+                super::expression::CallTarget::Indirect(t)
+                | super::expression::CallTarget::IndirectGot { expr: t, .. } => {
+                    clear_mutated_regs(regs, t)
+                }
+                _ => {}
+            }
+            for a in args {
+                clear_mutated_regs(regs, a);
+            }
+        }
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            clear_mutated_regs(regs, cond);
+            clear_mutated_regs(regs, then_expr);
+            clear_mutated_regs(regs, else_expr);
+        }
+        ExprKind::Phi(exprs) => {
+            for x in exprs {
+                clear_mutated_regs(regs, x);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Block-local tracker of which scratch registers currently hold a frame-pointer
+/// copy, stepped statement-by-statement over one `Block`'s straight-line body.
+/// Every consumer of a block's statements (field detection, state binding, the
+/// final rename) drives it identically through [`Self::effective_frame`], so they
+/// all agree on which register-aliased memory accesses are frame fields. Created
+/// empty per block and never carried across a branch/loop/call boundary, so no
+/// stale alias can ever leak.
+///
+/// DELIBERATE SCOPE: the tracker is intentionally block-local. Recovering a
+/// dispatch whose resume index is compared inline through a register copy made in
+/// a *preceding* block — `ret = local; if (ret[18] == 0) ...` (an optimized -O1+
+/// shape; gcc -O0 always reloads into a temp, which the temp binding already
+/// handles across siblings) — would require carrying the alias into the following
+/// `If`'s condition. That is sound in isolation (the condition runs on
+/// fall-through), but the flattener evaluates and EMITS case bodies through the
+/// same `frame`, so a single carried frame also rewrites register-aliased accesses
+/// inside those bodies, where the copy may have been clobbered. Doing it correctly
+/// needs a separate condition-frame and body-frame threaded through the whole
+/// flatten/`eval_outcome` core; that is a dedicated follow-up, not this slice.
+#[derive(Default)]
+struct FramePtrTracker {
+    regs: HashSet<String>,
+}
+
+impl FramePtrTracker {
+    /// The effective frame to use for `stmt` (the base frame plus the registers
+    /// known to hold a frame copy *before* this statement), then advance the
+    /// tracker past `stmt`. A statement that calls out first drops caller-saved
+    /// register aliases (see the block rewrite loop for why this is conservative
+    /// for the whole statement); the copy/clobber effects of the statement itself
+    /// are applied after the effective frame is captured, matching evaluation
+    /// order for the following statements.
+    fn effective_frame(&mut self, stmt: &Expr, frame: &Frame) -> Frame {
+        if expr_contains_call(stmt) {
+            self.regs.retain(|reg| reg_survives_call(reg));
+        }
+        // A register mutated by a NESTED side effect can't be trusted for this
+        // statement's own frame accesses: expression evaluation order within a
+        // statement is not recoverable, so `foo(++rbx, rbx[18])` must not rename
+        // `rbx[18]`. But a top-level assignment's own target is written only AFTER
+        // its RHS is evaluated, so the RHS still sees the old (frame) value —
+        // `eax = rax[18]` (a `movzx eax,[rax+off]` state reload) must keep the `rax`
+        // alias while inspecting the RHS. So exclude nested mutations only, not the
+        // top-level target (whose clobber `note_frame_ptr_reg` applies to the
+        // following statements).
+        let mut eff_regs = self.regs.clone();
+        clear_intra_stmt_mutated_regs(&mut eff_regs, stmt);
+        let eff = frame.with_frame_ptr_regs(&eff_regs);
+        note_frame_ptr_reg(&mut self.regs, stmt, frame);
+        eff
+    }
+}
+
+/// Canonical (widest) name of a register, so a write to a sub-register clears the
+/// alias for the full register it overlaps: x86-64 sub-registers fold to their
+/// 64-bit name, and AArch64 `w<N>` folds to `x<N>` (a 32-bit write zero-extends
+/// into the whole register).
+fn canon_reg(name: &str) -> String {
+    if let Some((canon, _)) = super::abi::normalize_x86_64_register(name, 8) {
+        return canon.to_string();
+    }
+    if let Some(num) = name.strip_prefix('w') {
+        if !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()) {
+            return format!("x{num}");
+        }
+    }
+    name.to_string()
+}
+
+/// Whether a register's value is preserved across a function call, so a frame
+/// pointer held in it survives the call. Callee-saved registers qualify — EXCEPT
+/// the AArch64 link register (`x30`/`lr`), which a `bl` overwrites with the
+/// return address even though it is otherwise callee-saved.
+fn reg_survives_call(reg: &str) -> bool {
+    super::abi::is_callee_saved_register(reg) && !matches!(reg, "x30" | "w30" | "lr")
+}
+
+/// Whether `e` evaluates to a frame-pointer copy: a known (flow-insensitive)
+/// frame alias, or a register currently in the block-local `regs` set.
+fn holds_frame_ptr(regs: &HashSet<String>, e: &Expr, frame: &Frame) -> bool {
+    // Peel casts, but reject any that NARROWS below the pointer width: a value cast
+    // through e.g. `(uint32_t)` truncates the pointer, so `rax = (uint32_t)local`
+    // does not leave `rax` holding a usable frame pointer even though `local` is a
+    // frame alias. (Widening / same-width casts are transparent.)
+    let mut cur = e;
+    while let ExprKind::Cast { expr, to_size, .. } = &cur.kind {
+        if *to_size < frame.pointer_size {
+            return false;
+        }
+        cur = expr;
+    }
+    // Also reject a NARROW read of a frame location — a sub-register read like
+    // `eax` (lifted as `Var{name:"rax", size:4}`) or a sub-pointer-width memory
+    // load holds only the low bits, so even though the location is a frame alias
+    // its value is not a usable frame pointer (`rbx = (uint64_t)eax` after
+    // `rax = frame`). An unsized/opaque form (the `arg0` base param) is full.
+    if !frame_read_is_full_width(cur, frame.pointer_size) {
+        return false;
+    }
+    if let Some(k) = alias_key(cur) {
+        if frame.aliases.contains(&k) {
+            return true;
+        }
+    }
+    matches!(&cur.kind, ExprKind::Var(v) if regs.contains(&canon_reg(&v.name)))
+}
+
+/// Whether reading `e` yields the whole pointer (not a truncated low-bits slice):
+/// a sized value form (`Var` / memory `Deref` / `ArrayAccess`) must be at least
+/// `pointer_size` wide; an unsized form (e.g. the `arg0` base param, a
+/// `FieldAccess`) carries no truncation signal and is treated as full-width.
+fn frame_read_is_full_width(e: &Expr, pointer_size: u8) -> bool {
+    match &e.kind {
+        ExprKind::Var(v) => v.size == 0 || v.size >= pointer_size,
+        ExprKind::Deref { size, .. } => *size == 0 || *size >= pointer_size,
+        ExprKind::ArrayAccess { element_size, .. } => {
+            *element_size == 0 || *element_size >= pointer_size as usize
+        }
+        _ => true,
+    }
+}
+
+/// Whether `e` contains a function call anywhere in its subtree (used to detect
+/// caller-saved-register clobbers).
+fn expr_contains_call(e: &Expr) -> bool {
+    match &e.kind {
+        ExprKind::Call { .. } => true,
+        ExprKind::BinOp { left, right, .. }
+        | ExprKind::Assign { lhs: left, rhs: right }
+        | ExprKind::CompoundAssign {
+            lhs: left,
+            rhs: right,
+            ..
+        } => expr_contains_call(left) || expr_contains_call(right),
+        ExprKind::UnaryOp { operand, .. }
+        | ExprKind::Deref { addr: operand, .. }
+        | ExprKind::AddressOf(operand)
+        | ExprKind::Cast { expr: operand, .. }
+        | ExprKind::BitField { expr: operand, .. } => expr_contains_call(operand),
+        ExprKind::ArrayAccess { base, index, .. } => {
+            expr_contains_call(base) || expr_contains_call(index)
+        }
+        ExprKind::FieldAccess { base, .. } => expr_contains_call(base),
+        ExprKind::Conditional {
+            cond,
+            then_expr,
+            else_expr,
+        } => {
+            expr_contains_call(cond)
+                || expr_contains_call(then_expr)
+                || expr_contains_call(else_expr)
+        }
+        ExprKind::Phi(exprs) => exprs.iter().any(expr_contains_call),
+        _ => false,
+    }
+}
+
 /// A normalized key identifying an lvalue location (a register/arg, or a
 /// memory location off one), so frame copies and re-reads can be matched.
 fn alias_key(e: &Expr) -> Option<String> {
     match &e.kind {
         ExprKind::Unknown(s) => Some(format!("U:{s}")),
-        ExprKind::Var(v) => Some(format!("V:{}", v.name)),
+        // Canonicalize register names (`eax`->`rax`, `w19`->`x19`) so a full-width
+        // copy recorded under its canonical name (see `with_frame_ptr_regs`, which
+        // keys block-local reg aliases by `canon_reg`) matches a later access
+        // spelled with the same or a narrower sub-register. Non-register vars
+        // (stack/arg/temp) never collide with register names, so `canon_reg` is a
+        // no-op for them; registers never enter the flow-insensitive alias set.
+        ExprKind::Var(v) => {
+            let name = if matches!(v.kind, VarKind::Register(_)) {
+                canon_reg(&v.name)
+            } else {
+                v.name.clone()
+            };
+            Some(format!("V:{name}"))
+        }
         ExprKind::Cast { expr, .. } => alias_key(expr),
         ExprKind::ArrayAccess {
             base,
@@ -233,6 +585,15 @@ fn alias_key(e: &Expr) -> Option<String> {
     }
 }
 
+/// Whether `base` is a usable frame pointer: a frame alias read at FULL pointer
+/// width. Routed through [`holds_frame_ptr`] (the block-local register aliases are
+/// already folded into `frame.aliases`), so the cast-narrowing and sub-register
+/// width checks apply here too — `eax[18]`/`(uint32_t)rax` after `rax = frame`
+/// must NOT resolve as a frame field, since the base is a truncated pointer.
+fn base_is_frame(base: &Expr, frame: &Frame) -> bool {
+    holds_frame_ptr(&HashSet::new(), base, frame)
+}
+
 /// If `e` is a field access off a frame alias (`frame[idx]` / `*(frame + off)` /
 /// `frame->field`), return the byte offset.
 fn frame_offset(e: &Expr, frame: &Frame) -> Option<i64> {
@@ -243,7 +604,7 @@ fn frame_offset(e: &Expr, frame: &Frame) -> Option<i64> {
             index,
             element_size,
         } => {
-            if frame.aliases.contains(&alias_key(base)?) {
+            if base_is_frame(base, frame) {
                 if let ExprKind::IntLit(i) = &index.kind {
                     return Some(*i as i64 * *element_size as i64);
                 }
@@ -251,7 +612,7 @@ fn frame_offset(e: &Expr, frame: &Frame) -> Option<i64> {
             None
         }
         ExprKind::FieldAccess { base, offset, .. } => {
-            frame.aliases.contains(&alias_key(base)?).then_some(*offset as i64)
+            base_is_frame(base, frame).then_some(*offset as i64)
         }
         ExprKind::Deref { addr, .. } => match &addr.kind {
             ExprKind::BinOp {
@@ -259,14 +620,14 @@ fn frame_offset(e: &Expr, frame: &Frame) -> Option<i64> {
                 left,
                 right,
             } => {
-                if frame.aliases.contains(&alias_key(left)?) {
+                if base_is_frame(left, frame) {
                     if let ExprKind::IntLit(off) = &right.kind {
                         return Some(*off as i64);
                     }
                 }
                 None
             }
-            _ => frame.aliases.contains(&alias_key(addr)?).then_some(0),
+            _ => base_is_frame(addr, frame).then_some(0),
         },
         _ => None,
     }
@@ -322,7 +683,12 @@ fn scan_state_compares(
     for node in nodes {
         match node {
             StructuredNode::Block { statements, .. } => {
+                // Block-local frame-register tracker so a resume-index load through
+                // a just-copied frame register (`rax = local; tmp = rax[18];`) is
+                // attributed to the right frame offset when finding the state field.
+                let mut tracker = FramePtrTracker::default();
                 for stmt in statements {
+                    let frame = &tracker.effective_frame(stmt, frame);
                     match &stmt.kind {
                         ExprKind::Assign { lhs, rhs } => {
                             if let ExprKind::Var(v) = &lhs.kind {
@@ -1028,7 +1394,12 @@ struct BindingEnv {
 
 impl BindingEnv {
     fn note_block(&mut self, statements: &[Expr], frame: &Frame, state: &StateField) {
+        // Drive the same block-local frame-pointer register tracker the rewrite
+        // loop uses, so a state reload through a just-copied frame register
+        // (`rax = local; tmp = rax[18];`) is recognized as a state temp.
+        let mut tracker = FramePtrTracker::default();
         for stmt in statements {
+            let frame = &tracker.effective_frame(stmt, frame);
             match &stmt.kind {
                 ExprKind::Assign { lhs, rhs } => {
                     if let ExprKind::Var(v) = &lhs.kind {
@@ -1098,13 +1469,23 @@ fn rewrite_nodes(
                 address_range,
             } => {
                 env.note_block(&statements, frame, state);
-                let statements = statements
-                    .into_iter()
-                    .map(|s| rename_state_in_expr(s, frame, state))
-                    .collect();
+                // Rename each statement, tracking frame-pointer registers within
+                // this block's straight-line statements so a store through a
+                // scratch-register frame copy (`ret[18] = N` after `ret = frame`)
+                // is renamed too. The tracker is BLOCK-LOCAL — created here and
+                // never carried across a branch/loop/call boundary — so a stale
+                // alias can never cause an incorrect rename. `env.note_block` above
+                // drives an identical tracker, so its state-temp bindings agree with
+                // the register-aliased accesses renamed here.
+                let mut tracker = FramePtrTracker::default();
+                let mut renamed = Vec::with_capacity(statements.len());
+                for s in statements {
+                    let eff = tracker.effective_frame(&s, frame);
+                    renamed.push(rename_state_in_expr(s, &eff, state));
+                }
                 out.push(StructuredNode::Block {
                     id,
-                    statements,
+                    statements: renamed,
                     address_range,
                 });
             }
@@ -1157,7 +1538,8 @@ fn rewrite_nodes(
             }
             other => {
                 // Loops/switch/try-catch bodies may reassign a state temp; kill
-                // those bindings for the following siblings.
+                // those bindings for the following siblings. (Frame-pointer register
+                // aliases are tracked block-locally, so nothing to invalidate here.)
                 let reassigned = assigned_vars(std::slice::from_ref(&other));
                 out.push(rewrite_structural(other, frame, state, env, domain));
                 for n in &reassigned {
@@ -1528,6 +1910,17 @@ fn collect_branch(
 /// (`tmp = <state field or state temp>`) — pure dispatch plumbing with no other
 /// effect, which is dead once the dispatch becomes a switch on the named field.
 /// An empty block qualifies. `env` is the binding state on entry to the block.
+///
+/// NOTE: a leading frame-pointer COPY (`rax = local`) is intentionally NOT accepted
+/// here. Unlike a state reload into a scratch temp (dead after the dispatch), a
+/// register holding a frame-pointer copy can be live anywhere — a later indirect
+/// call target, or a sibling AFTER the flattened switch — and the reload-peeling
+/// machinery (`prepend_used_reloads`) only re-prepends a dropped reload when the
+/// case body itself uses it, so peeling a frame copy could drop a still-live
+/// register. The block-local register-alias tracking still recovers this reload
+/// shape at the top level (via `note_block`/`rewrite_nodes`); extending the
+/// bounded-branch prefix peeler to it soundly needs post-region liveness analysis
+/// and is a dedicated follow-up.
 fn is_state_reload_block(
     statements: &[Expr],
     frame: &Frame,
@@ -1712,12 +2105,17 @@ fn visit_assignments(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr, &Expr))
     });
 }
 
-/// Every variable/temp name assigned anywhere within `nodes` (the lhs of an
-/// assignment). Used to invalidate state/slice bindings that a conditional
-/// branch may have overwritten before continuing with the following siblings.
+/// Every variable/temp name assigned anywhere within `nodes` — the lhs of a
+/// plain OR compound assignment. Used to invalidate state/slice/frame-pointer
+/// bindings that a conditional branch may have overwritten (including via
+/// `tmp += 1` / `ret += 8`) before continuing with the following siblings.
 fn assigned_vars(nodes: &[StructuredNode]) -> HashSet<String> {
     let mut names = HashSet::new();
-    visit_assignments(nodes, &mut |lhs, _| {
+    visit_exprs(nodes, &mut |e| {
+        let lhs = match &e.kind {
+            ExprKind::Assign { lhs, .. } | ExprKind::CompoundAssign { lhs, .. } => lhs,
+            _ => return,
+        };
         if let ExprKind::Var(v) = &lhs.kind {
             names.insert(v.name.clone());
         }
@@ -1742,7 +2140,15 @@ fn visit_exprs(nodes: &[StructuredNode], f: &mut impl FnMut(&Expr)) {
                 walk_expr(index, f);
             }
             ExprKind::FieldAccess { base, .. } => walk_expr(base, f),
-            ExprKind::Call { args, .. } => {
+            ExprKind::Call { target, args } => {
+                // Visit the indirect-call target too, so a value used ONLY as
+                // `(*reg)()` counts as a use (e.g. a frame copy feeding an indirect
+                // call must not be dropped as dead reload plumbing).
+                match target {
+                    super::expression::CallTarget::Indirect(t)
+                    | super::expression::CallTarget::IndirectGot { expr: t, .. } => walk_expr(t, f),
+                    _ => {}
+                }
                 for a in args {
                     walk_expr(a, f);
                 }
@@ -2643,6 +3049,102 @@ mod tests {
     }
 
     #[test]
+    fn truncated_register_base_is_not_a_frame_field() {
+        // local = arg0; rax = local; tmp = eax[18]; if (tmp==0/1) ...
+        // `eax` is the low 32 bits of the frame-holding rax; `eax[18]` reads through
+        // a truncated pointer, so frame_offset must NOT accept it as the resume
+        // field and the dispatch must not flatten.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let eax = || Expr::var(Variable::reg("eax", 4));
+        let tmp = || Expr::var(Variable::reg("edx", 4));
+        let body = vec![
+            block(vec![
+                Expr::assign(local(), frame()),
+                Expr::assign(rax(), local()),
+                Expr::assign(tmp(), Expr::array_access(eax(), Expr::int(18), 2)),
+            ]),
+            iff(
+                cmp(BinOpKind::Eq, tmp(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, tmp(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_ne!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn flattens_dispatch_with_same_register_reload() {
+        // rax = local;            (rax holds the frame)
+        // eax = rax[18];          (state reload writing BACK into rax's low half —
+        //                          `movzx eax,[rax+off]`; RHS reads old rax = frame)
+        // if (eax == 0) A else if (eax == 1) B
+        // The RHS load must still see rax as the frame even though the assignment's
+        // target (canonical rax) is clobbered afterwards, so eax binds as a state
+        // temp and the dispatch flattens.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let eax = || Expr::var(Variable::reg("eax", 4));
+        let body = vec![
+            block(vec![
+                Expr::assign(rax(), local()),
+                Expr::assign(eax(), Expr::array_access(rax(), Expr::int(18), 2)),
+            ]),
+            iff(
+                cmp(BinOpKind::Eq, eax(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, eax(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        // Establish `local = arg0` so `rax = local` is a frame copy.
+        let mut full = vec![block(vec![Expr::assign(local(), frame())])];
+        full.extend(body);
+        let out = recover_resume_dispatch(full);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn flattens_dispatch_with_state_loaded_through_register_alias() {
+        // local = arg0;            (frame spill -> stack alias)
+        // ret = local;             (scratch-register frame copy)
+        // tmp = ret[18];           (resume index loaded THROUGH the register alias)
+        // if (tmp == 0) A else if (tmp == 1) B
+        // The load reaches the state field only via the block-local register alias
+        // `ret`; field detection and state binding must both honor it so the
+        // dispatch still flattens.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let tmp = || Expr::var(Variable::reg("edx", 4));
+        let body = vec![
+            block(vec![
+                Expr::assign(local(), frame()),
+                Expr::assign(ret(), local()),
+                Expr::assign(tmp(), Expr::array_access(ret(), Expr::int(18), 2)),
+            ]),
+            iff(
+                cmp(BinOpKind::Eq, tmp(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, tmp(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
     fn flattens_binary_search_dispatch_with_reloaded_temp() {
         // tmp = arg0[18];
         // if (tmp <= 1) { if (tmp == 0) A else if (tmp == 1) B }
@@ -2910,6 +3412,27 @@ mod tests {
     }
 
     #[test]
+    fn reload_used_only_as_indirect_call_target_is_preserved() {
+        // A `rax = local` reload feeding an indirect call `(*rax)()` must NOT be
+        // dropped as dead plumbing — the use is the call TARGET, which the expr
+        // visitor must descend into.
+        use super::super::expression::CallTarget;
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let reloads = vec![block(vec![Expr::assign(rax(), local())])];
+        let outcome = vec![block(vec![Expr::call(
+            CallTarget::Indirect(Box::new(rax())),
+            vec![],
+        )])];
+        let combined = prepend_used_reloads(reloads, outcome);
+        assert_eq!(
+            combined.len(),
+            2,
+            "reload feeding an indirect call target was wrongly dropped: {combined:?}"
+        );
+    }
+
+    #[test]
     fn reused_stack_slot_is_not_treated_as_frame_alias() {
         // local_8 = arg0; local_8 = <non-frame>; if (local_8[18]==0/1) ...
         // Because local_8 is later overwritten with a non-frame value, it must NOT
@@ -2956,6 +3479,816 @@ mod tests {
         ];
         let out = recover_resume_dispatch(body);
         assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn aliased_frame_pointer_register_store_is_renamed() {
+        // local = arg0;                     (frame spill -> stack alias)
+        // if (state == 0) { ret = local; ret[18] = 5; }   (store through a reg copy)
+        // else if (state == 1) { body_b }
+        // `ret` is a scratch register (excluded from the flow-insensitive alias
+        // set), but flow-sensitively it holds the frame after `ret = local`, so
+        // `ret[18] = 5` renames to `frame->__resume_index = 5`.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(ret(), local()),
+                    Expr::assign(Expr::array_access(ret(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(c0.contains("__resume_index"), "aliased store not renamed: {c0}");
+        // The renamed store leaves no raw `ret[18]` ArrayAccess behind.
+        assert!(!c0.contains("ArrayAccess"), "aliased store not fully renamed: {c0}");
+    }
+
+    #[test]
+    fn aliased_frame_pointer_register_store_is_renamed_on_32bit() {
+        // Same shape as the 64-bit case, but every frame-pointer home/copy is
+        // 4-wide (a 32-bit target). `pointer_size` is derived from the frame
+        // home's slot width (4 here), so a 4-byte `ret = local` is recognized as a
+        // FULL copy and `ret[18] = 5` still renames — the width check is not
+        // hard-coded to 8. (`state_access` reads a 2-byte field either way.)
+        let local = || Expr::var(Variable::stack(-8, 4));
+        let ret = || Expr::var(Variable::reg("eax", 4));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(ret(), local()),
+                    Expr::assign(Expr::array_access(ret(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("__resume_index"),
+            "32-bit aliased store not renamed: {c0}"
+        );
+        assert!(
+            !c0.contains("ArrayAccess"),
+            "32-bit aliased store not fully renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn pointer_width_derived_from_deref_frame_home_on_32bit() {
+        // 32-bit target whose frame spill is a memory Deref home rather than a
+        // named stack slot: *(ebp-4) = arg0; then eax = *(ebp-4); eax[18] = 5.
+        // `pointer_size` must come from the 4-byte Deref store width, so the
+        // 4-byte `eax` copy is recognized as a full copy and the store renames.
+        // `*(ebp + -4)` — the normalized (Add-with-negative-offset) form the lifter
+        // produces and `alias_key` recognizes.
+        let mem = || {
+            Expr::deref(
+                Expr::binop(
+                    BinOpKind::Add,
+                    Expr::var(Variable::reg("ebp", 4)),
+                    Expr::int(-4),
+                ),
+                4,
+            )
+        };
+        let ret = || Expr::var(Variable::reg("eax", 4));
+        let body = vec![
+            block(vec![Expr::assign(mem(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(ret(), mem()),
+                    Expr::assign(Expr::array_access(ret(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("__resume_index"),
+            "deref-home 32-bit store not renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn same_statement_register_mutation_is_not_trusted_for_that_statement() {
+        // rbx = local; foo(++rbx, rbx[18]);
+        // The statement both mutates rbx (++rbx) and accesses rbx[18]; evaluation
+        // order within the statement is not recoverable, so rbx[18] must NOT be
+        // renamed. rbx is callee-saved so the call clobber alone leaves it — only
+        // the same-statement mutation exclusion catches this.
+        use super::super::expression::{CallTarget, UnaryOpKind};
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rbx = || Expr::var(Variable::reg("rbx", 8));
+        let call = Expr::call(
+            CallTarget::Named("foo".to_string()),
+            vec![
+                Expr::unary(UnaryOpKind::Inc, rbx()),
+                Expr::array_access(rbx(), Expr::int(18), 2),
+            ],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::assign(rbx(), local()), call])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            !c0.contains("__resume_index"),
+            "access through a same-statement-mutated register was renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn pointer_width_from_frame_param_when_no_spill_home_32bit() {
+        // Optimized 32-bit coroutine: the frame arg (a sized 4-byte Var) is kept in
+        // a register with NO stack/Deref spill home, so pointer_size must come from
+        // the frame parameter's own width. Then `eax = arg0` is a full 4-byte copy
+        // and `eax[18] = 5` renames.
+        let arg0v = || {
+            Expr::var(Variable {
+                kind: VarKind::Arg(0),
+                name: "arg0".to_string(),
+                size: 4,
+            })
+        };
+        let eax = || Expr::var(Variable::reg("eax", 4));
+        let state = || Expr::array_access(arg0v(), Expr::int(18), 2);
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state(), 0),
+            vec![block(vec![
+                Expr::assign(eax(), arg0v()),
+                Expr::assign(Expr::array_access(eax(), Expr::int(18), 2), Expr::int(5)),
+            ])],
+            vec![iff(
+                cmp(BinOpKind::Eq, state(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("__resume_index"),
+            "32-bit no-spill register copy store was not renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn narrowing_cast_copy_does_not_establish_frame_ptr_alias() {
+        // local = arg0; rax = (uint32_t)local; rax[18] = 5;
+        // The cast truncates the 64-bit pointer to 32 bits, so `rax` does NOT hold
+        // a usable frame pointer and the store must stay raw. (`rax` is otherwise a
+        // full-width 8-byte register, so only the cast width can catch this.)
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let narrowed = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(local()),
+                to_size: 4,
+                signed: false,
+            },
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax(), narrowed),
+                    Expr::assign(Expr::array_access(rax(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            !c0.contains("__resume_index"),
+            "store through a truncated frame pointer was wrongly renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn widened_subregister_read_does_not_establish_frame_ptr_alias() {
+        // local = arg0; rax = local; rbx = (uint64_t)eax; rbx[18] = 5;
+        // `eax` is the low 32 bits of the frame-holding `rax` (lifted as
+        // Var{name:"rax", size:4}); widening it back to 64 bits does not restore the
+        // pointer, so `rbx` must NOT be treated as a frame alias.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let eax = || Expr::var(Variable::reg("eax", 4));
+        let rbx = || Expr::var(Variable::reg("rbx", 8));
+        let widened = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(eax()),
+                to_size: 8,
+                signed: false,
+            },
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax(), local()),
+                    Expr::assign(rbx(), widened),
+                    Expr::assign(Expr::array_access(rbx(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        // Only the raw `rbx[18]` store remains; it must not become __resume_index.
+        // (`rax = local` may render, but the truncated-copy store stays raw.)
+        assert!(
+            c0.matches("__resume_index").count() == 0,
+            "store through a widened sub-register was wrongly renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn nested_register_mutation_clears_frame_ptr_alias() {
+        // rbx = local;            (rbx is a callee-saved frame copy)
+        // rcx[++rbx] = 0;         (rbx mutated INSIDE an array index — no call)
+        // rbx[18] = 5;            (rbx no longer holds the frame -> stays raw)
+        // Uses rbx (callee-saved) with no call in the block, so this exercises the
+        // nested-mutation clear specifically, not the caller-saved call clobber.
+        use super::super::expression::UnaryOpKind;
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rbx = || Expr::var(Variable::reg("rbx", 8));
+        let inc_rbx = Expr::unary(UnaryOpKind::Inc, rbx());
+        let nested = Expr::assign(
+            Expr::array_access(Expr::var(Variable::reg("rcx", 8)), inc_rbx, 1),
+            Expr::int(0),
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rbx(), local()),
+                    nested,
+                    Expr::assign(Expr::array_access(rbx(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        // The store through the mutated register must NOT be renamed.
+        assert!(
+            !c0.contains("__resume_index"),
+            "store through nested-mutated register was wrongly renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn frame_ptr_reg_alias_does_not_cross_block_boundary() {
+        // ret = local;   (block A: ret is a frame copy)
+        // if (state == 0) { ret[18] = 5; }   (block B, a different block/node)
+        // Frame-pointer register tracking is BLOCK-LOCAL, so the alias does not
+        // carry from block A into block B — the store is conservatively left raw
+        // rather than risk a stale-alias rename across the control-flow boundary.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::assign(
+                    Expr::array_access(ret(), Expr::int(18), 2),
+                    Expr::int(5),
+                )])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "block-local alias should not rename a store in a separate block: {c0}"
+        );
+    }
+
+    #[test]
+    fn call_clobbers_caller_saved_frame_ptr_reg() {
+        // local = arg0;
+        // if (state == 0) { rax = local; foo(); rax[18] = 5; } else if (state==1) B
+        // `rax` is caller-saved — `foo()` clobbers it, so `rax[18]` must stay raw.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let foo = || {
+            Expr::call(
+                crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                vec![],
+            )
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax(), local()),
+                    foo(),
+                    Expr::assign(Expr::array_access(rax(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "caller-saved frame reg not cleared on call: {c0}"
+        );
+    }
+
+    #[test]
+    fn switch_arm_within_block_copy_and_store_is_renamed_independently() {
+        // A pre-existing switch where case 0 does its own within-block frame copy +
+        // store and case 1 calls out. Block-local tracking makes each arm
+        // independent, so case 0's `rax[18]` renames regardless of case 1's call.
+        // local = arg0;
+        // switch (sel) { case 0: { rax = local; rax[18] = 5; }  case 1: foo(); }
+        // if (state == 0) A else if (state == 1) B    (triggers recovery)
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let pre_switch = StructuredNode::Switch {
+            value: Expr::unknown("sel"),
+            cases: vec![
+                (
+                    vec![0],
+                    vec![block(vec![
+                        Expr::assign(rax(), local()),
+                        Expr::assign(
+                            Expr::array_access(rax(), Expr::int(18), 2),
+                            Expr::int(5),
+                        ),
+                    ])],
+                ),
+                (
+                    vec![1],
+                    vec![block(vec![Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                        vec![],
+                    )])],
+                ),
+            ],
+            default: None,
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            pre_switch,
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::unknown("body_a")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        let dump = format!("{out:?}");
+        assert!(dump.contains("__resume_index"), "{dump}");
+        assert!(
+            !dump.contains("ArrayAccess"),
+            "case 0's within-block store was not renamed: {dump}"
+        );
+    }
+
+    #[test]
+    fn same_statement_call_clobbers_frame_ptr_reg() {
+        // if (state == 0) { rax = local; rax[18] = foo(); } else if (state==1) B
+        // The call on the rhs clobbers rax before the store, so `rax[18]` (through
+        // the now-clobbered rax) must stay raw even in the same statement.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax(), local()),
+                    Expr::assign(
+                        Expr::array_access(rax(), Expr::int(18), 2),
+                        Expr::call(
+                            crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                            vec![],
+                        ),
+                    ),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "same-statement call did not clobber the frame alias: {c0}"
+        );
+    }
+
+    #[test]
+    fn caller_saved_reg_not_renamed_in_call_statement() {
+        // if (state == 0) { rax = local; foo(rax[18]); } else if (state==1) B
+        // The statement calls out; after call-result folding the order of the
+        // access relative to the call is unrecoverable, so caller-saved register
+        // aliases are conservatively dropped for the whole statement — rax[18]
+        // stays raw. (A stack alias would still be renamed; calls don't clobber
+        // memory.)
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax(), local()),
+                    Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                        vec![Expr::array_access(rax(), Expr::int(18), 2)],
+                    ),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "caller-saved access in a call statement was renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn compound_store_with_call_value_clobbers_frame_ptr_reg() {
+        // if (state == 0) { rax = local; rax[18] += foo(); } else if (state==1) B
+        // A compound memory store whose rhs calls out clobbers rax before the
+        // write, just like a plain `= foo()` store, so it must stay raw.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let compound_store = Expr {
+            kind: ExprKind::CompoundAssign {
+                op: BinOpKind::Add,
+                lhs: Box::new(Expr::array_access(rax(), Expr::int(18), 2)),
+                rhs: Box::new(Expr::call(
+                    crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                    vec![],
+                )),
+            },
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![Expr::assign(rax(), local()), compound_store])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "compound call-valued store did not clobber the frame alias: {c0}"
+        );
+    }
+
+    #[test]
+    fn unary_inc_clears_frame_ptr_reg_alias() {
+        // if (state == 0) { rax = local; ++rax; rax[18] = 5; } else if (state==1) B
+        // ++rax mutates rax, so the later store must stay raw.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let inc = Expr {
+            kind: ExprKind::UnaryOp {
+                op: super::super::expression::UnaryOpKind::Inc,
+                operand: Box::new(rax()),
+            },
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax(), local()),
+                    inc,
+                    Expr::assign(Expr::array_access(rax(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "++reg did not clear the frame alias: {c0}"
+        );
+    }
+
+    #[test]
+    fn partial_register_frame_copy_does_not_establish_alias() {
+        // if (state == 0) { eax = local; rax[18] = 5; } else if (state==1) B
+        // `eax = local` only writes the low 32 bits, so the full rax is NOT the
+        // frame — the later rax[18] store must stay raw.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let eax = || Expr::var(Variable::reg("eax", 4));
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(eax(), local()),
+                    Expr::assign(Expr::array_access(rax(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "partial-register copy was wrongly promoted to a frame alias: {c0}"
+        );
+    }
+
+    #[test]
+    fn narrow_width_copy_under_full_name_does_not_establish_alias() {
+        // A sub-register lifted under its 64-bit NAME but narrow SIZE (`eax` as
+        // name `rax`, size 4) must not establish a full frame alias.
+        // if (state == 0) { rax:4 = local; rax:8[18] = 5; } else if (state==1) B
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rax32 = || Expr::var(Variable::reg("rax", 4));
+        let rax64 = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rax32(), local()),
+                    Expr::assign(Expr::array_access(rax64(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "narrow-width copy wrongly established a frame alias: {c0}"
+        );
+    }
+
+    #[test]
+    fn subregister_write_clears_overlapping_frame_ptr_alias() {
+        // if (state == 0) { x19 = local; w19 = 0; x19[18] = 5; } else if (state==1) B
+        // Writing w19 zero-extends into x19, clobbering the frame copy, so the
+        // later x19[18] store must stay raw.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let x19 = || Expr::var(Variable::reg("x19", 8));
+        let w19 = || Expr::var(Variable::reg("w19", 4));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(x19(), local()),
+                    Expr::assign(w19(), Expr::int(0)),
+                    Expr::assign(Expr::array_access(x19(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "sub-register write did not clear the overlapping alias: {c0}"
+        );
+    }
+
+    #[test]
+    fn link_register_frame_alias_does_not_survive_call() {
+        // local = arg0;
+        // if (state == 0) { x30 = local; foo(); x30[18] = 5; } else if (state==1) B
+        // x30 is the AArch64 link register — `bl` (foo) overwrites it even though
+        // it is otherwise callee-saved, so the store stays raw.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let x30 = || Expr::var(Variable::reg("x30", 8));
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(x30(), local()),
+                    Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                        vec![],
+                    ),
+                    Expr::assign(Expr::array_access(x30(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess"),
+            "link-register frame alias survived a call: {c0}"
+        );
+    }
+
+    #[test]
+    fn callee_saved_frame_ptr_reg_survives_call() {
+        // Same shape but `rbx` (callee-saved) keeps the frame across `foo()`, so
+        // `rbx[18] = 5` is still renamed.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let rbx = || Expr::var(Variable::reg("rbx", 8));
+        let foo = || {
+            Expr::call(
+                crate::decompiler::expression::CallTarget::Named("foo".to_string()),
+                vec![],
+            )
+        };
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            iff(
+                cmp(BinOpKind::Eq, state_access(), 0),
+                vec![block(vec![
+                    Expr::assign(rbx(), local()),
+                    foo(),
+                    Expr::assign(Expr::array_access(rbx(), Expr::int(18), 2), Expr::int(5)),
+                ])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, state_access(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("__resume_index"),
+            "callee-saved frame reg wrongly cleared on call: {c0}"
+        );
+    }
+
+    #[test]
+    fn non_frame_register_store_is_not_renamed() {
+        // if (state == 0) { ret = extern(); ret[18] = 5; }  else if (state == 1) B
+        // `ret` holds a call result, NOT a frame copy, so `ret[18]` must NOT be
+        // renamed to the resume-index field.
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let body = vec![iff(
+            cmp(BinOpKind::Eq, state_access(), 0),
+            vec![block(vec![
+                Expr::assign(
+                    ret(),
+                    Expr::call(
+                        crate::decompiler::expression::CallTarget::Named("extern".to_string()),
+                        vec![],
+                    ),
+                ),
+                Expr::assign(Expr::array_access(ret(), Expr::int(18), 2), Expr::int(5)),
+            ])],
+            vec![iff(
+                cmp(BinOpKind::Eq, state_access(), 1),
+                vec![block(vec![Expr::unknown("body_b")])],
+                vec![],
+            )],
+        )];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        // The switch value renames to __resume_index, but the case-0 body's
+        // `ret[18]` store (through a non-frame register) must stay a raw
+        // ArrayAccess — not renamed.
+        assert!(c0.contains("ArrayAccess"), "non-frame store wrongly renamed: {c0}");
     }
 
     #[test]
