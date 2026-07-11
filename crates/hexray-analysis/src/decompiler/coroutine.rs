@@ -376,26 +376,27 @@ fn clear_mutated_regs(regs: &mut HashSet<String>, e: &Expr) {
     }
 }
 
-/// Block-local tracker of which scratch registers currently hold a frame-pointer
-/// copy, stepped statement-by-statement over one `Block`'s straight-line body.
-/// Every consumer of a block's statements (field detection, state binding, the
-/// final rename) drives it identically through [`Self::effective_frame`], so they
-/// all agree on which register-aliased memory accesses are frame fields. Created
-/// empty per block and never carried across a branch/loop/call boundary, so no
-/// stale alias can ever leak.
+/// Tracker of which scratch registers currently hold a frame-pointer copy, stepped
+/// statement-by-statement over straight-line code. Every consumer of a block's
+/// statements (field detection, state binding, the final rename) drives it
+/// identically through [`Self::effective_frame`], so they all agree on which
+/// register-aliased memory accesses are frame fields.
 ///
-/// DELIBERATE SCOPE: the tracker is intentionally block-local. Recovering a
-/// dispatch whose resume index is compared inline through a register copy made in
-/// a *preceding* block — `ret = local; if (ret[18] == 0) ...` (an optimized -O1+
-/// shape; gcc -O0 always reloads into a temp, which the temp binding already
-/// handles across siblings) — would require carrying the alias into the following
-/// `If`'s condition. That is sound in isolation (the condition runs on
-/// fall-through), but the flattener evaluates and EMITS case bodies through the
-/// same `frame`, so a single carried frame also rewrites register-aliased accesses
-/// inside those bodies, where the copy may have been clobbered. Doing it correctly
-/// needs a separate condition-frame and body-frame threaded through the whole
-/// flatten/`eval_outcome` core; that is a dedicated follow-up, not this slice.
-#[derive(Default)]
+/// The tracker follows straight-line control flow: within a `Block`, and across a
+/// run of fall-through sibling nodes (a `Block` into the next `Block`, or into an
+/// `If`'s CONDITION — which runs before the branch splits). It is reset at any join
+/// point (a `Label`, the only way a node is reached other than by fall-through,
+/// since the structurer materializes every goto target as a `Label`) and at
+/// anything that isn't straight-line (loops, switch, after an `If`), and it never
+/// flows into a branch BODY. So a stale alias can never leak into code reachable by
+/// another path.
+///
+/// Carrying the alias into an `If` condition is why `try_flatten_switch` takes a
+/// separate condition-frame (register-aliased, for the guard chain) and body-frame
+/// (plain, for emitting/rewriting the case bodies): the alias must drive dispatch
+/// detection without rewriting register accesses inside case bodies, where the copy
+/// may have been clobbered on the branch path.
+#[derive(Default, Clone)]
 struct FramePtrTracker {
     regs: HashSet<String>,
 }
@@ -426,6 +427,20 @@ impl FramePtrTracker {
         let eff = frame.with_frame_ptr_regs(&eff_regs);
         note_frame_ptr_reg(&mut self.regs, stmt, frame);
         eff
+    }
+
+    /// The effective frame for a terminator/condition expression WITHOUT advancing
+    /// the tracker — used for an `If`'s condition, which executes on straight-line
+    /// fall-through from the preceding block before the branch splits. Applies the
+    /// same call-clobber and same-expression mutation exclusions as
+    /// [`Self::effective_frame`].
+    fn effective_frame_peek(&self, expr: &Expr, frame: &Frame) -> Frame {
+        let mut eff_regs = self.regs.clone();
+        if expr_contains_call(expr) {
+            eff_regs.retain(|reg| reg_survives_call(reg));
+        }
+        clear_intra_stmt_mutated_regs(&mut eff_regs, expr);
+        frame.with_frame_ptr_regs(&eff_regs)
     }
 }
 
@@ -647,7 +662,14 @@ fn find_state_field(body: &[StructuredNode], frame: &Frame) -> Option<StateField
     // Per offset: the set of equality constants it is compared against, and the
     // shallowest nesting depth at which it is compared.
     let mut stats: HashMap<i64, OffsetStat> = HashMap::new();
-    scan_state_compares(body, frame, &mut HashMap::new(), &mut stats, 0);
+    scan_state_compares(
+        body,
+        frame,
+        &mut HashMap::new(),
+        &mut stats,
+        0,
+        &FramePtrTracker::default(),
+    );
     // The resume dispatch is the actor/resume clone's OUTERMOST branching, so its
     // index field is compared at the shallowest depth; an unrelated frame field
     // (e.g. a user enum switched on in resumed code) is nested inside a resume
@@ -679,16 +701,22 @@ fn scan_state_compares(
     temp_offset: &mut HashMap<String, i64>,
     stats: &mut HashMap<i64, OffsetStat>,
     depth: usize,
+    entry_carry: &FramePtrTracker,
 ) {
+    // Frame-pointer register aliases carried from the preceding straight-line
+    // sibling (see `FramePtrTracker`), seeded with those live on entry to this node
+    // list; reset wherever fall-through is not guaranteed so a `temp = ret[18]` load
+    // or `if (ret[18] == N)` compare through a register copied in an earlier
+    // fall-through block is attributed to the right offset. This pass only COUNTS
+    // candidate offsets (no code transform), so it may also flow the aliases into a
+    // branch body's leading guard — an `else if (ret[18] == 1)` chain keeps `ret` as
+    // the frame along the guard chain — without any soundness risk.
+    let mut carry = entry_carry.clone();
     for node in nodes {
         match node {
             StructuredNode::Block { statements, .. } => {
-                // Block-local frame-register tracker so a resume-index load through
-                // a just-copied frame register (`rax = local; tmp = rax[18];`) is
-                // attributed to the right frame offset when finding the state field.
-                let mut tracker = FramePtrTracker::default();
                 for stmt in statements {
-                    let frame = &tracker.effective_frame(stmt, frame);
+                    let frame = &carry.effective_frame(stmt, frame);
                     match &stmt.kind {
                         ExprKind::Assign { lhs, rhs } => {
                             if let ExprKind::Var(v) = &lhs.kind {
@@ -719,36 +747,120 @@ fn scan_state_compares(
                 then_body,
                 else_body,
             } => {
-                note_state_compare(condition, frame, temp_offset, stats, depth);
-                scan_state_compares(then_body, frame, &mut temp_offset.clone(), stats, depth + 1);
+                // The condition runs on fall-through from the preceding block, so it
+                // may use the carried aliases. A branch keeps those aliases only if
+                // it PROVABLY continues navigating the SAME field: a single nested
+                // `If` whose guard compares the same frame offset (an
+                // `else if (ret[18] == 1)` chain, or a binary-search node still on
+                // `ret[18]`). A leaf case BODY — or a nested dispatch on a DIFFERENT
+                // field, `if (ret[50] == ...)` — must not inherit the alias, else its
+                // comparisons pollute resume-field selection.
+                let cond_frame = carry.effective_frame_peek(condition, frame);
+                note_state_compare(condition, &cond_frame, temp_offset, stats, depth);
+                let guard_off =
+                    compare_to_frame_offset(condition, &cond_frame, temp_offset).map(|(o, _, _)| o);
+                let branch_carry = carry.clone();
+                carry = FramePtrTracker::default();
+                let empty = FramePtrTracker::default();
+                let seed = |b: &[StructuredNode]| -> &FramePtrTracker {
+                    match (guard_off, b) {
+                        (Some(o), [StructuredNode::If { condition: c, .. }])
+                            if compare_to_frame_offset(c, &cond_frame, temp_offset)
+                                .map(|(off, _, _)| off)
+                                == Some(o) =>
+                        {
+                            &branch_carry
+                        }
+                        _ => &empty,
+                    }
+                };
+                scan_state_compares(
+                    then_body,
+                    frame,
+                    &mut temp_offset.clone(),
+                    stats,
+                    depth + 1,
+                    seed(then_body),
+                );
                 if let Some(b) = else_body {
-                    scan_state_compares(b, frame, &mut temp_offset.clone(), stats, depth + 1);
+                    scan_state_compares(
+                        b,
+                        frame,
+                        &mut temp_offset.clone(),
+                        stats,
+                        depth + 1,
+                        seed(b),
+                    );
                 }
             }
             StructuredNode::While { condition, body, .. }
             | StructuredNode::DoWhile { condition, body, .. } => {
+                carry = FramePtrTracker::default();
                 note_state_compare(condition, frame, temp_offset, stats, depth);
-                scan_state_compares(body, frame, &mut temp_offset.clone(), stats, depth + 1);
+                scan_state_compares(
+                    body,
+                    frame,
+                    &mut temp_offset.clone(),
+                    stats,
+                    depth + 1,
+                    &FramePtrTracker::default(),
+                );
             }
             StructuredNode::For { body, .. } | StructuredNode::Loop { body, .. } => {
-                scan_state_compares(body, frame, &mut temp_offset.clone(), stats, depth + 1);
+                carry = FramePtrTracker::default();
+                scan_state_compares(
+                    body,
+                    frame,
+                    &mut temp_offset.clone(),
+                    stats,
+                    depth + 1,
+                    &FramePtrTracker::default(),
+                );
             }
             StructuredNode::Switch { cases, default, .. } => {
+                carry = FramePtrTracker::default();
                 for (_, b) in cases {
-                    scan_state_compares(b, frame, &mut temp_offset.clone(), stats, depth + 1);
+                    scan_state_compares(
+                        b,
+                        frame,
+                        &mut temp_offset.clone(),
+                        stats,
+                        depth + 1,
+                        &FramePtrTracker::default(),
+                    );
                 }
                 if let Some(b) = default {
-                    scan_state_compares(b, frame, &mut temp_offset.clone(), stats, depth + 1);
+                    scan_state_compares(
+                        b,
+                        frame,
+                        &mut temp_offset.clone(),
+                        stats,
+                        depth + 1,
+                        &FramePtrTracker::default(),
+                    );
                 }
             }
             StructuredNode::Sequence(nodes) => {
-                scan_state_compares(nodes, frame, temp_offset, stats, depth)
+                // A `Sequence` is a transparent inline run of fall-through nodes, so
+                // the aliases flow through it (a dispatch wrapped as
+                // `Sequence([if (ret[18] == 0) ...])` after `ret = local` is still
+                // found). Reset after — the sequence's end state isn't threaded back.
+                scan_state_compares(nodes, frame, temp_offset, stats, depth, &carry);
+                carry = FramePtrTracker::default();
             }
             StructuredNode::TryCatch {
                 try_body,
                 catch_handlers,
             } => {
-                scan_state_compares(try_body, frame, &mut temp_offset.clone(), stats, depth + 1);
+                carry = FramePtrTracker::default();
+                scan_state_compares(
+                    try_body,
+                    frame,
+                    &mut temp_offset.clone(),
+                    stats,
+                    depth + 1,
+                    &FramePtrTracker::default(),
+                );
                 for handler in catch_handlers {
                     scan_state_compares(
                         &handler.body,
@@ -756,10 +868,14 @@ fn scan_state_compares(
                         &mut temp_offset.clone(),
                         stats,
                         depth + 1,
+                        &FramePtrTracker::default(),
                     );
                 }
             }
-            _ => {}
+            _ => {
+                // Labels/goto/break/continue/return break straight-line flow.
+                carry = FramePtrTracker::default();
+            }
         }
     }
 }
@@ -1394,10 +1510,23 @@ struct BindingEnv {
 
 impl BindingEnv {
     fn note_block(&mut self, statements: &[Expr], frame: &Frame, state: &StateField) {
-        // Drive the same block-local frame-pointer register tracker the rewrite
-        // loop uses, so a state reload through a just-copied frame register
-        // (`rax = local; tmp = rax[18];`) is recognized as a state temp.
-        let mut tracker = FramePtrTracker::default();
+        self.note_block_seeded(statements, frame, state, &FramePtrTracker::default());
+    }
+
+    /// Like [`Self::note_block`], but the register tracker starts from `seed` (the
+    /// aliases live at block entry from the preceding straight-line sibling) and its
+    /// end state is returned, so callers can carry it into the following sibling.
+    fn note_block_seeded(
+        &mut self,
+        statements: &[Expr],
+        frame: &Frame,
+        state: &StateField,
+        seed: &FramePtrTracker,
+    ) -> FramePtrTracker {
+        // Drive the same frame-pointer register tracker the rewrite loop uses, so a
+        // state reload through a just-copied frame register (`rax = local;
+        // tmp = rax[18];`) is recognized as a state temp.
+        let mut tracker = seed.clone();
         for stmt in statements {
             let frame = &tracker.effective_frame(stmt, frame);
             match &stmt.kind {
@@ -1426,6 +1555,7 @@ impl BindingEnv {
                 _ => {}
             }
         }
+        tracker
     }
 
     fn is_state(&self, expr: &Expr, frame: &Frame, state: &StateField) -> bool {
@@ -1460,7 +1590,25 @@ fn rewrite_nodes(
     env: &mut BindingEnv,
     domain: &Domain,
 ) -> Vec<StructuredNode> {
+    rewrite_nodes_seeded(nodes, frame, state, env, domain, &FramePtrTracker::default())
+}
+
+/// [`rewrite_nodes`] whose frame-pointer register carry starts from `entry_carry`
+/// (the aliases live on entry to this node list — non-empty only for a transparent
+/// `Sequence` wrapping fall-through code from a preceding block).
+fn rewrite_nodes_seeded(
+    nodes: Vec<StructuredNode>,
+    frame: &Frame,
+    state: &StateField,
+    env: &mut BindingEnv,
+    domain: &Domain,
+    entry_carry: &FramePtrTracker,
+) -> Vec<StructuredNode> {
     let mut out = Vec::with_capacity(nodes.len());
+    // Frame-pointer register aliases live at the start of the current sibling,
+    // carried from the preceding straight-line node (see `FramePtrTracker`). Reset
+    // wherever fall-through is not guaranteed.
+    let mut carry = entry_carry.clone();
     for node in nodes {
         match node {
             StructuredNode::Block {
@@ -1468,21 +1616,18 @@ fn rewrite_nodes(
                 statements,
                 address_range,
             } => {
-                env.note_block(&statements, frame, state);
-                // Rename each statement, tracking frame-pointer registers within
-                // this block's straight-line statements so a store through a
-                // scratch-register frame copy (`ret[18] = N` after `ret = frame`)
-                // is renamed too. The tracker is BLOCK-LOCAL — created here and
-                // never carried across a branch/loop/call boundary — so a stale
-                // alias can never cause an incorrect rename. `env.note_block` above
-                // drives an identical tracker, so its state-temp bindings agree with
-                // the register-aliased accesses renamed here.
-                let mut tracker = FramePtrTracker::default();
+                // Seed both the binding pass and the rename tracker with the aliases
+                // carried in from the preceding sibling, so a store/reload through a
+                // register copied in an earlier fall-through block is recognized too.
+                env.note_block_seeded(&statements, frame, state, &carry);
+                let mut tracker = carry.clone();
                 let mut renamed = Vec::with_capacity(statements.len());
                 for s in statements {
                     let eff = tracker.effective_frame(&s, frame);
                     renamed.push(rename_state_in_expr(s, &eff, state));
                 }
+                // The block's end aliases carry to the next fall-through sibling.
+                carry = tracker;
                 out.push(StructuredNode::Block {
                     id,
                     statements: renamed,
@@ -1494,6 +1639,39 @@ fn rewrite_nodes(
                 then_body,
                 else_body,
             } => {
+                // The condition runs on straight-line fall-through from the preceding
+                // block (before the branch splits), so a dispatch guard made through
+                // a carried frame-pointer register — `ret = local; if (ret[18] == 0)`
+                // — is valid here. Canonicalize the guard SPINE to the named field
+                // using those aliases, then run every downstream step on the PLAIN
+                // frame: the register alias never reaches case-body analysis, so a
+                // register access inside a body (possibly a clobbered copy on the
+                // branch path) is never mis-renamed. After the `if` the branches
+                // merge, so no register state carries past it.
+                let had_aliases = !carry.regs.is_empty();
+                let cond_frame = carry.effective_frame_peek(&condition, frame);
+                carry = FramePtrTracker::default();
+                let (condition, then_body, else_body) = if had_aliases {
+                    match rewrite_dispatch_guards(
+                        StructuredNode::If {
+                            condition,
+                            then_body,
+                            else_body,
+                        },
+                        &cond_frame,
+                        state,
+                    ) {
+                        StructuredNode::If {
+                            condition,
+                            then_body,
+                            else_body,
+                        } => (condition, then_body, else_body),
+                        _ => unreachable!("rewrite_dispatch_guards preserves the If"),
+                    }
+                } else {
+                    (condition, then_body, else_body)
+                };
+
                 // A temp the branches reassign no longer holds the state after the
                 // `if`, so invalidate those bindings for the following siblings.
                 let mut reassigned = assigned_vars(&then_body);
@@ -1536,10 +1714,29 @@ fn rewrite_nodes(
                 });
                 kill(env);
             }
+            StructuredNode::Sequence(seq) => {
+                // A `Sequence` is a transparent inline run of fall-through nodes, so
+                // the carried aliases flow into it — a dispatch wrapped as
+                // `Sequence([if (ret[18] == 0) ...])` after `ret = local` still has
+                // its guards canonicalized and flattens. Reset after (the sequence's
+                // end state isn't threaded back to the following sibling). Env is
+                // cloned like `rewrite_structural`, and temps the sequence reassigns
+                // are killed for the following siblings, matching the old path.
+                let reassigned = assigned_vars(&seq);
+                let inner =
+                    rewrite_nodes_seeded(seq, frame, state, &mut env.clone(), domain, &carry);
+                carry = FramePtrTracker::default();
+                out.push(StructuredNode::Sequence(inner));
+                for n in &reassigned {
+                    env.state_temps.remove(n);
+                    env.slice_temps.remove(n);
+                }
+            }
             other => {
-                // Loops/switch/try-catch bodies may reassign a state temp; kill
-                // those bindings for the following siblings. (Frame-pointer register
-                // aliases are tracked block-locally, so nothing to invalidate here.)
+                // Loops/switch/try-catch/labels/goto break straight-line flow (a
+                // `Label` is a join point reachable from elsewhere), so reset the
+                // carried register aliases — nothing survives to the next sibling.
+                carry = FramePtrTracker::default();
                 let reassigned = assigned_vars(std::slice::from_ref(&other));
                 out.push(rewrite_structural(other, frame, state, env, domain));
                 for n in &reassigned {
@@ -1642,11 +1839,62 @@ fn rewrite_structural(
     }
 }
 
+/// Canonicalize the comparisons on a dispatch if-tree's guard SPINE from a carried
+/// frame-pointer register to the named field: `if (ret[18] == K)` (after
+/// `ret = local`) becomes `if (frame->__resume_index == K)`. `cond_frame` carries
+/// the register alias, valid at every guard on the spine (the comparisons don't
+/// clobber the register). Only pure-navigation guards are rewritten — recursion
+/// stops at any branch that isn't itself a single state-compare `If`, so a leaf
+/// case BODY (a `Block`, where the register may be clobbered) is never touched.
+/// After this the whole tree references the frame directly and the flattener runs
+/// on the plain frame, so no register alias reaches body analysis.
+fn rewrite_dispatch_guards(node: StructuredNode, cond_frame: &Frame, state: &StateField) -> StructuredNode {
+    let StructuredNode::If {
+        condition,
+        then_body,
+        else_body,
+    } = node
+    else {
+        return node;
+    };
+    // Only a direct (register-aliased) state comparison is a guard we rewrite; a
+    // temp-based or non-state condition is left for the existing paths.
+    if as_state_compare(&condition, cond_frame, state, &BindingEnv::default()).is_none() {
+        return StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        };
+    }
+    let recur = |b: Vec<StructuredNode>| -> Vec<StructuredNode> {
+        // A branch continues the navigation spine only if it is exactly one `If`;
+        // anything else (a leaf body block, a reload prefix, multiple nodes) stops
+        // rewriting so its register accesses are left untouched.
+        if b.len() == 1 && matches!(b[0], StructuredNode::If { .. }) {
+            b.into_iter()
+                .map(|n| rewrite_dispatch_guards(n, cond_frame, state))
+                .collect()
+        } else {
+            b
+        }
+    };
+    StructuredNode::If {
+        condition: rename_state_in_expr(condition, cond_frame, state),
+        then_body: recur(then_body),
+        else_body: else_body.map(recur),
+    }
+}
+
 /// Attempt to flatten an `If` rooted state dispatch into a `Switch`. Returns
 /// `None` (leaving the if-tree untouched) unless ≥2 distinct equality cases are
 /// confidently recovered. The unmatched-state behavior (default and any explicit
 /// trap cases) is computed by evaluating each reachable state value through the
 /// original tree, so trapping and fall-through states are emitted exactly.
+///
+/// The tree is expected to reference the frame directly (any dispatch guard made
+/// through a carried frame-pointer register is canonicalized to the named field by
+/// `rewrite_dispatch_guards` before this runs), so a single plain `frame` is used
+/// throughout — no register alias reaches case-body analysis.
 fn try_flatten_switch(
     condition: &Expr,
     then_body: &[StructuredNode],
@@ -3110,6 +3358,218 @@ mod tests {
         full.extend(body);
         let out = recover_resume_dispatch(full);
         assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn flattens_cross_sibling_inline_compare_through_register_alias() {
+        // local = arg0;              (block A)
+        // ret = local;               (block B: ret is a frame copy)
+        // if (ret[18] == 0) A else if (ret[18] == 1) B
+        // The resume index is compared INLINE in the following sibling `if`, through
+        // the register copied in block B. The alias carries across the fall-through
+        // into the condition, so the dispatch flattens.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn cross_sibling_alias_does_not_rename_case_body_access() {
+        // local = arg0; ret = local;
+        // if (ret[18] == 0) { ret[18] = 5; } else if (ret[18] == 1) B
+        // The guard `ret[18]` flattens via the carried alias, but the case body's
+        // `ret[18] = 5` must NOT be renamed: on the branch path the copy in `ret`
+        // may have been clobbered, so bodies are rewritten with the plain frame.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(), 0),
+                vec![block(vec![Expr::assign(ret_state(), Expr::int(5))])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("ArrayAccess") && !c0.contains("__resume_index"),
+            "case-body register access was wrongly renamed: {c0}"
+        );
+    }
+
+    #[test]
+    fn cross_sibling_case_body_field_does_not_outrank_resume_field() {
+        // local = arg0; ret = local;
+        // if (ret[18] == 0) { if (ret[50]==0) A else if (ret[50]==1) B else C }
+        // else if (ret[18] == 1) D
+        // The case-0 body compares a DIFFERENT frame field (offset 50*2) more times
+        // than the real resume field (offset 18*2). The carried alias must not be
+        // counted through the case body, so the shallow resume field still wins and
+        // the outer dispatch flattens on offset 36 (index 18), not 100 (index 50).
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let idx = |n| Expr::array_access(ret(), Expr::int(n), 2);
+        let inner = iff(
+            cmp(BinOpKind::Eq, idx(50), 0),
+            vec![block(vec![Expr::unknown("a")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, idx(50), 1),
+                vec![block(vec![Expr::unknown("b")])],
+                vec![block(vec![Expr::unknown("c")])],
+            )],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, idx(18), 0),
+                vec![inner],
+                vec![iff(
+                    cmp(BinOpKind::Eq, idx(18), 1),
+                    vec![block(vec![Expr::unknown("d")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        // The recovered switch is on the resume field (index 18 = offset 36), with
+        // the two outer cases — not on the inner branch-body field.
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn range_guard_body_dispatch_on_other_field_is_not_selected() {
+        // local = arg0; ret = local;
+        // if (ret[18] <= 0) { if (ret[50]==0/1/2) ... }   (then-body dispatch on 50)
+        // else if (ret[18] == 1) D
+        // The then-body navigates a DIFFERENT field (offset 100) more times than the
+        // resume field (offset 36). The carried alias must not flow into that body
+        // (its guard is on a different offset), so offset 100 is never chosen as the
+        // resume field. The resume field has a single equality here, so no switch is
+        // synthesized — but crucially not a bogus one on ret[50].
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let idx = |n| Expr::array_access(ret(), Expr::int(n), 2);
+        let then_body = iff(
+            cmp(BinOpKind::Eq, idx(50), 0),
+            vec![block(vec![Expr::unknown("a")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, idx(50), 1),
+                vec![block(vec![Expr::unknown("b")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, idx(50), 2),
+                    vec![block(vec![Expr::unknown("c")])],
+                    vec![],
+                )],
+            )],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Le, idx(18), 0),
+                vec![then_body],
+                vec![iff(
+                    cmp(BinOpKind::Eq, idx(18), 1),
+                    vec![block(vec![Expr::unknown("d")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        // No switch on the unrelated body field (offset 100 / index 50).
+        assert_eq!(switch_labels(&out), None);
+    }
+
+    #[test]
+    fn flattens_cross_sibling_dispatch_wrapped_in_sequence() {
+        // local = arg0; ret = local;
+        // Sequence([ if (ret[18]==0) A else if (ret[18]==1) B ])
+        // A transparent Sequence wrapper must not stop the carried alias, so the
+        // wrapped dispatch is still found and flattened.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let dispatch = iff(
+            cmp(BinOpKind::Eq, ret_state(), 0),
+            vec![block(vec![Expr::int(1)])],
+            vec![iff(
+                cmp(BinOpKind::Eq, ret_state(), 1),
+                vec![block(vec![Expr::int(2)])],
+                vec![],
+            )],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            StructuredNode::Sequence(vec![dispatch]),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert!(
+            body_has_resume_switch(&out),
+            "sequence-wrapped cross-sibling dispatch was not flattened: {out:?}"
+        );
+    }
+
+    #[test]
+    fn cross_sibling_case_body_reusing_register_is_preserved() {
+        // local = arg0; ret = local;
+        // if (ret[18] == 0) { rax = rax[18]; body_a } else if (ret[18] == 1) body_b
+        // The case-0 body overwrites `rax` and re-reads `rax[18]`; because the
+        // flattener runs on the plain frame (the guard spine was canonicalized to
+        // the named field first), that body block is NOT misread as droppable
+        // dispatch plumbing — the real body code survives.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(), 0),
+                vec![
+                    block(vec![Expr::assign(ret(), ret_state())]),
+                    block(vec![Expr::unknown("body_a")]),
+                ],
+                vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(), 1),
+                    vec![block(vec![Expr::unknown("body_b")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let case0 = case_body(&out, 0).expect("case 0");
+        let c0 = format!("{case0:?}");
+        assert!(
+            c0.contains("body_a"),
+            "case body reusing the register was wrongly dropped as plumbing: {c0}"
+        );
     }
 
     #[test]
