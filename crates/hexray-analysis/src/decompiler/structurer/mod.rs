@@ -2387,7 +2387,18 @@ impl<'a> Structurer<'a> {
                             cases,
                             default: None,
                         });
-                        break;
+                        // Continue structuring at the join so the shared continuation
+                        // is emitted immediately after the switch (each case's implicit
+                        // break falls into it). Leaving it to the address-sorted
+                        // orphan-block pass could interpose an unrelated block. When the
+                        // join is the enclosing region end (or none exists), stop.
+                        match switch_end {
+                            Some(join) if end != Some(join) => {
+                                current = Some(join);
+                                continue;
+                            }
+                            _ => break,
+                        }
                     }
 
                     // Fallback: emit block and break
