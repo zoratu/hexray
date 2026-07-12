@@ -77,14 +77,21 @@ struct StateField {
 /// Recover the resume dispatch in a coroutine clone body. Returns the body
 /// unchanged when no frame or confident dispatch is found.
 pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode> {
-    let Some(frame) = build_frame(&body) else {
+    // Normalize the dispatch spine by splicing transparent `Sequence` wrappers
+    // inline (constant propagation etc. can wrap fall-through code, or an `else if`
+    // continuation, as `Sequence([...])`). Analysis and the rewrite then run on a
+    // Sequence-free spine, so field detection, guard canonicalization, and the
+    // flattener all see the dispatch directly. On no recovery the ORIGINAL body is
+    // returned unchanged, so a non-coroutine or unrecovered clone is never restructured.
+    let normalized = flatten_spine_sequences(body.clone());
+    let Some(frame) = build_frame(&normalized) else {
         return body;
     };
-    let Some(state) = find_state_field(&body, &frame) else {
+    let Some(state) = find_state_field(&normalized, &frame) else {
         return body;
     };
     let mut env = BindingEnv::default();
-    let rewritten = rewrite_nodes(body.clone(), &frame, &state, &mut env, &Domain::default());
+    let rewritten = rewrite_nodes(normalized, &frame, &state, &mut env, &Domain::default());
     // The rewrite also renames the state field to `frame->__resume_index`; only
     // commit it when a dispatch actually flattened into a switch, so a field that
     // merely happened to be the most-compared one is never renamed in isolation.
@@ -93,6 +100,31 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
     } else {
         body
     }
+}
+
+/// Splice transparent `Sequence` wrappers inline throughout the dispatch spine
+/// (the top-level node list and every `If` branch, recursively), so downstream
+/// detection/rewrite/flatten never see a `Sequence` between a frame copy and its
+/// dispatch or wrapping an `else if` continuation. Loop/switch/try-catch bodies are
+/// left as-is — the resume dispatch is the outermost branching, never inside them.
+fn flatten_spine_sequences(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        match node {
+            StructuredNode::Sequence(inner) => out.extend(flatten_spine_sequences(inner)),
+            StructuredNode::If {
+                condition,
+                then_body,
+                else_body,
+            } => out.push(StructuredNode::If {
+                condition,
+                then_body: flatten_spine_sequences(then_body),
+                else_body: else_body.map(flatten_spine_sequences),
+            }),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Whether a (recovered) body contains the resume-index `switch` — i.e. the
@@ -695,6 +727,52 @@ struct OffsetStat {
 /// Ordered walk maintaining `temp -> frame offset` bindings; records each
 /// comparison's `(offset, const)` and the nesting depth against the binding live
 /// at that point.
+///
+/// Advance `carry`/`temp_offset` over one straight-line statement (a `Block`'s
+/// statement or a raw `Expr` node): a `tmp = <frame field>` load binds `tmp` to the
+/// offset; any other write clears the binding.
+fn scan_stmt_bindings(
+    stmt: &Expr,
+    frame: &Frame,
+    carry: &mut FramePtrTracker,
+    temp_offset: &mut HashMap<String, i64>,
+) {
+    let frame = &carry.effective_frame(stmt, frame);
+    match &stmt.kind {
+        ExprKind::Assign { lhs, rhs } => {
+            if let ExprKind::Var(v) = &lhs.kind {
+                match frame_offset(rhs, frame) {
+                    Some(off) => {
+                        temp_offset.insert(v.name.clone(), off);
+                    }
+                    None => {
+                        temp_offset.remove(&v.name);
+                    }
+                }
+            }
+        }
+        // A compound assignment mutates the temp — clear its binding.
+        ExprKind::CompoundAssign { lhs, .. } => {
+            if let ExprKind::Var(v) = &lhs.kind {
+                temp_offset.remove(&v.name);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Splice transparent `Sequence` wrappers inline so the alias carry flows across
+/// them (constant propagation can emit `Sequence([...])` between a frame copy and
+/// its dispatch); other nodes pass through unchanged.
+fn flatten_transparent_seq<'a>(nodes: &'a [StructuredNode], out: &mut Vec<&'a StructuredNode>) {
+    for n in nodes {
+        match n {
+            StructuredNode::Sequence(inner) => flatten_transparent_seq(inner, out),
+            other => out.push(other),
+        }
+    }
+}
+
 fn scan_state_compares(
     nodes: &[StructuredNode],
     frame: &Frame,
@@ -712,35 +790,20 @@ fn scan_state_compares(
     // branch body's leading guard — an `else if (ret[18] == 1)` chain keeps `ret` as
     // the frame along the guard chain — without any soundness risk.
     let mut carry = entry_carry.clone();
-    for node in nodes {
+    // Splice transparent `Sequence` wrappers inline so the carry flows across them.
+    let mut flat: Vec<&StructuredNode> = Vec::with_capacity(nodes.len());
+    flatten_transparent_seq(nodes, &mut flat);
+    for node in flat {
         match node {
             StructuredNode::Block { statements, .. } => {
                 for stmt in statements {
-                    let frame = &carry.effective_frame(stmt, frame);
-                    match &stmt.kind {
-                        ExprKind::Assign { lhs, rhs } => {
-                            if let ExprKind::Var(v) = &lhs.kind {
-                                match frame_offset(rhs, frame) {
-                                    Some(off) => {
-                                        temp_offset.insert(v.name.clone(), off);
-                                    }
-                                    None => {
-                                        temp_offset.remove(&v.name);
-                                    }
-                                }
-                            }
-                        }
-                        // A compound assignment mutates the temp — clear its binding
-                        // so a later comparison of the modified value isn't
-                        // attributed to the original frame offset.
-                        ExprKind::CompoundAssign { lhs, .. } => {
-                            if let ExprKind::Var(v) = &lhs.kind {
-                                temp_offset.remove(&v.name);
-                            }
-                        }
-                        _ => {}
-                    }
+                    scan_stmt_bindings(stmt, frame, &mut carry, temp_offset);
                 }
+            }
+            // A raw `Expr` node is a single straight-line statement — advance through
+            // it (it may be the `ret = local` / `tmp = ret[18]` itself).
+            StructuredNode::Expr(e) => {
+                scan_stmt_bindings(e, frame, &mut carry, temp_offset);
             }
             StructuredNode::If {
                 condition,
@@ -749,47 +812,66 @@ fn scan_state_compares(
             } => {
                 // The condition runs on fall-through from the preceding block, so it
                 // may use the carried aliases. A branch keeps those aliases only if
-                // it PROVABLY continues navigating the SAME field: a single nested
-                // `If` whose guard compares the same frame offset (an
-                // `else if (ret[18] == 1)` chain, or a binary-search node still on
-                // `ret[18]`). A leaf case BODY — or a nested dispatch on a DIFFERENT
-                // field, `if (ret[50] == ...)` — must not inherit the alias, else its
-                // comparisons pollute resume-field selection.
+                // it is a TRUE dispatch continuation: a single nested `If` whose guard
+                // navigates the SAME frame offset, AND whose arm can still hold OTHER
+                // state values. An `==` guard's true arm is a concrete case (state is
+                // fixed there), `!=`'s false arm likewise; a range guard leaves both
+                // arms open. So a case BODY — even one that is a single `If` on the
+                // same field (`if (ret[18]==0){ if (ret[18]==1) }`) or a different
+                // field (`if (ret[50]==0)`) — is never counted against the resume
+                // field.
                 let cond_frame = carry.effective_frame_peek(condition, frame);
                 note_state_compare(condition, &cond_frame, temp_offset, stats, depth);
-                let guard_off =
-                    compare_to_frame_offset(condition, &cond_frame, temp_offset).map(|(o, _, _)| o);
+                let parent = compare_to_frame_offset(condition, &cond_frame, temp_offset);
+                let parent_off = parent.map(|(o, _, _)| o);
+                let then_open = parent.is_some_and(|(_, _, op)| op != BinOpKind::Eq);
+                let else_open = parent.is_some_and(|(_, _, op)| op != BinOpKind::Ne);
                 let branch_carry = carry.clone();
                 carry = FramePtrTracker::default();
                 let empty = FramePtrTracker::default();
-                let seed = |b: &[StructuredNode]| -> &FramePtrTracker {
-                    match (guard_off, b) {
-                        (Some(o), [StructuredNode::If { condition: c, .. }])
-                            if compare_to_frame_offset(c, &cond_frame, temp_offset)
-                                .map(|(off, _, _)| off)
-                                == Some(o) =>
-                        {
-                            &branch_carry
+                let seed = |b: &[StructuredNode], arm_open: bool| -> &FramePtrTracker {
+                    if arm_open {
+                        if let [StructuredNode::If { condition: inner, .. }] = b {
+                            let inner_frame = branch_carry.effective_frame_peek(inner, frame);
+                            let inner_off = compare_to_frame_offset(inner, &inner_frame, temp_offset)
+                                .map(|(o, _, _)| o);
+                            if parent_off.is_some() && inner_off == parent_off {
+                                return &branch_carry;
+                            }
                         }
-                        _ => &empty,
                     }
+                    &empty
+                };
+                // In a CLOSED arm (== true / != false) the state equals the matched
+                // value, so a temp holding the parent offset is a known constant, not a
+                // dispatch variable — drop those bindings so a dead nested `tmp == K`
+                // there isn't counted as another value for the resume field (mirrors
+                // the register-carry suppression above).
+                let branch_temps = |arm_open: bool| -> HashMap<String, i64> {
+                    let mut t = temp_offset.clone();
+                    if !arm_open {
+                        if let Some(off) = parent_off {
+                            t.retain(|_, v| *v != off);
+                        }
+                    }
+                    t
                 };
                 scan_state_compares(
                     then_body,
                     frame,
-                    &mut temp_offset.clone(),
+                    &mut branch_temps(then_open),
                     stats,
                     depth + 1,
-                    seed(then_body),
+                    seed(then_body, then_open),
                 );
                 if let Some(b) = else_body {
                     scan_state_compares(
                         b,
                         frame,
-                        &mut temp_offset.clone(),
+                        &mut branch_temps(else_open),
                         stats,
                         depth + 1,
-                        seed(b),
+                        seed(b, else_open),
                     );
                 }
             }
@@ -840,14 +922,7 @@ fn scan_state_compares(
                     );
                 }
             }
-            StructuredNode::Sequence(nodes) => {
-                // A `Sequence` is a transparent inline run of fall-through nodes, so
-                // the aliases flow through it (a dispatch wrapped as
-                // `Sequence([if (ret[18] == 0) ...])` after `ret = local` is still
-                // found). Reset after — the sequence's end state isn't threaded back.
-                scan_state_compares(nodes, frame, temp_offset, stats, depth, &carry);
-                carry = FramePtrTracker::default();
-            }
+            // `Sequence` nodes were spliced inline by `flatten_transparent_seq`.
             StructuredNode::TryCatch {
                 try_body,
                 catch_handlers,
@@ -1590,12 +1665,14 @@ fn rewrite_nodes(
     env: &mut BindingEnv,
     domain: &Domain,
 ) -> Vec<StructuredNode> {
-    rewrite_nodes_seeded(nodes, frame, state, env, domain, &FramePtrTracker::default())
+    rewrite_nodes_seeded(nodes, frame, state, env, domain, &FramePtrTracker::default()).0
 }
 
 /// [`rewrite_nodes`] whose frame-pointer register carry starts from `entry_carry`
 /// (the aliases live on entry to this node list — non-empty only for a transparent
-/// `Sequence` wrapping fall-through code from a preceding block).
+/// `Sequence` wrapping fall-through code from a preceding block). Returns the
+/// rewritten nodes and the carry left at the END of the list, so a caller can thread
+/// it across a transparent wrapper.
 fn rewrite_nodes_seeded(
     nodes: Vec<StructuredNode>,
     frame: &Frame,
@@ -1603,7 +1680,7 @@ fn rewrite_nodes_seeded(
     env: &mut BindingEnv,
     domain: &Domain,
     entry_carry: &FramePtrTracker,
-) -> Vec<StructuredNode> {
+) -> (Vec<StructuredNode>, FramePtrTracker) {
     let mut out = Vec::with_capacity(nodes.len());
     // Frame-pointer register aliases live at the start of the current sibling,
     // carried from the preceding straight-line node (see `FramePtrTracker`). Reset
@@ -1660,6 +1737,7 @@ fn rewrite_nodes_seeded(
                         },
                         &cond_frame,
                         state,
+                        env,
                     ) {
                         StructuredNode::If {
                             condition,
@@ -1716,21 +1794,30 @@ fn rewrite_nodes_seeded(
             }
             StructuredNode::Sequence(seq) => {
                 // A `Sequence` is a transparent inline run of fall-through nodes, so
-                // the carried aliases flow into it — a dispatch wrapped as
-                // `Sequence([if (ret[18] == 0) ...])` after `ret = local` still has
-                // its guards canonicalized and flattens. Reset after (the sequence's
-                // end state isn't threaded back to the following sibling). Env is
-                // cloned like `rewrite_structural`, and temps the sequence reassigns
-                // are killed for the following siblings, matching the old path.
+                // the carried aliases flow into it AND its end state threads back to
+                // the following sibling — a dispatch wrapped as
+                // `Sequence([if (ret[18] == 0) ...])`, or an empty `Sequence([])`
+                // between the frame copy and the dispatch, no longer breaks recovery.
+                // Env is cloned like `rewrite_structural`, and temps the sequence
+                // reassigns are killed for the following siblings, matching the old
+                // path.
                 let reassigned = assigned_vars(&seq);
-                let inner =
+                let (inner, end) =
                     rewrite_nodes_seeded(seq, frame, state, &mut env.clone(), domain, &carry);
-                carry = FramePtrTracker::default();
+                carry = end;
                 out.push(StructuredNode::Sequence(inner));
                 for n in &reassigned {
                     env.state_temps.remove(n);
                     env.slice_temps.remove(n);
                 }
+            }
+            StructuredNode::Expr(e) => {
+                // A raw `Expr` node is a single straight-line statement — advance the
+                // carry through it (it may be `ret = local` / a state store) and bind
+                // any `tmp = <state>` into env, mirroring a one-statement block.
+                env.note_block_seeded(std::slice::from_ref(&e), frame, state, &carry);
+                let eff = carry.effective_frame(&e, frame);
+                out.push(StructuredNode::Expr(rename_state_in_expr(e, &eff, state)));
             }
             other => {
                 // Loops/switch/try-catch/labels/goto break straight-line flow (a
@@ -1746,7 +1833,7 @@ fn rewrite_nodes_seeded(
             }
         }
     }
-    out
+    (out, carry)
 }
 
 /// Recurse into the structural children of loops/switch/etc. with a fresh env
@@ -1848,7 +1935,12 @@ fn rewrite_structural(
 /// case BODY (a `Block`, where the register may be clobbered) is never touched.
 /// After this the whole tree references the frame directly and the flattener runs
 /// on the plain frame, so no register alias reaches body analysis.
-fn rewrite_dispatch_guards(node: StructuredNode, cond_frame: &Frame, state: &StateField) -> StructuredNode {
+fn rewrite_dispatch_guards(
+    node: StructuredNode,
+    cond_frame: &Frame,
+    state: &StateField,
+    env: &BindingEnv,
+) -> StructuredNode {
     let StructuredNode::If {
         condition,
         then_body,
@@ -1857,22 +1949,29 @@ fn rewrite_dispatch_guards(node: StructuredNode, cond_frame: &Frame, state: &Sta
     else {
         return node;
     };
-    // Only a direct (register-aliased) state comparison is a guard we rewrite; a
-    // temp-based or non-state condition is left for the existing paths.
-    if as_state_compare(&condition, cond_frame, state, &BindingEnv::default()).is_none() {
+    // Only a state comparison is a guard we recurse through — but recognized against
+    // the LIVE env, so a mixed tree whose root guard is a state TEMP
+    // (`tmp = ret[18]; if (tmp <= 1) { if (ret[18] == 0) ... }`) still descends to
+    // canonicalize the nested register-aliased guards. rename_state_in_expr only
+    // rewrites a direct register-aliased frame access, so a temp-based condition is
+    // left untouched for the env-based paths. `as_state_compare` matches only the
+    // resume field, so recursion never enters an unrelated-offset sub-dispatch.
+    let Some((parent_op, _)) = as_state_compare(&condition, cond_frame, state, env) else {
         return StructuredNode::If {
             condition,
             then_body,
             else_body,
         };
-    }
-    let recur = |b: Vec<StructuredNode>| -> Vec<StructuredNode> {
-        // A branch continues the navigation spine only if it is exactly one `If`;
-        // anything else (a leaf body block, a reload prefix, multiple nodes) stops
-        // rewriting so its register accesses are left untouched.
-        if b.len() == 1 && matches!(b[0], StructuredNode::If { .. }) {
+    };
+    let recur = |b: Vec<StructuredNode>, arm_open: bool| -> Vec<StructuredNode> {
+        // Recurse only into an arm that can still hold OTHER state values (== -> else,
+        // != -> then, ranges -> both), and only when it is exactly one `If`. An `==`
+        // guard's true arm is a concrete case BODY — descending would rewrite its
+        // `ret[..]` accesses even though the register may be clobbered there, so it is
+        // left untouched (matches `scan_state_compares`).
+        if arm_open && b.len() == 1 && matches!(b[0], StructuredNode::If { .. }) {
             b.into_iter()
-                .map(|n| rewrite_dispatch_guards(n, cond_frame, state))
+                .map(|n| rewrite_dispatch_guards(n, cond_frame, state, env))
                 .collect()
         } else {
             b
@@ -1880,8 +1979,8 @@ fn rewrite_dispatch_guards(node: StructuredNode, cond_frame: &Frame, state: &Sta
     };
     StructuredNode::If {
         condition: rename_state_in_expr(condition, cond_frame, state),
-        then_body: recur(then_body),
-        else_body: else_body.map(recur),
+        then_body: recur(then_body, parent_op != BinOpKind::Eq),
+        else_body: else_body.map(|b| recur(b, parent_op != BinOpKind::Ne)),
     }
 }
 
@@ -3462,27 +3561,32 @@ mod tests {
     }
 
     #[test]
-    fn range_guard_body_dispatch_on_other_field_is_not_selected() {
-        // local = arg0; ret = local;
-        // if (ret[18] <= 0) { if (ret[50]==0/1/2) ... }   (then-body dispatch on 50)
-        // else if (ret[18] == 1) D
-        // The then-body navigates a DIFFERENT field (offset 100) more times than the
-        // resume field (offset 36). The carried alias must not flow into that body
-        // (its guard is on a different offset), so offset 100 is never chosen as the
-        // resume field. The resume field has a single equality here, so no switch is
-        // synthesized — but crucially not a bogus one on ret[50].
+    fn eq_case_body_temp_nested_compare_is_not_counted() {
+        // local = arg0; ret = local; tmp = ret[18];
+        // if (tmp == 5) { if (tmp == 6) A else B }        [dead nested temp compare]
+        // else { if (local[50]==0) X else if (==1) Y else if (==2) Z }
+        // `tmp` is bound to offset 36 from the register-aliased reload. In the `==`
+        // true arm the state is fixed at 5, so the dead `tmp == 6` must NOT be counted
+        // (the temp binding is scoped out of the closed arm), otherwise offset 36 gets
+        // two shallow values and outranks the genuine offset-50 dispatch in the else.
         let local = || Expr::var(Variable::stack(-8, 8));
         let ret = || Expr::var(Variable::reg("rax", 8));
-        let idx = |n| Expr::array_access(ret(), Expr::int(n), 2);
-        let then_body = iff(
-            cmp(BinOpKind::Eq, idx(50), 0),
+        let tmp = || Expr::var(Variable::reg("edx", 4));
+        let lidx = |n| Expr::array_access(local(), Expr::int(n), 2);
+        let dead = iff(
+            cmp(BinOpKind::Eq, tmp(), 6),
             vec![block(vec![Expr::unknown("a")])],
+            vec![block(vec![Expr::unknown("b")])],
+        );
+        let real = iff(
+            cmp(BinOpKind::Eq, lidx(50), 0),
+            vec![block(vec![Expr::unknown("x")])],
             vec![iff(
-                cmp(BinOpKind::Eq, idx(50), 1),
-                vec![block(vec![Expr::unknown("b")])],
+                cmp(BinOpKind::Eq, lidx(50), 1),
+                vec![block(vec![Expr::unknown("y")])],
                 vec![iff(
-                    cmp(BinOpKind::Eq, idx(50), 2),
-                    vec![block(vec![Expr::unknown("c")])],
+                    cmp(BinOpKind::Eq, lidx(50), 2),
+                    vec![block(vec![Expr::unknown("z")])],
                     vec![],
                 )],
             )],
@@ -3490,19 +3594,204 @@ mod tests {
         let body = vec![
             block(vec![Expr::assign(local(), frame())]),
             block(vec![Expr::assign(ret(), local())]),
-            iff(
-                cmp(BinOpKind::Le, idx(18), 0),
-                vec![then_body],
+            block(vec![Expr::assign(tmp(), Expr::array_access(ret(), Expr::int(18), 2))]),
+            iff(cmp(BinOpKind::Eq, tmp(), 5), vec![dead], vec![real]),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn eq_case_body_same_field_nested_if_is_not_counted() {
+        // local = arg0; ret = local;
+        // if (ret[18] == 5) { if (ret[18] == 6) A else B }   [a dead nested compare]
+        // else { if (local[50]==0) X else if (local[50]==1) Y else if (local[50]==2) Z }
+        // The `==` true arm is a concrete case (state fixed to 5 there), so its nested
+        // register-aliased `ret[18] == 6` must NOT be counted — otherwise offset 18
+        // gets two shallow values and outranks the genuine offset-50 dispatch in the
+        // else (accessed directly off the stack frame alias, so found without the
+        // register carry). The real dispatch must still be recovered on offset 50.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ridx = |n| Expr::array_access(ret(), Expr::int(n), 2);
+        let lidx = |n| Expr::array_access(local(), Expr::int(n), 2);
+        let dead = iff(
+            cmp(BinOpKind::Eq, ridx(18), 6),
+            vec![block(vec![Expr::unknown("a")])],
+            vec![block(vec![Expr::unknown("b")])],
+        );
+        let real = iff(
+            cmp(BinOpKind::Eq, lidx(50), 0),
+            vec![block(vec![Expr::unknown("x")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, lidx(50), 1),
+                vec![block(vec![Expr::unknown("y")])],
                 vec![iff(
-                    cmp(BinOpKind::Eq, idx(18), 1),
-                    vec![block(vec![Expr::unknown("d")])],
+                    cmp(BinOpKind::Eq, lidx(50), 2),
+                    vec![block(vec![Expr::unknown("z")])],
+                    vec![],
+                )],
+            )],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(cmp(BinOpKind::Eq, ridx(18), 5), vec![dead], vec![real]),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn single_if_body_on_other_field_does_not_win_field_selection() {
+        // local = arg0; ret = local;
+        // if (ret[18] <= 1) { if (ret[18]==0) A else if (ret[18]==1) B }
+        // else              { if (ret[50]==0) X else if (ret[50]==1) Y else if (ret[50]==2) Z }
+        // The else default body is a single `If` on a DIFFERENT field (offset 100)
+        // with MORE distinct constants than the resume field (offset 36), at the same
+        // depth. The alias must not carry into it, so the resume field still wins and
+        // the dispatch flattens on offset 36 (index 18).
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let idx = |n| Expr::array_access(ret(), Expr::int(n), 2);
+        let resume = iff(
+            cmp(BinOpKind::Eq, idx(18), 0),
+            vec![block(vec![Expr::unknown("a")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, idx(18), 1),
+                vec![block(vec![Expr::unknown("b")])],
+                vec![],
+            )],
+        );
+        let other = iff(
+            cmp(BinOpKind::Eq, idx(50), 0),
+            vec![block(vec![Expr::unknown("x")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, idx(50), 1),
+                vec![block(vec![Expr::unknown("y")])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, idx(50), 2),
+                    vec![block(vec![Expr::unknown("z")])],
+                    vec![],
+                )],
+            )],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(cmp(BinOpKind::Le, idx(18), 1), vec![resume], vec![other]),
+        ];
+        let out = recover_resume_dispatch(body);
+        // Recovered on the resume field (index 18), not the deeper other-field body.
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn flattens_mixed_temp_root_register_nested_dispatch() {
+        // local = arg0; ret = local; tmp = ret[18];
+        // if (tmp <= 1) { if (ret[18]==0) A else if (ret[18]==1) B }
+        // The ROOT guard is a state TEMP (bound from the register-aliased reload);
+        // the nested guards use the register alias directly. Guard canonicalization
+        // must recognize the temp root (via the live env) and still descend to
+        // rewrite the nested `ret[18]` guards, so the mixed tree flattens.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let tmp = || Expr::var(Variable::reg("edx", 4));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let inner = iff(
+            cmp(BinOpKind::Eq, ret_state(), 0),
+            vec![block(vec![Expr::unknown("a")])],
+            vec![iff(
+                cmp(BinOpKind::Eq, ret_state(), 1),
+                vec![block(vec![Expr::unknown("b")])],
+                vec![],
+            )],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            block(vec![Expr::assign(tmp(), ret_state())]),
+            iff(cmp(BinOpKind::Le, tmp(), 1), vec![inner], vec![]),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn flattens_cross_sibling_with_sequence_wrapped_continuation() {
+        // local = arg0; ret = local;
+        // if (ret[18]==0) A else Sequence([ if (ret[18]==1) B ])
+        // The `else if` continuation is wrapped in a transparent Sequence; spine
+        // normalization must splice it so both values are recovered.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![StructuredNode::Sequence(vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )])],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn empty_sequence_barrier_does_not_break_cross_sibling_recovery() {
+        // local = arg0; ret = local; Sequence([]); if (ret[18]==0) A else if (==1) B
+        // An empty transparent Sequence between the frame copy and the dispatch must
+        // not reset the carried alias (const-prop can emit one).
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            StructuredNode::Sequence(vec![]),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(), 1),
+                    vec![block(vec![Expr::int(2)])],
                     vec![],
                 )],
             ),
         ];
         let out = recover_resume_dispatch(body);
-        // No switch on the unrelated body field (offset 100 / index 50).
-        assert_eq!(switch_labels(&out), None);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
+    fn raw_expr_node_establishes_frame_ptr_alias() {
+        // local = arg0; Expr(ret = local); if (ret[18]==0) A else if (==1) B
+        // The frame copy is a raw `Expr` node (not a Block); it must advance the
+        // carry as straight-line so the following register-aliased dispatch flattens.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = || Expr::array_access(ret(), Expr::int(18), 2);
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            StructuredNode::Expr(Expr::assign(ret(), local())),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(), 0),
+                vec![block(vec![Expr::int(1)])],
+                vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(), 1),
+                    vec![block(vec![Expr::int(2)])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
     }
 
     #[test]
@@ -3532,6 +3821,46 @@ mod tests {
         assert!(
             body_has_resume_switch(&out),
             "sequence-wrapped cross-sibling dispatch was not flattened: {out:?}"
+        );
+    }
+
+    #[test]
+    fn eq_case_body_single_if_on_register_is_not_rewritten() {
+        // local = arg0; ret = local;
+        // if (ret[18] == 0) { if (ret[18] == 6) A else B } else if (ret[18] == 1) C
+        // case 0's body is itself a single `If` on the same register. The guard
+        // canonicalization must NOT descend into it (the `==` true arm is a concrete
+        // case), so the body's `ret[18] == 6` stays a raw access, not dispatch logic.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let ret = || Expr::var(Variable::reg("rax", 8));
+        let ret_state = |k| Expr::array_access(ret(), Expr::int(k), 2);
+        let case0 = iff(
+            cmp(BinOpKind::Eq, ret_state(6), 0),
+            vec![block(vec![Expr::unknown("a")])],
+            vec![block(vec![Expr::unknown("b")])],
+        );
+        let body = vec![
+            block(vec![Expr::assign(local(), frame())]),
+            block(vec![Expr::assign(ret(), local())]),
+            iff(
+                cmp(BinOpKind::Eq, ret_state(18), 0),
+                vec![case0],
+                vec![iff(
+                    cmp(BinOpKind::Eq, ret_state(18), 1),
+                    vec![block(vec![Expr::unknown("c")])],
+                    vec![],
+                )],
+            ),
+        ];
+        let out = recover_resume_dispatch(body);
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+        let c0 = format!("{:?}", case_body(&out, 0).expect("case 0"));
+        // The case body's inner compare stays a raw register access (ArrayAccess),
+        // not a second __resume_index dispatch. (The outer switch value is the only
+        // __resume_index; the body keeps ret[6].)
+        assert!(
+            c0.contains("ArrayAccess") && !c0.contains("__resume_index"),
+            "concrete == case body was wrongly rewritten as dispatch: {c0}"
         );
     }
 
