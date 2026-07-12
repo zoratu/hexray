@@ -166,18 +166,20 @@ pub fn rewrite_clang_resume_dispatch(
         return None;
     }
 
-    // Both branch targets must be genuine resume-state BODIES. `dispatch_spills_index`
-    // catches multi-state chains that spill the index for later compares, but a chain
-    // can also carry the index in a register (no spill) into a continuation-compare on
-    // the false edge. Treating that continuation as case 1 would drop the states it
-    // guards, so decline if either target (after trivial routing) re-dispatches on the
-    // resume index. Seed the check with EVERY register holding the live index at the
-    // dispatch branch (through copies/masks), not just the field-read destination.
-    let index_holders =
-        dispatch_index_holders(dispatch_block, disp.index_offset, disp.index_size);
-    if states.iter().any(|&t| {
-        target_redispatches_index(cfg, t, &index_holders, disp.index_offset, disp.index_size)
-    }) {
+    // Reject multi-state compare CHAINS conservatively. A genuine two-state dispatch
+    // reads the resume-index field EXACTLY once (in the dispatch) and tests it once; a
+    // longer chain re-tests the index for each further state, which clang -O0 does by
+    // EITHER spilling the index and reloading it, OR re-reading the frame field in a
+    // continuation block. Decline both forms:
+    //   * `dispatch_spills_index` rejects the spill-and-reload form.
+    //   * a field read anywhere but the dispatch rejects the re-read form.
+    // This is a deliberately conservative, provenance-free guard (a dedicated
+    // multi-state slice can flatten longer chains). A chain that instead CARRIES the
+    // index in a register with neither a spill nor a re-read cannot be distinguished
+    // here without whole-function dataflow, but clang -O0 does not emit that shape, so
+    // it is out of scope.
+    if !index_field_read_only_in_dispatch(cfg, disp.dispatch, disp.index_offset, disp.index_size)
+    {
         return None;
     }
 
@@ -299,15 +301,37 @@ fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u
     false
 }
 
-/// Registers holding the live resume index at the dispatch block's terminating branch
-/// (after any copies/masks of the field read). Used to seed the target re-dispatch
-/// check with the register(s) actually carried into the branch targets.
-fn dispatch_index_holders(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> Vec<String> {
-    let mut holders: Vec<String> = Vec::new();
-    for inst in &dispatch.instructions {
-        update_index_holders(inst, index_offset, index_size, &mut holders);
+/// Whether the resume-index field `frame[index_offset]` (of `index_size` bytes) is read
+/// in NO block other than the dispatch. A multi-state compare chain re-reads the field
+/// (or a spilled reload of it) in a continuation block for each extra state test, so a
+/// read outside the dispatch means this is not a genuine two-state dispatch. Provenance
+/// -free and deliberately conservative (see the caller's note).
+fn index_field_read_only_in_dispatch(
+    cfg: &ControlFlowGraph,
+    dispatch_id: BasicBlockId,
+    index_offset: i64,
+    index_size: u8,
+) -> bool {
+    for block in cfg.blocks() {
+        if block.id == dispatch_id {
+            continue;
+        }
+        for inst in &block.instructions {
+            if matches!(inst.operation, Operation::Move | Operation::Load) {
+                if let (Some(Operand::Register(_)), Some(Operand::Memory(m))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                {
+                    if m.index.is_none()
+                        && m.displacement == index_offset
+                        && u16::from(m.size) == u16::from(index_size)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
     }
-    holders
+    true
 }
 
 /// Order a two-state dispatch's resume targets by index value `[state0, state1]`, or
@@ -516,95 +540,6 @@ fn update_zero_regs(inst: &hexray_core::Instruction, zero: &mut Vec<String>) {
 /// The architectural zero register (`wzr`/`xzr` on aarch64), which always reads as 0.
 fn is_zero_register(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "wzr" | "xzr")
-}
-
-/// Whether `target`, after routing through trivial jump-only blocks, is a
-/// continuation-compare that re-dispatches on the resume index (a multi-state chain)
-/// rather than a genuine resume-state body. Such a block re-tests the index — either
-/// reloading the frame field or testing the index register still carried from the
-/// dispatch — and ends in a conditional branch.
-fn target_redispatches_index(
-    cfg: &ControlFlowGraph,
-    target: BasicBlockId,
-    seed_holders: &[String],
-    index_offset: i64,
-    index_size: u8,
-) -> bool {
-    let landing = route_trivial_jumps(cfg, target);
-    let Some(block) = cfg.block(landing) else {
-        return false;
-    };
-    if !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. }) {
-        return false;
-    }
-    // Registers holding the resume index: everything carried live from the dispatch
-    // branch (`seed_holders`, which already accounts for copies/masks there), plus any
-    // fresh reload of the frame field or further copies/masks in this block. A
-    // compare/test/sub reading any of them re-dispatches on the index.
-    let mut holders: Vec<String> = seed_holders.to_vec();
-    for inst in &block.instructions {
-        if matches!(
-            inst.operation,
-            Operation::Compare | Operation::Test | Operation::Sub
-        ) {
-            let touches_index = inst.operands.iter().any(|o| {
-                matches!(o, Operand::Register(r) if holders.contains(&canon_reg(r.name())))
-            });
-            if touches_index {
-                return true;
-            }
-        }
-        update_index_holders(inst, index_offset, index_size, &mut holders);
-    }
-    false
-}
-
-/// Follow trivial routing blocks (nothing but unconditional `jmp`s / an empty
-/// fall-through, or a no-op `e9 00000000` jump the CFG builder mislabeled `Return`)
-/// from `start` to the first block that does real work, so a continuation reached only
-/// through clang's padding jumps is inspected. A block carrying ANY real instruction
-/// (e.g. a copied/reloaded index falling through to the compare) is NOT skipped — that
-/// instruction is part of the continuation. Bounded to avoid cycles.
-fn route_trivial_jumps(cfg: &ControlFlowGraph, start: BasicBlockId) -> BasicBlockId {
-    use std::collections::{HashMap, HashSet};
-    let start_to_id: HashMap<u64, BasicBlockId> = cfg.blocks().map(|b| (b.start, b.id)).collect();
-    let mut cur = start;
-    let mut seen = HashSet::new();
-    for _ in 0..16 {
-        if !seen.insert(cur) {
-            break;
-        }
-        let Some(b) = cfg.block(cur) else {
-            break;
-        };
-        let next = match &b.terminator {
-            // A block that is nothing but unconditional jump(s) / an empty fall-through
-            // (its only instructions, if any, are the jumps themselves).
-            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
-                if b.instructions
-                    .iter()
-                    .all(|i| matches!(i.operation, Operation::Jump)) =>
-            {
-                Some(*target)
-            }
-            // A no-op jump mislabeled `Return`: its real successor is the block at the
-            // jump's fall-through address.
-            BlockTerminator::Return
-                if b.instructions.len() == 1
-                    && b.instructions.last().is_some_and(is_nop_jump) =>
-            {
-                b.instructions
-                    .last()
-                    .and_then(|i| start_to_id.get(&i.end_address()).copied())
-            }
-            _ => None,
-        };
-        match next {
-            Some(n) => cur = n,
-            None => break,
-        }
-    }
-    cur
 }
 
 /// The register operand holding the resume index in the dispatch block — the last
@@ -1762,136 +1697,6 @@ mod tests {
             size: bits,
             signed: false,
         })
-    }
-
-    #[test]
-    fn redispatch_detects_carried_index_continuation_compare() {
-        // A continuation block that tests the carried index register `al` then branches
-        // is a multi-state chain compare (`cmp al,1; je ...`), not a state body.
-        let al = r(0, 8);
-        let bb = BasicBlockId::new(5);
-        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
-        let mut cont = BasicBlock::new(bb, 0x600);
-        cont.instructions.push(
-            Instruction::new(0, 2, vec![], "cmp")
-                .with_operation(Operation::Compare)
-                .with_operands(vec![Operand::Register(al), imm1(8)]),
-        );
-        cont.terminator = BlockTerminator::ConditionalBranch {
-            condition: Condition::Equal,
-            true_target: BasicBlockId::new(6),
-            false_target: BasicBlockId::new(7),
-        };
-        cfg.add_block(cont);
-        assert!(target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
-    }
-
-    #[test]
-    fn redispatch_detects_copied_index_continuation_compare() {
-        // `mov ecx, eax; cmp ecx, 1; je ...` copies the carried index (eax) into ecx
-        // before testing it — still a multi-state chain compare.
-        let (eax, ecx) = (r(0, 32), r(1, 32));
-        let bb = BasicBlockId::new(5);
-        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
-        let mut cont = BasicBlock::new(bb, 0x600);
-        cont.instructions
-            .push(mov(Operand::Register(ecx), Operand::Register(eax)));
-        cont.instructions.push(
-            Instruction::new(0, 2, vec![], "cmp")
-                .with_operation(Operation::Compare)
-                .with_operands(vec![Operand::Register(ecx), imm1(32)]),
-        );
-        cont.terminator = BlockTerminator::ConditionalBranch {
-            condition: Condition::Equal,
-            true_target: BasicBlockId::new(6),
-            false_target: BasicBlockId::new(7),
-        };
-        cfg.add_block(cont);
-        assert!(target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
-    }
-
-    #[test]
-    fn redispatch_ignores_state_body_that_overwrites_index_reg() {
-        // A state body whose own conditional tests a register it just overwrote
-        // (`mov al,1; test al,al`) is NOT re-dispatching on the resume index.
-        let al = r(0, 8);
-        let bb = BasicBlockId::new(5);
-        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
-        let mut body = BasicBlock::new(bb, 0x50e);
-        body.instructions.push(mov(Operand::Register(al), imm1(8)));
-        body.instructions.push(
-            Instruction::new(0, 2, vec![], "test")
-                .with_operation(Operation::Test)
-                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
-        );
-        body.terminator = BlockTerminator::ConditionalBranch {
-            condition: Condition::NotEqual,
-            true_target: BasicBlockId::new(6),
-            false_target: BasicBlockId::new(7),
-        };
-        cfg.add_block(body);
-        assert!(!target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
-    }
-
-    #[test]
-    fn redispatch_ignores_non_conditional_state_body() {
-        // A target that is not a conditional-branch block is a state body.
-        let bb = BasicBlockId::new(5);
-        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
-        let mut body = BasicBlock::new(bb, 0x50e);
-        body.terminator = BlockTerminator::Return;
-        cfg.add_block(body);
-        assert!(!target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
-    }
-
-    #[test]
-    fn dispatch_index_holders_track_copy_before_branch() {
-        // `mov al,[frame+0x11]; mov cl,al` — the index is live in BOTH al and cl at the
-        // branch, so a continuation comparing the copy `cl` is still caught downstream.
-        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
-        block.instructions.push(mov(
-            Operand::Register(r(0, 8)),
-            Operand::Memory(MemoryRef::base_disp(r(0, 64), 0x11, 1)),
-        ));
-        block
-            .instructions
-            .push(mov(Operand::Register(r(1, 8)), Operand::Register(r(0, 8))));
-        let holders = dispatch_index_holders(&block, 0x11, 1);
-        assert!(
-            holders.contains(&"rax".to_string()) && holders.contains(&"rcx".to_string()),
-            "both index registers should be tracked, got {holders:?}"
-        );
-    }
-
-    #[test]
-    fn dispatch_index_holders_survive_zero_subtract() {
-        // aarch64 `ldrb w8,[frame+0x11]; subs w8,w8,w9` — `subs` of the index keeps it
-        // index-derived, so the holder set still carries it into the redispatch guard.
-        let a = Architecture::Arm64;
-        let gp = |id: u16, bits: u16| Register::new(a, RegisterClass::General, id, bits);
-        let (w8, w9, x29) = (gp(8, 32), gp(9, 32), gp(29, 64));
-        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x7b8);
-        block.instructions.push(
-            Instruction::new(0, 4, vec![], "ldrb")
-                .with_operation(Operation::Load)
-                .with_operands(vec![
-                    Operand::Register(w8),
-                    Operand::Memory(MemoryRef::base_disp(x29, 0x11, 1)),
-                ]),
-        );
-        block.instructions.push(
-            Instruction::new(0, 4, vec![], "subs")
-                .with_operation(Operation::Sub)
-                .with_operands(vec![
-                    Operand::Register(w8),
-                    Operand::Register(w8),
-                    Operand::Register(w9),
-                ]),
-        );
-        assert!(
-            dispatch_index_holders(&block, 0x11, 1).contains(&"x8".to_string()),
-            "the index must survive a zero/holder subtract"
-        );
     }
 
     #[test]
