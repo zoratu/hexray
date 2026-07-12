@@ -121,106 +121,55 @@ pub fn name_clang_resume_switch(body: Vec<StructuredNode>, offset: i64) -> Vec<S
     rename_synthetic_switch_value(body, &named)
 }
 
-/// Replace the value of every synthetic `switch (switch_value)` (the opaque
-/// placeholder emitted by the structurer's indirect-jump fallback) with `named`,
-/// recursing through the whole node tree. Only the CFG-recovered resume dispatch
-/// carries this exact placeholder, so no genuine switch is affected.
-fn rename_synthetic_switch_value(nodes: Vec<StructuredNode>, named: &Expr) -> Vec<StructuredNode> {
+/// Replace the value of the resume-dispatch `switch (switch_value)` with `named`.
+///
+/// The structurer's indirect-jump fallback labels EVERY unrecovered computed switch
+/// with the same `Unknown("switch_value")` placeholder, so a nested/user switch inside
+/// a resume-state body carries it too. Only the CFG-rewritten resume dispatch must be
+/// renamed: it is the OUTERMOST switch, reached along the straight-line spine (the
+/// top-level list, `Sequence` wrappers, and `If` branches — the same spine
+/// [`flatten_spine_sequences`] normalizes). So descend only that spine and rename the
+/// FIRST synthetic switch found, never recursing into switch cases, loops, or
+/// try-blocks where unrelated computed switches live.
+fn rename_synthetic_switch_value(
+    mut nodes: Vec<StructuredNode>,
+    named: &Expr,
+) -> Vec<StructuredNode> {
+    let mut done = false;
+    rename_first_spine_switch(&mut nodes, named, &mut done);
     nodes
-        .into_iter()
-        .map(|n| rename_synthetic_in_node(n, named))
-        .collect()
 }
 
-fn rename_synthetic_in_node(node: StructuredNode, named: &Expr) -> StructuredNode {
-    let recurse = |b: Vec<StructuredNode>| rename_synthetic_switch_value(b, named);
-    match node {
-        StructuredNode::Switch {
-            value,
-            cases,
-            default,
-        } => {
-            let value = if matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value") {
-                named.clone()
-            } else {
-                value
-            };
-            StructuredNode::Switch {
-                value,
-                cases: cases.into_iter().map(|(l, b)| (l, recurse(b))).collect(),
-                default: default.map(recurse),
-            }
+fn rename_first_spine_switch(nodes: &mut [StructuredNode], named: &Expr, done: &mut bool) {
+    for node in nodes.iter_mut() {
+        if *done {
+            return;
         }
-        StructuredNode::If {
-            condition,
-            then_body,
-            else_body,
-        } => StructuredNode::If {
-            condition,
-            then_body: recurse(then_body),
-            else_body: else_body.map(recurse),
-        },
-        StructuredNode::While {
-            condition,
-            body,
-            header,
-            exit_block,
-        } => StructuredNode::While {
-            condition,
-            body: recurse(body),
-            header,
-            exit_block,
-        },
-        StructuredNode::DoWhile {
-            body,
-            condition,
-            header,
-            exit_block,
-        } => StructuredNode::DoWhile {
-            body: recurse(body),
-            condition,
-            header,
-            exit_block,
-        },
-        StructuredNode::For {
-            init,
-            condition,
-            update,
-            body,
-            header,
-            exit_block,
-        } => StructuredNode::For {
-            init,
-            condition,
-            update,
-            body: recurse(body),
-            header,
-            exit_block,
-        },
-        StructuredNode::Loop {
-            body,
-            header,
-            exit_block,
-        } => StructuredNode::Loop {
-            body: recurse(body),
-            header,
-            exit_block,
-        },
-        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(recurse(nodes)),
-        StructuredNode::TryCatch {
-            try_body,
-            catch_handlers,
-        } => StructuredNode::TryCatch {
-            try_body: recurse(try_body),
-            catch_handlers: catch_handlers
-                .into_iter()
-                .map(|mut h| {
-                    h.body = recurse(h.body);
-                    h
-                })
-                .collect(),
-        },
-        other => other,
+        match node {
+            StructuredNode::Switch { value, .. } => {
+                if matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value") {
+                    *value = named.clone();
+                    *done = true;
+                }
+                // Whether or not this was the dispatch switch, do NOT descend into its
+                // cases: a nested computed switch there keeps its own placeholder.
+                return;
+            }
+            StructuredNode::Sequence(inner) => rename_first_spine_switch(inner, named, done),
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                rename_first_spine_switch(then_body, named, done);
+                if let Some(b) = else_body {
+                    rename_first_spine_switch(b, named, done);
+                }
+            }
+            // Off-spine (Block, loops, TryCatch, ...) — the resume dispatch is never
+            // nested inside these, so stop descending.
+            _ => {}
+        }
     }
 }
 
@@ -5432,6 +5381,46 @@ mod tests {
         assert!(
             matches!(&value.kind, ExprKind::Var(v) if v.name == "edx"),
             "genuine switch value must be preserved, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn name_clang_switch_leaves_nested_synthetic_switch_untouched() {
+        // A user computed-switch inside a resume-state body shares the `switch_value`
+        // placeholder. Only the OUTERMOST dispatch switch must be named; the nested
+        // one must keep its placeholder (not become frame->__resume_index).
+        let nested = StructuredNode::Switch {
+            value: Expr::unknown("switch_value"),
+            cases: vec![(vec![0], vec![block(vec![Expr::unknown("inner")])])],
+            default: None,
+        };
+        let body = vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::unknown("switch_value"),
+                cases: vec![(vec![0], vec![nested])],
+                default: None,
+            },
+        ];
+        let out = name_clang_resume_switch(body, 0x11);
+        let StructuredNode::Switch { value, cases, .. } = &out[1] else {
+            panic!("expected outer switch");
+        };
+        // Outer renamed.
+        assert!(
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
+            "outer should be named, got {value:?}"
+        );
+        // Nested still carries the placeholder.
+        let StructuredNode::Switch { value: inner_value, .. } = &cases[0].1[0] else {
+            panic!("expected nested switch");
+        };
+        assert!(
+            matches!(&inner_value.kind, ExprKind::Unknown(s) if s == "switch_value"),
+            "nested switch must be untouched, got {inner_value:?}"
         );
     }
 
