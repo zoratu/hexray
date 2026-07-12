@@ -2360,13 +2360,48 @@ impl<'a> Structurer<'a> {
                                 address_range,
                             });
                         }
-                        // Emit a basic switch with unknown values, using indices
+                        // Emit a basic switch with sequential case indices. Coroutine
+                        // VALUE naming and two-way `default` shaping are done later by the
+                        // coroutine pass (not here), so this stays neutral for real
+                        // computed dispatches. But structure each case only up to the
+                        // point where the targets converge, so a continuation shared by
+                        // several cases (e.g. a common cleanup/frame-store block before a
+                        // return) is emitted ONCE after the switch instead of being
+                        // absorbed by the first-structured case and lost from the others.
+                        // This mirrors the recovered-switch path (find_switch_join_point).
+                        // Only synthesize a join at the top level: inside a bounded region
+                        // `end` is already the boundary and a later block must not be
+                        // structured past it.
                         let switch_expr = Expr::unknown("switch_value".to_string());
+                        let switch_end = match end {
+                            Some(_) => end,
+                            None if possible_targets.len() >= 2 => {
+                                self.find_join_point_of_targets(possible_targets)
+                            }
+                            None => None,
+                        };
                         let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = possible_targets
                             .iter()
                             .enumerate()
                             .map(|(i, &target)| {
-                                let body = self.structure_region(target, end);
+                                // The pure-return shortcut folds a target's whole chain
+                                // to a `return`, which would follow THROUGH a shared join
+                                // and mark it processed before it can be emitted after the
+                                // switch. So only take it when there is no join to respect;
+                                // otherwise structure up to the join.
+                                let body = match switch_end {
+                                    None => {
+                                        if let Some(ret_expr) =
+                                            self.get_return_expr_if_pure_return(target)
+                                        {
+                                            self.mark_pure_return_chain_processed(target);
+                                            vec![StructuredNode::Return(ret_expr)]
+                                        } else {
+                                            self.structure_region(target, None)
+                                        }
+                                    }
+                                    Some(_) => self.structure_region(target, switch_end),
+                                };
                                 (vec![i as i128], body)
                             })
                             .collect();
@@ -2375,7 +2410,25 @@ impl<'a> Structurer<'a> {
                             cases,
                             default: None,
                         });
-                        break;
+                        // Continue structuring at the join so the shared continuation is
+                        // emitted immediately after the switch. The join has multiple
+                        // predecessors (the cases converge on it), so mark it inline so the
+                        // next iteration's multi-pred guard does not defer it to a goto.
+                        match switch_end {
+                            Some(join) if end != Some(join) => {
+                                let is_irreducible_entry = self
+                                    .irreducible_analysis
+                                    .regions
+                                    .iter()
+                                    .any(|r| r.entry_points.contains(&join));
+                                if !is_irreducible_entry {
+                                    self.inline_allowed.insert(join);
+                                }
+                                current = Some(join);
+                                continue;
+                            }
+                            _ => break,
+                        }
                     }
 
                     // Fallback: emit block and break
@@ -3295,14 +3348,22 @@ impl<'a> Structurer<'a> {
         if let Some(default) = switch_info.default {
             targets.push(default);
         }
+        self.find_join_point_of_targets(&targets)
+    }
 
+    /// The common convergence block of a set of case targets (the first block in
+    /// reverse post-order reachable from ALL targets), or `None` if they don't
+    /// converge. Used so each case is structured only up to the join, letting the
+    /// shared continuation after it be emitted once instead of being absorbed into
+    /// whichever case is structured first (and dropped from the rest).
+    fn find_join_point_of_targets(&self, targets: &[BasicBlockId]) -> Option<BasicBlockId> {
         if targets.is_empty() {
             return None;
         }
 
         // Find blocks reachable from each target
         let mut reachable_sets: Vec<HashSet<BasicBlockId>> = Vec::new();
-        for target in &targets {
+        for target in targets {
             let mut reachable = HashSet::new();
             self.collect_reachable(*target, &mut reachable, None);
             reachable_sets.push(reachable);
@@ -3319,7 +3380,7 @@ impl<'a> Structurer<'a> {
         }
 
         // Remove the case blocks themselves from candidates
-        for target in &targets {
+        for target in targets {
             common.remove(target);
         }
 
@@ -9963,5 +10024,77 @@ mod tests {
                 .any(|expr| expr.contains("= atomic_compare_exchange_strong")),
             "expected SETcc to consume the cmpxchg result, got {rendered:?}"
         );
+    }
+
+    #[test]
+    fn find_join_point_of_targets_returns_shared_continuation() {
+        // Diamond: bb1 and bb2 both flow to bb3, which returns via bb4. The join of
+        // the two targets is bb3 (the shared continuation), so a switch fallback over
+        // [bb1, bb2] structures each case only up to bb3, emitting it once afterwards.
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut mk = |id: u32, term: BlockTerminator| {
+            let mut b = BasicBlock::new(BasicBlockId::new(id), 0x1000 + u64::from(id) * 0x10);
+            b.terminator = term;
+            cfg.add_block(b);
+        };
+        mk(
+            0,
+            BlockTerminator::IndirectJump {
+                target: Operand::imm(0, 64),
+                possible_targets: vec![BasicBlockId::new(1), BasicBlockId::new(2)],
+            },
+        );
+        mk(1, BlockTerminator::Jump { target: BasicBlockId::new(3) });
+        mk(2, BlockTerminator::Jump { target: BasicBlockId::new(3) });
+        mk(3, BlockTerminator::Jump { target: BasicBlockId::new(4) });
+        mk(4, BlockTerminator::Return);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+        cfg.add_edge(BasicBlockId::new(1), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(2), BasicBlockId::new(3));
+        cfg.add_edge(BasicBlockId::new(3), BasicBlockId::new(4));
+
+        let structurer = Structurer::new(&cfg);
+        assert_eq!(
+            structurer
+                .find_join_point_of_targets(&[BasicBlockId::new(1), BasicBlockId::new(2)]),
+            Some(BasicBlockId::new(3)),
+        );
+    }
+
+    #[test]
+    fn two_target_indirect_fallback_emits_two_cases() {
+        // The GENERIC fallback emits both targets as explicit cases with no default
+        // (coroutine-specific two-way `default` shaping happens later, in the coroutine
+        // pass, so this stays correct for real computed dispatches).
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut mk = |id: u32, term: BlockTerminator| {
+            let mut b = BasicBlock::new(BasicBlockId::new(id), 0x1000 + u64::from(id) * 0x10);
+            b.terminator = term;
+            cfg.add_block(b);
+        };
+        mk(
+            0,
+            BlockTerminator::IndirectJump {
+                target: Operand::imm(0, 64),
+                possible_targets: vec![BasicBlockId::new(1), BasicBlockId::new(2)],
+            },
+        );
+        mk(1, BlockTerminator::Return);
+        mk(2, BlockTerminator::Return);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        let mut structurer = Structurer::new(&cfg);
+        let nodes = structurer.structure();
+        let (cases, default) = nodes
+            .iter()
+            .find_map(|n| match n {
+                StructuredNode::Switch { cases, default, .. } => Some((cases, default)),
+                _ => None,
+            })
+            .expect("expected a switch node");
+        assert_eq!(cases.len(), 2, "both targets are explicit cases, got {cases:?}");
+        assert!(default.is_none(), "generic fallback emits no default");
     }
 }

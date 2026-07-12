@@ -15,10 +15,9 @@ pub mod comparison;
 pub mod config;
 mod constant_propagation;
 mod coroutine;
-// Slice 1a: CFG-level clang coroutine dispatch DETECTION (verified on real
-// fixtures). The CFG rewrite that consumes it is wired in a following slice, so the
-// detection API is not yet called from the pipeline.
-#[allow(dead_code)]
+// CFG-level clang coroutine resume-dispatch recognition + rewrite: turns the tail
+// resume-index dispatch into an explicit switch region so the generic structurer
+// preserves each resume-point body instead of collapsing the goto flow.
 mod coroutine_cfg;
 mod cse;
 mod dead_store;
@@ -760,6 +759,15 @@ impl RelocationTable {
             .map(|reloc| reloc.target_addr)
     }
 
+    /// Whether any relocation (call/branch or data) is anchored at `inst_addr`.
+    /// Used to tell a genuine no-op `jmp` (no relocation) from an unresolved
+    /// branch relocation such as `jmp __x86_return_thunk`, which shares the same
+    /// `e9 00000000` encoding.
+    pub fn has_relocation_at(&self, inst_addr: u64) -> bool {
+        self.call_relocations.contains_key(&inst_addr)
+            || self.data_relocations.contains_key(&inst_addr)
+    }
+
     /// Returns whether the data relocation at an instruction was PC-relative.
     pub fn data_is_pc_relative(&self, inst_addr: u64) -> bool {
         self.data_relocations
@@ -1224,7 +1232,20 @@ impl Decompiler {
             merged_types.insert(k.clone(), v.clone());
         }
 
-        // Step 1: Structure the control flow
+        // Step 1: Structure the control flow.
+        // For clang C++20 coroutine `.resume` clones the resume-index dispatch is a
+        // tail block the generic structurer would collapse (folding the scattered
+        // resume-point bodies away to `return`). Rewrite it into an explicit switch
+        // region first so each resume-point body survives structuring.
+        let coro_rewritten = if coroutine::is_coroutine_resume_clone(func_name) {
+            coroutine_cfg::rewrite_clang_resume_dispatch(cfg, self.relocation_table.as_ref())
+        } else {
+            None
+        };
+        // The resume-index offset from the rewrite, used later to name the recovered
+        // switch value `frame->__resume_index` (only set when the rewrite fired).
+        let clang_resume_offset = coro_rewritten.as_ref().map(|r| r.index_offset);
+        let cfg = coro_rewritten.as_ref().map(|r| &r.cfg).unwrap_or(cfg);
         let structured = self.structure(cfg);
 
         // Step 2: Apply struct inference if enabled
@@ -1366,6 +1387,12 @@ impl Decompiler {
             || coroutine::is_coroutine_resume_clone(func_name)
         {
             let body = coroutine::recover_resume_dispatch(structured.body);
+            // For clang `.resume` clones recovered by the CFG-level rewrite, name the
+            // synthetic `switch(switch_value)` as `switch(frame->__resume_index)`.
+            let body = match clang_resume_offset {
+                Some(offset) => coroutine::name_clang_resume_switch(body, offset),
+                None => body,
+            };
             let recovered = coroutine::body_has_resume_switch(&body);
             (
                 StructuredCfg {

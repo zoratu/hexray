@@ -102,6 +102,90 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
     }
 }
 
+/// Name the CFG-recovered clang resume `switch(switch_value)` as
+/// `switch(frame->__resume_index)`.
+///
+/// clang's `.resume` dispatch is rebuilt as a synthetic switch at the CFG level
+/// ([`super::coroutine_cfg`]), where the resume-index frame offset is known exactly.
+/// The generic structurer's `possible_targets` fallback can only label that switch
+/// with an opaque `switch_value` placeholder, and the index-read that would carry the
+/// frame provenance is dead-code-eliminated (the synthetic `IndirectJump` doesn't
+/// consume it). So the offset is threaded in here and the placeholder is replaced
+/// directly with the named field, committing the recovery. Returns the body unchanged
+/// when the frame parameter can't be identified or no synthetic switch is present.
+pub fn name_clang_resume_switch(body: Vec<StructuredNode>, offset: i64) -> Vec<StructuredNode> {
+    // Naming the switch value needs the frame parameter; the two-way `default` shaping
+    // does NOT. Compute the name when the frame is identifiable, but shape the switch
+    // either way so a `.resume` clone whose frame this structured pass can't recognize
+    // (e.g. a Win64 `rcx` frame) still gets correct control flow — just an unnamed value.
+    let named = build_frame(&flatten_spine_sequences(body.clone()))
+        .map(|frame| named_state_expr(&frame, &StateField { offset }));
+    let mut nodes = body;
+    let mut done = false;
+    shape_first_spine_switch(&mut nodes, named.as_ref(), &mut done);
+    nodes
+}
+
+/// Shape the resume-dispatch `switch (switch_value)`: turn its two-way nonzero edge into
+/// `default`, and (when `named` is available) replace the opaque value placeholder.
+///
+/// The structurer's indirect-jump fallback labels EVERY unrecovered computed switch with
+/// the same `Unknown("switch_value")` placeholder, so a nested/user switch inside a
+/// resume-state body carries it too. Only the CFG-rewritten resume dispatch must be
+/// shaped: it is the OUTERMOST switch, reached along the straight-line spine (the
+/// top-level list, `Sequence` wrappers, and `If` branches — the same spine
+/// [`flatten_spine_sequences`] normalizes). So descend only that spine and shape the
+/// FIRST synthetic switch found, never recursing into switch cases, loops, or try-blocks
+/// where unrelated computed switches live.
+fn shape_first_spine_switch(nodes: &mut [StructuredNode], named: Option<&Expr>, done: &mut bool) {
+    for node in nodes.iter_mut() {
+        if *done {
+            return;
+        }
+        match node {
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
+                if matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value") {
+                    // Name the value if the frame was identified (otherwise leave the
+                    // placeholder — recovery is not committed, but control flow is right).
+                    if let Some(named) = named {
+                        *value = named.clone();
+                    }
+                    // The resume dispatch is a two-way `test idx,idx; je state0` recovered
+                    // as `case 0` / `case 1`. The second (nonzero) edge runs for EVERY
+                    // value != 0, so present it as `default` rather than a `case 1` that
+                    // would skip it for other values. This does not depend on naming.
+                    if default.is_none() && cases.len() == 2 {
+                        let (_, body) = cases.pop().expect("len checked");
+                        *default = Some(body);
+                    }
+                    *done = true;
+                }
+                // Whether or not this was the dispatch switch, do NOT descend into its
+                // cases: a nested computed switch there keeps its own placeholder.
+                return;
+            }
+            StructuredNode::Sequence(inner) => shape_first_spine_switch(inner, named, done),
+            StructuredNode::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                shape_first_spine_switch(then_body, named, done);
+                if let Some(b) = else_body {
+                    shape_first_spine_switch(b, named, done);
+                }
+            }
+            // Off-spine (Block, loops, TryCatch, ...) — the resume dispatch is never
+            // nested inside these, so stop descending.
+            _ => {}
+        }
+    }
+}
+
 /// Splice transparent `Sequence` wrappers inline throughout the dispatch spine
 /// (the top-level node list and every `If` branch, recursively), so downstream
 /// detection/rewrite/flatten never see a `Sequence` between a frame copy and its
@@ -5253,5 +5337,152 @@ mod tests {
         let out = recover_resume_dispatch(body);
         let dump = format!("{out:?}");
         assert!(dump.contains(RESUME_FIELD_NAME));
+    }
+
+    /// A synthetic clang dispatch `switch (switch_value)` with an arg0 reference.
+    fn clang_synthetic_body() -> Vec<StructuredNode> {
+        vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::unknown("switch_value"),
+                cases: vec![
+                    (vec![0], vec![block(vec![Expr::unknown("body0")])]),
+                    (vec![1], vec![block(vec![Expr::unknown("body1")])]),
+                ],
+                default: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn names_synthetic_clang_switch_as_resume_index() {
+        // The CFG-recovered clang dispatch is `switch (switch_value)`; naming it with
+        // the known offset must produce `switch (frame->__resume_index)` and commit.
+        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11);
+        assert!(body_has_resume_switch(&out), "recovery should commit: {out:?}");
+        let StructuredNode::Switch { value, .. } = &out[1] else {
+            panic!("expected switch, got {:?}", out[1]);
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
+            "value should be frame->__resume_index, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn clang_switch_nonzero_edge_becomes_default() {
+        // The two-way dispatch's second (nonzero) edge must be the `default`, not a
+        // `case 1` that would skip it for index values other than 1.
+        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11);
+        let StructuredNode::Switch { cases, default, .. } = &out[1] else {
+            panic!("expected switch, got {:?}", out[1]);
+        };
+        assert_eq!(cases.len(), 1, "only case 0 stays explicit, got {cases:?}");
+        assert!(default.is_some(), "the nonzero edge should be the default");
+    }
+
+    #[test]
+    fn name_clang_switch_leaves_genuine_switch_untouched() {
+        // A real switch (value is not the synthetic `switch_value` placeholder) must
+        // not be rewritten, even in a resume clone.
+        let body = vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::var(Variable::reg("edx", 4)),
+                cases: vec![(vec![0], vec![block(vec![Expr::unknown("body0")])])],
+                default: None,
+            },
+        ];
+        let out = name_clang_resume_switch(body.clone(), 0x11);
+        let StructuredNode::Switch { value, .. } = &out[1] else {
+            panic!("expected switch");
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Var(v) if v.name == "edx"),
+            "genuine switch value must be preserved, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn name_clang_switch_leaves_nested_synthetic_switch_untouched() {
+        // A user computed-switch inside a resume-state body shares the `switch_value`
+        // placeholder. Only the OUTERMOST dispatch switch must be named; the nested
+        // one must keep its placeholder (not become frame->__resume_index).
+        let nested = StructuredNode::Switch {
+            value: Expr::unknown("switch_value"),
+            cases: vec![(vec![0], vec![block(vec![Expr::unknown("inner")])])],
+            default: None,
+        };
+        let body = vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::unknown("switch_value"),
+                cases: vec![(vec![0], vec![nested])],
+                default: None,
+            },
+        ];
+        let out = name_clang_resume_switch(body, 0x11);
+        let StructuredNode::Switch { value, cases, .. } = &out[1] else {
+            panic!("expected outer switch");
+        };
+        // Outer renamed.
+        assert!(
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
+            "outer should be named, got {value:?}"
+        );
+        // Nested still carries the placeholder.
+        let StructuredNode::Switch { value: inner_value, .. } = &cases[0].1[0] else {
+            panic!("expected nested switch");
+        };
+        assert!(
+            matches!(&inner_value.kind, ExprKind::Unknown(s) if s == "switch_value"),
+            "nested switch must be untouched, got {inner_value:?}"
+        );
+    }
+
+    #[test]
+    fn name_clang_switch_no_frame_leaves_value_unnamed() {
+        // Without a frame parameter (no arg0), the value can't be named; leave it.
+        let body = vec![StructuredNode::Switch {
+            value: Expr::unknown("switch_value"),
+            cases: vec![(vec![0], vec![block(vec![Expr::unknown("body0")])])],
+            default: None,
+        }];
+        let out = name_clang_resume_switch(body, 0x11);
+        assert!(!body_has_resume_switch(&out));
+    }
+
+    #[test]
+    fn clang_switch_default_shaping_runs_without_frame() {
+        // Even when the frame can't be identified (e.g. a Win64 rcx clone) the two-way
+        // nonzero edge must still become `default`, so control flow stays correct — only
+        // the value naming is skipped.
+        let body = vec![StructuredNode::Switch {
+            value: Expr::unknown("switch_value"),
+            cases: vec![
+                (vec![0], vec![block(vec![Expr::unknown("state0")])]),
+                (vec![1], vec![block(vec![Expr::unknown("state1")])]),
+            ],
+            default: None,
+        }];
+        let out = name_clang_resume_switch(body, 0x11);
+        let StructuredNode::Switch { value, cases, default } = &out[0] else {
+            panic!("expected switch, got {:?}", out[0]);
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value"),
+            "no frame -> value stays unnamed"
+        );
+        assert_eq!(cases.len(), 1, "nonzero edge moved out of cases");
+        assert!(default.is_some(), "nonzero edge became default even without a frame");
     }
 }
