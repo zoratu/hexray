@@ -153,7 +153,7 @@ pub fn rewrite_clang_resume_dispatch(
         return None;
     };
     let index_reg = canon_reg(index_reg.name());
-    let ordered = ordered_two_state_targets(dispatch_block, &index_reg)?;
+    let ordered = ordered_two_state_targets(dispatch_block, disp.index_offset, disp.index_size)?;
 
     // Deduplicate while preserving index order (a degenerate branch could list the
     // same target twice). Need >=2 distinct states to form a switch.
@@ -325,7 +325,11 @@ fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u
 /// so the value-0 edge is state 0 regardless of sense. Only a proven zero-comparison of
 /// the index yields this mapping; a compare against a non-zero value (`cmp idx,1`) is
 /// declined so case bodies are never swapped.
-fn ordered_two_state_targets(dispatch: &BasicBlock, index_reg: &str) -> Option<Vec<BasicBlockId>> {
+fn ordered_two_state_targets(
+    dispatch: &BasicBlock,
+    index_offset: i64,
+    index_size: u8,
+) -> Option<Vec<BasicBlockId>> {
     let (condition, true_target, false_target) = match &dispatch.terminator {
         BlockTerminator::ConditionalBranch {
             condition,
@@ -334,7 +338,7 @@ fn ordered_two_state_targets(dispatch: &BasicBlock, index_reg: &str) -> Option<V
         } => (*condition, *true_target, *false_target),
         _ => return None,
     };
-    if !dispatch_zero_compares_index(dispatch, index_reg) {
+    if !dispatch_zero_compares_index(dispatch, index_offset, index_size) {
         return None;
     }
     match condition {
@@ -349,9 +353,14 @@ fn ordered_two_state_targets(dispatch: &BasicBlock, index_reg: &str) -> Option<V
 /// `zreg` is the zero register or a register the block has proven to be zero, e.g.
 /// `mov w9,wzr; and w9,w9,#3`). This distinguishes the value-0 edge (state 0) from a
 /// non-zero comparison whose true edge would be a later state.
-fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_reg: &str) -> bool {
+fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> bool {
     // Canonical names of registers the block has proven to hold zero.
     let mut zero_regs: Vec<String> = Vec::new();
+    // Registers currently holding the LIVE resume index. Populated by the field read
+    // (and copies/masks of it) so a `test idx,idx` on a register that was overwritten
+    // after the read (`mov al,[frame+off]; mov al,0; test al,al`) is NOT accepted as an
+    // index dispatch. Provenance comes from the read, not the register name.
+    let mut holders: Vec<String> = Vec::new();
     let is_zero_operand = |op: &Operand, zero: &[String]| -> bool {
         match op {
             Operand::Immediate(imm) => imm.value == 0,
@@ -377,11 +386,13 @@ fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_reg: &str) -> bool 
                     _ => None,
                 })
                 .collect();
-            let mentions_index = regs.iter().any(|r| r == index_reg);
-            // `test idx,idx`: every register operand is the index -> a zero test.
+            // The tested register(s) must currently HOLD the index, not merely share
+            // its name.
+            let mentions_index = regs.iter().any(|r| holders.contains(r));
+            // `test idx,idx`: every register operand holds the index -> a zero test.
             let is_self_test = matches!(inst.operation, Operation::Test)
                 && regs.len() >= 2
-                && regs.iter().all(|r| r == index_reg);
+                && regs.iter().all(|r| holders.contains(r));
             let against_zero = inst.operands.iter().any(|o| is_zero_operand(o, &zero_regs));
             mentions_index && (is_self_test || against_zero)
         };
@@ -390,10 +401,69 @@ fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_reg: &str) -> bool 
         } else if instruction_sets_flags(inst.operation) {
             result = false;
         }
+        // Update index provenance: a fresh field reload or a copy extends the holder
+        // set; any other register write drops that register.
+        update_index_holders(inst, index_offset, index_size, &mut holders);
         // Track registers proven zero for the aarch64 `subs idx,idx,zreg` form.
         update_zero_regs(inst, &mut zero_regs);
     }
     result
+}
+
+/// Update the set of registers holding the LIVE resume index across one instruction:
+/// a fresh field reload (`mov reg,[frame+off]`) or a copy/self-mask of a holder
+/// (`mov dst,src`, `and dst,src,#imm` — masking the low bits keeps `== 0` iff the
+/// index is 0 for the small resume-state range) extends the set; any other write to a
+/// register drops it. Comparisons/tests write only flags and are left alone.
+fn update_index_holders(
+    inst: &hexray_core::Instruction,
+    index_offset: i64,
+    index_size: u8,
+    holders: &mut Vec<String>,
+) {
+    let operand_is_holder = |op: &Operand| {
+        matches!(op, Operand::Register(r) if holders.contains(&canon_reg(r.name())))
+    };
+    match inst.operation {
+        Operation::Move | Operation::Load => {
+            if let Some(Operand::Register(d)) = inst.operands.first() {
+                let dc = canon_reg(d.name());
+                let inherits = match inst.operands.get(1) {
+                    Some(Operand::Memory(m)) => {
+                        m.index.is_none()
+                            && m.displacement == index_offset
+                            && u16::from(m.size) == u16::from(index_size)
+                    }
+                    Some(op) => operand_is_holder(op),
+                    None => false,
+                };
+                holders.retain(|r| r != &dc);
+                if inherits {
+                    holders.push(dc);
+                }
+            }
+        }
+        // A mask of the index (`and idx, #imm`) keeps its zero-ness for the small
+        // resume-state range; the destination stays a holder iff any operand is one.
+        Operation::And => {
+            if let Some(Operand::Register(d)) = inst.operands.first() {
+                let dc = canon_reg(d.name());
+                let inherits = inst.operands.iter().any(operand_is_holder);
+                holders.retain(|r| r != &dc);
+                if inherits {
+                    holders.push(dc);
+                }
+            }
+        }
+        // Flag-only ops leave registers untouched.
+        Operation::Compare | Operation::Test => {}
+        _ => {
+            if let Some(Operand::Register(d)) = inst.operands.first() {
+                let dc = canon_reg(d.name());
+                holders.retain(|r| r != &dc);
+            }
+        }
+    }
 }
 
 /// Whether an operation writes the condition flags (over-approximated as anything that
@@ -469,42 +539,11 @@ fn target_redispatches_index(
     if !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. }) {
         return false;
     }
-    // Registers currently holding the resume index: the register carried from the
-    // dispatch, any fresh reload of the frame field, and simple copies of those
-    // (`mov ecx, eax`). A compare/test/sub reading any of them re-dispatches on the
-    // index; a redefinition from a non-index source drops the register.
+    // Registers holding the resume index: the register carried from the dispatch, any
+    // fresh reload of the frame field, and copies/masks of those (`mov ecx,eax`,
+    // `and eax,3`). A compare/test/sub reading any of them re-dispatches on the index.
     let mut holders: Vec<String> = vec![index_reg.to_string()];
     for inst in &block.instructions {
-        if matches!(inst.operation, Operation::Move | Operation::Load) {
-            if let (Some(Operand::Register(d)), Some(src)) =
-                (inst.operands.first(), inst.operands.get(1))
-            {
-                let dc = canon_reg(d.name());
-                match src {
-                    // Fresh reload of the resume-index field.
-                    Operand::Memory(m)
-                        if m.index.is_none()
-                            && m.displacement == index_offset
-                            && u16::from(m.size) == u16::from(index_size) =>
-                    {
-                        if !holders.contains(&dc) {
-                            holders.push(dc);
-                        }
-                    }
-                    // Register copy: the destination inherits the source's index status.
-                    Operand::Register(s) => {
-                        let sc = canon_reg(s.name());
-                        holders.retain(|r| r != &dc);
-                        if holders.contains(&sc) {
-                            holders.push(dc);
-                        }
-                    }
-                    // Any other move overwrites the destination.
-                    _ => holders.retain(|r| r != &dc),
-                }
-                continue;
-            }
-        }
         if matches!(
             inst.operation,
             Operation::Compare | Operation::Test | Operation::Sub
@@ -515,21 +554,18 @@ fn target_redispatches_index(
             if touches_index {
                 return true;
             }
-            continue;
         }
-        // Any other write to a register drops it as an index holder.
-        if let Some(Operand::Register(d)) = inst.operands.first() {
-            let dc = canon_reg(d.name());
-            holders.retain(|r| r != &dc);
-        }
+        update_index_holders(inst, index_offset, index_size, &mut holders);
     }
     false
 }
 
-/// Follow trivial routing blocks (a single unconditional `jmp`/fall-through, or a
-/// no-op `e9 00000000` jump the CFG builder mislabeled `Return`) from `start` to the
-/// first block that does real work, so a continuation reached only through clang's
-/// padding jumps is inspected. Bounded to avoid cycles.
+/// Follow trivial routing blocks (nothing but unconditional `jmp`s / an empty
+/// fall-through, or a no-op `e9 00000000` jump the CFG builder mislabeled `Return`)
+/// from `start` to the first block that does real work, so a continuation reached only
+/// through clang's padding jumps is inspected. A block carrying ANY real instruction
+/// (e.g. a copied/reloaded index falling through to the compare) is NOT skipped — that
+/// instruction is part of the continuation. Bounded to avoid cycles.
 fn route_trivial_jumps(cfg: &ControlFlowGraph, start: BasicBlockId) -> BasicBlockId {
     use std::collections::{HashMap, HashSet};
     let start_to_id: HashMap<u64, BasicBlockId> = cfg.blocks().map(|b| (b.start, b.id)).collect();
@@ -543,9 +579,12 @@ fn route_trivial_jumps(cfg: &ControlFlowGraph, start: BasicBlockId) -> BasicBloc
             break;
         };
         let next = match &b.terminator {
-            // A block that is nothing but an unconditional jump / fall-through.
+            // A block that is nothing but unconditional jump(s) / an empty fall-through
+            // (its only instructions, if any, are the jumps themselves).
             BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
-                if b.instructions.len() <= 1 =>
+                if b.instructions
+                    .iter()
+                    .all(|i| matches!(i.operation, Operation::Jump)) =>
             {
                 Some(*target)
             }
@@ -1628,7 +1667,8 @@ mod tests {
         );
         assert!(!dispatch_zero_compares_index(
             cfg.block(BasicBlockId::new(1)).unwrap(),
-            "rax"
+            0x11,
+            1
         ));
         assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
     }
@@ -1685,9 +1725,9 @@ mod tests {
             true_target: BasicBlockId::new(2),
             false_target: BasicBlockId::new(3),
         };
-        assert!(dispatch_zero_compares_index(&dispatch, "x8"));
+        assert!(dispatch_zero_compares_index(&dispatch, 0x11, 1));
         assert_eq!(
-            ordered_two_state_targets(&dispatch, "x8"),
+            ordered_two_state_targets(&dispatch, 0x11, 1),
             Some(vec![BasicBlockId::new(2), BasicBlockId::new(3)])
         );
     }
@@ -1815,20 +1855,30 @@ mod tests {
         Instruction::new(0, 6, vec![], "je").with_operation(Operation::ConditionalJump)
     }
 
+    /// `mov al, [rax + 0x11]` — the resume-index field read that establishes provenance.
+    fn read_index() -> Instruction {
+        mov(
+            Operand::Register(r(0, 8)),
+            Operand::Memory(MemoryRef::base_disp(r(0, 64), 0x11, 1)),
+        )
+    }
+
     #[test]
     fn zero_compare_recognizes_test_then_branch() {
-        // `test al,al; je` — the terminating conditional jump reads (not sets) flags.
+        // `mov al,[frame+0x11]; test al,al; je` — je reads (not sets) flags.
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(read_index());
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(je());
-        assert!(dispatch_zero_compares_index(&block, "rax"));
+        assert!(dispatch_zero_compares_index(&block, 0x11, 1));
     }
 
     #[test]
     fn zero_compare_invalidated_by_later_flag_setter() {
-        // `test al,al; add ecx,1; je` — the branch tests `add`'s flags, not the index,
-        // so this must NOT be treated as an index-zero dispatch.
+        // `mov al,[frame+0x11]; test al,al; add ecx,1; je` — the branch tests `add`'s
+        // flags, not the index, so this must NOT be an index-zero dispatch.
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(read_index());
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(
             Instruction::new(0, 3, vec![], "add")
@@ -1836,7 +1886,19 @@ mod tests {
                 .with_operands(vec![Operand::Register(r(1, 32)), imm1(32)]),
         );
         block.instructions.push(je());
-        assert!(!dispatch_zero_compares_index(&block, "rax"));
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
+    }
+
+    #[test]
+    fn zero_compare_rejects_overwritten_index_register() {
+        // `mov al,[frame+0x11]; mov al,0; test al,al` — al no longer holds the live
+        // index at the test, so this is not an index dispatch.
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(read_index());
+        block.instructions.push(mov(Operand::Register(r(0, 8)), imm1(8)));
+        block.instructions.push(test_ii(r(0, 8)));
+        block.instructions.push(je());
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
     }
 
     #[test]
