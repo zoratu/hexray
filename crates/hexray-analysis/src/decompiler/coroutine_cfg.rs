@@ -127,6 +127,9 @@ pub fn rewrite_clang_resume_dispatch(
         return None;
     }
     let dispatch_block = cfg.block(disp.dispatch)?;
+    // The stack homes holding the frame pointer (arg0), so a reload in the dispatch is
+    // recognized and only a read off a frame pointer is taken for the resume index.
+    let frame_slots = frame_pointer_spill_slots(cfg.entry_block()?);
 
     // Only a genuine two-way dispatch is safe to rewrite as two cases. For >2 resume
     // states clang emits a compare CHAIN: the dispatch spills the freshly-read index
@@ -136,7 +139,7 @@ pub fn rewrite_clang_resume_dispatch(
     // therefore a chain we don't yet flatten — decline it (a dedicated multi-state
     // slice can walk the chain). A true two-state dispatch tests the index in-register
     // and never spills it.
-    if dispatch_spills_index(dispatch_block, disp.index_offset, disp.index_size) {
+    if dispatch_spills_index(dispatch_block, disp.index_offset, disp.index_size, &frame_slots) {
         return None;
     }
 
@@ -152,7 +155,12 @@ pub fn rewrite_clang_resume_dispatch(
     if !matches!(index_operand, Operand::Register(_)) {
         return None;
     }
-    let ordered = ordered_two_state_targets(dispatch_block, disp.index_offset, disp.index_size)?;
+    let ordered = ordered_two_state_targets(
+        dispatch_block,
+        disp.index_offset,
+        disp.index_size,
+        &frame_slots,
+    )?;
 
     // Deduplicate while preserving index order (a degenerate branch could list the
     // same target twice). Need >=2 distinct states to form a switch.
@@ -271,10 +279,17 @@ fn is_nop_jump(inst: &hexray_core::Instruction) -> bool {
 /// al,K; je stateK; ...` reloads for each subsequent test); a genuine two-state
 /// dispatch tests the in-register index directly (`test al,al; je`) and never spills
 /// it. Used to decline the 2-case rewrite on chains it cannot represent.
-fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> bool {
-    // Registers holding the live resume index (field read, copies, masks) — the same
-    // provenance model used everywhere in the guard, so a masked index (`ldrb w8,..;
-    // and w8,w8,#3; strb w8,..`) is still recognized as spilled.
+fn dispatch_spills_index(
+    dispatch: &BasicBlock,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+) -> bool {
+    // Registers holding a reloaded frame pointer and the live resume index (read off it,
+    // then copied/masked) — the same provenance model used everywhere in the guard, so a
+    // masked index (`ldrb w8,..; and w8,w8,#3; strb w8,..`) is still recognized as
+    // spilled, and a same-offset load off a non-frame base is not taken for the index.
+    let mut frame_regs: Vec<String> = Vec::new();
     let mut holders: Vec<String> = Vec::new();
     for inst in &dispatch.instructions {
         // Spill: `mov [mem], idxreg` (x86) or `str idxreg, [mem]` (aarch64) writes an
@@ -296,7 +311,14 @@ fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u
                 return true;
             }
         }
-        update_index_holders(inst, index_offset, index_size, &mut holders);
+        update_index_holders(
+            inst,
+            index_offset,
+            index_size,
+            frame_slots,
+            &mut frame_regs,
+            &mut holders,
+        );
     }
     false
 }
@@ -351,6 +373,7 @@ fn ordered_two_state_targets(
     dispatch: &BasicBlock,
     index_offset: i64,
     index_size: u8,
+    frame_slots: &[SpillSlot],
 ) -> Option<Vec<BasicBlockId>> {
     let (condition, true_target, false_target) = match &dispatch.terminator {
         BlockTerminator::ConditionalBranch {
@@ -360,7 +383,7 @@ fn ordered_two_state_targets(
         } => (*condition, *true_target, *false_target),
         _ => return None,
     };
-    if !dispatch_zero_compares_index(dispatch, index_offset, index_size) {
+    if !dispatch_zero_compares_index(dispatch, index_offset, index_size, frame_slots) {
         return None;
     }
     match condition {
@@ -375,13 +398,20 @@ fn ordered_two_state_targets(
 /// `zreg` is the zero register or a register the block has proven to be zero, e.g.
 /// `mov w9,wzr; and w9,w9,#3`). This distinguishes the value-0 edge (state 0) from a
 /// non-zero comparison whose true edge would be a later state.
-fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> bool {
+fn dispatch_zero_compares_index(
+    dispatch: &BasicBlock,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+) -> bool {
     // Canonical names of registers the block has proven to hold zero.
     let mut zero_regs: Vec<String> = Vec::new();
-    // Registers currently holding the LIVE resume index. Populated by the field read
-    // (and copies/masks of it) so a `test idx,idx` on a register that was overwritten
-    // after the read (`mov al,[frame+off]; mov al,0; test al,al`) is NOT accepted as an
-    // index dispatch. Provenance comes from the read, not the register name.
+    // Registers currently holding a reloaded frame pointer, and those holding the LIVE
+    // resume index (read off a frame pointer, then copied/masked). Frame-base provenance
+    // ensures a same-offset load off an unrelated pointer is not taken for the index, and
+    // a register overwritten after the read (`mov al,[frame+off]; mov al,0; test al,al`)
+    // is dropped.
+    let mut frame_regs: Vec<String> = Vec::new();
     let mut holders: Vec<String> = Vec::new();
     let is_zero_operand = |op: &Operand, zero: &[String]| -> bool {
         match op {
@@ -423,45 +453,87 @@ fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_offset: i64, index_
         } else if instruction_sets_flags(inst.operation) {
             result = false;
         }
-        // Update index provenance: a fresh field reload or a copy extends the holder
-        // set; any other register write drops that register.
-        update_index_holders(inst, index_offset, index_size, &mut holders);
+        // Update frame-pointer and index provenance.
+        update_index_holders(
+            inst,
+            index_offset,
+            index_size,
+            frame_slots,
+            &mut frame_regs,
+            &mut holders,
+        );
         // Track registers proven zero for the aarch64 `subs idx,idx,zreg` form.
         update_zero_regs(inst, &mut zero_regs);
     }
     result
 }
 
-/// Update the set of registers holding the LIVE resume index across one instruction:
-/// a fresh field reload (`mov reg,[frame+off]`) or a copy/self-mask of a holder
-/// (`mov dst,src`, `and dst,src,#imm` — masking the low bits keeps `== 0` iff the
-/// index is 0 for the small resume-state range) extends the set; any other write to a
-/// register drops it. Comparisons/tests write only flags and are left alone.
+/// Update, across one instruction, the registers holding a reloaded FRAME POINTER
+/// (`frame_regs`) and those holding the LIVE resume index (`holders`).
+///
+/// A frame reload (`mov reg,[framebase - K]` for a recorded spill slot, full pointer
+/// width) makes `reg` a frame pointer. An index read (`mov(zx) reg,[framereg + off]` of
+/// the detected width, off a register that currently holds the frame pointer) makes
+/// `reg` hold the index — crucially, a same-offset load off a NON-frame base (e.g.
+/// `mov dl,[rcx+0x11]`) is NOT treated as the index. A copy or index mask propagates the
+/// respective status; any other write drops both.
 fn update_index_holders(
     inst: &hexray_core::Instruction,
     index_offset: i64,
     index_size: u8,
+    frame_slots: &[SpillSlot],
+    frame_regs: &mut Vec<String>,
     holders: &mut Vec<String>,
 ) {
-    let operand_is_holder = |op: &Operand| {
-        matches!(op, Operand::Register(r) if holders.contains(&canon_reg(r.name())))
-    };
     match inst.operation {
         Operation::Move | Operation::Load => {
-            if let Some(Operand::Register(d)) = inst.operands.first() {
-                let dc = canon_reg(d.name());
-                let inherits = match inst.operands.get(1) {
-                    Some(Operand::Memory(m)) => {
+            let Some(Operand::Register(d)) = inst.operands.first() else {
+                return;
+            };
+            let dc = canon_reg(d.name());
+            match inst.operands.get(1) {
+                Some(Operand::Memory(m)) => {
+                    let base = m.base.as_ref();
+                    // Frame reload: `mov reg, [framebase - K]` for a recorded slot.
+                    let is_frame_reload = base.is_some_and(|b| {
+                        is_frame_base_register(b.name())
+                            && m.index.is_none()
+                            && frame_slots.contains(&(canon_reg(b.name()), m.displacement))
+                            && d.size >= b.size
+                            && u16::from(m.size) * 8 >= b.size
+                    });
+                    // Index read: small field off a register currently holding the frame.
+                    let is_index_read = base.is_some_and(|b| {
                         m.index.is_none()
                             && m.displacement == index_offset
                             && u16::from(m.size) == u16::from(index_size)
+                            && frame_regs.contains(&canon_reg(b.name()))
+                    });
+                    holders.retain(|r| r != &dc);
+                    frame_regs.retain(|r| r != &dc);
+                    if is_frame_reload {
+                        frame_regs.push(dc);
+                    } else if is_index_read {
+                        holders.push(dc);
                     }
-                    Some(op) => operand_is_holder(op),
-                    None => false,
-                };
-                holders.retain(|r| r != &dc);
-                if inherits {
-                    holders.push(dc);
+                }
+                // Register copy: the destination inherits both statuses from the source.
+                Some(Operand::Register(s)) => {
+                    let sc = canon_reg(s.name());
+                    let src_holder = holders.contains(&sc);
+                    let src_frame = frame_regs.contains(&sc);
+                    holders.retain(|r| r != &dc);
+                    frame_regs.retain(|r| r != &dc);
+                    if src_holder {
+                        holders.push(dc.clone());
+                    }
+                    if src_frame {
+                        frame_regs.push(dc);
+                    }
+                }
+                _ => {
+                    holders.retain(|r| r != &dc);
+                    frame_regs.retain(|r| r != &dc);
                 }
             }
         }
@@ -473,8 +545,11 @@ fn update_index_holders(
         Operation::And => {
             if let Some(Operand::Register(d)) = inst.operands.first() {
                 let dc = canon_reg(d.name());
-                let inherits = inst.operands.iter().any(operand_is_holder);
+                let inherits = inst.operands.iter().any(|o| {
+                    matches!(o, Operand::Register(r) if holders.contains(&canon_reg(r.name())))
+                });
                 holders.retain(|r| r != &dc);
+                frame_regs.retain(|r| r != &dc);
                 if inherits {
                     holders.push(dc);
                 }
@@ -486,6 +561,7 @@ fn update_index_holders(
             if let Some(Operand::Register(d)) = inst.operands.first() {
                 let dc = canon_reg(d.name());
                 holders.retain(|r| r != &dc);
+                frame_regs.retain(|r| r != &dc);
             }
         }
     }
@@ -1605,7 +1681,8 @@ mod tests {
         assert!(!dispatch_zero_compares_index(
             cfg.block(BasicBlockId::new(1)).unwrap(),
             0x11,
-            1
+            1,
+            &x_frame_slots()
         ));
         assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
     }
@@ -1618,8 +1695,17 @@ mod tests {
         let a = Architecture::Arm64;
         let gp = |id: u16, bits: u16| Register::new(a, RegisterClass::General, id, bits);
         // arm64::XZR is register id 32 (names as `wzr`/`xzr`).
-        let (x8, w8, w9, wzr) = (gp(8, 64), gp(8, 32), gp(9, 32), gp(32, 32));
+        let (x8, w8, w9, wzr, x29) = (gp(8, 64), gp(8, 32), gp(9, 32), gp(32, 32), gp(29, 64));
         let mut dispatch = BasicBlock::new(BasicBlockId::new(1), 0x7b8);
+        // ldur x8, [x29 - 0x38] — reload the coroutine frame pointer into x8.
+        dispatch.instructions.push(
+            Instruction::new(0, 4, vec![], "ldur")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(x8),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0x38, 8)),
+                ]),
+        );
         let and = |d: Register, s: Register, imm: i128| {
             Instruction::new(0, 4, vec![], "and")
                 .with_operation(Operation::And)
@@ -1662,9 +1748,10 @@ mod tests {
             true_target: BasicBlockId::new(2),
             false_target: BasicBlockId::new(3),
         };
-        assert!(dispatch_zero_compares_index(&dispatch, 0x11, 1));
+        let slots = vec![("x29".to_string(), -0x38)];
+        assert!(dispatch_zero_compares_index(&dispatch, 0x11, 1, &slots));
         assert_eq!(
-            ordered_two_state_targets(&dispatch, 0x11, 1),
+            ordered_two_state_targets(&dispatch, 0x11, 1, &slots),
             Some(vec![BasicBlockId::new(2), BasicBlockId::new(3)])
         );
     }
@@ -1689,7 +1776,8 @@ mod tests {
         assert!(dispatch_spills_index(
             cfg.block(BasicBlockId::new(1)).unwrap(),
             0x11,
-            1
+            1,
+            &x_frame_slots()
         ));
         assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
     }
@@ -1747,6 +1835,15 @@ mod tests {
         let gp = |id: u16, bits: u16| Register::new(a, RegisterClass::General, id, bits);
         let (x8, w8, x29) = (gp(8, 64), gp(8, 32), gp(29, 64));
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x7b8);
+        // ldur x8, [x29 - 0x38] — reload the coroutine frame pointer.
+        block.instructions.push(
+            Instruction::new(0, 4, vec![], "ldur")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(x8),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0x38, 8)),
+                ]),
+        );
         block.instructions.push(
             Instruction::new(0, 4, vec![], "ldrb")
                 .with_operation(Operation::Load)
@@ -1769,10 +1866,10 @@ mod tests {
                 .with_operation(Operation::Store)
                 .with_operands(vec![
                     Operand::Register(w8),
-                    Operand::Memory(MemoryRef::base_disp(x29, -0x38, 1)),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0x40, 1)),
                 ]),
         );
-        assert!(dispatch_spills_index(&block, 0x11, 1));
+        assert!(dispatch_spills_index(&block, 0x11, 1, &[("x29".to_string(), -0x38)]));
     }
 
     fn test_ii(reg: Register) -> Instruction {
@@ -1793,14 +1890,28 @@ mod tests {
         )
     }
 
+    /// `mov rax, [rbp - 0x70]` — establishes `rax` as the frame pointer, so the byte
+    /// read `[rax + 0x11]` is recognized as the resume index.
+    fn frame_reload() -> Instruction {
+        mov(
+            Operand::Register(r(0, 64)),
+            Operand::Memory(MemoryRef::base_disp(r(5, 64), -0x70, 8)),
+        )
+    }
+
+    fn x_frame_slots() -> Vec<SpillSlot> {
+        vec![("rbp".to_string(), -0x70)]
+    }
+
     #[test]
     fn zero_compare_recognizes_test_then_branch() {
         // `mov al,[frame+0x11]; test al,al; je` — je reads (not sets) flags.
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
         block.instructions.push(read_index());
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(je());
-        assert!(dispatch_zero_compares_index(&block, 0x11, 1));
+        assert!(dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
     }
 
     #[test]
@@ -1808,6 +1919,7 @@ mod tests {
         // `mov al,[frame+0x11]; test al,al; add ecx,1; je` — the branch tests `add`'s
         // flags, not the index, so this must NOT be an index-zero dispatch.
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
         block.instructions.push(read_index());
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(
@@ -1816,7 +1928,7 @@ mod tests {
                 .with_operands(vec![Operand::Register(r(1, 32)), imm1(32)]),
         );
         block.instructions.push(je());
-        assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
     }
 
     #[test]
@@ -1824,6 +1936,7 @@ mod tests {
         // `mov al,[frame+0x11]; sub al,1; test al,al` tests (index-1)==0 (i.e. index==1),
         // NOT index==0, so it must not be accepted as an index-zero dispatch.
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
         block.instructions.push(read_index());
         block.instructions.push(
             Instruction::new(0, 3, vec![], "sub")
@@ -1832,7 +1945,25 @@ mod tests {
         );
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(je());
-        assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
+    }
+
+    #[test]
+    fn zero_compare_rejects_same_offset_read_off_non_frame_base() {
+        // After the real `[rax+0x11]` read, a `mov dl,[rcx+0x11]; test dl,dl` at the same
+        // offset but off a NON-frame base (rcx) must NOT be accepted as the index
+        // dispatch — provenance requires the read to be off a frame pointer.
+        let (rcx, dl) = (r(1, 64), r(2, 8));
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
+        block.instructions.push(read_index());
+        block.instructions.push(mov(
+            Operand::Register(dl),
+            Operand::Memory(MemoryRef::base_disp(rcx, 0x11, 1)),
+        ));
+        block.instructions.push(test_ii(dl));
+        block.instructions.push(je());
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
     }
 
     #[test]
@@ -1840,11 +1971,12 @@ mod tests {
         // `mov al,[frame+0x11]; mov al,0; test al,al` — al no longer holds the live
         // index at the test, so this is not an index dispatch.
         let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
         block.instructions.push(read_index());
         block.instructions.push(mov(Operand::Register(r(0, 8)), imm1(8)));
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(je());
-        assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
     }
 
     #[test]
@@ -1855,7 +1987,8 @@ mod tests {
         assert!(!dispatch_spills_index(
             cfg.block(BasicBlockId::new(1)).unwrap(),
             0x11,
-            1
+            1,
+            &x_frame_slots()
         ));
     }
 
