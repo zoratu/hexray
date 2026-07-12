@@ -2380,24 +2380,33 @@ impl<'a> Structurer<'a> {
                             }
                             None => None,
                         };
-                        let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = possible_targets
-                            .iter()
-                            .enumerate()
-                            .map(|(i, &target)| {
-                                let body =
-                                    if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
-                                        self.mark_pure_return_chain_processed(target);
-                                        vec![StructuredNode::Return(ret_expr)]
-                                    } else {
-                                        self.structure_region(target, switch_end)
-                                    };
-                                (vec![i as i128], body)
-                            })
-                            .collect();
+                        // A 2-target indirect dispatch is a two-way branch (an if/else,
+                        // e.g. `test idx,idx; je`): the second edge runs for EVERY value
+                        // that is not the first case, so emit it as the `default` rather
+                        // than a spurious `case 1` that would skip it for other values.
+                        // Genuine multi-entry jump tables reach the recovered-switch path
+                        // (with a real bound-check default) instead of this fallback.
+                        let two_way = possible_targets.len() == 2;
+                        let mut cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = Vec::new();
+                        let mut default: Option<Vec<StructuredNode>> = None;
+                        for (i, &target) in possible_targets.iter().enumerate() {
+                            let body =
+                                if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
+                                    self.mark_pure_return_chain_processed(target);
+                                    vec![StructuredNode::Return(ret_expr)]
+                                } else {
+                                    self.structure_region(target, switch_end)
+                                };
+                            if two_way && i == 1 {
+                                default = Some(body);
+                            } else {
+                                cases.push((vec![i as i128], body));
+                            }
+                        }
                         result.push(StructuredNode::Switch {
                             value: switch_expr,
                             cases,
-                            default: None,
+                            default,
                         });
                         // Continue structuring at the join so the shared continuation
                         // is emitted immediately after the switch (each case's implicit
@@ -10056,5 +10065,41 @@ mod tests {
                 .find_join_point_of_targets(&[BasicBlockId::new(1), BasicBlockId::new(2)]),
             Some(BasicBlockId::new(3)),
         );
+    }
+
+    #[test]
+    fn two_target_indirect_fallback_emits_default() {
+        // A 2-target IndirectJump with no jump table is a two-way branch: the second
+        // target must become the switch `default` (it runs for all non-first values),
+        // not a spurious `case 1`.
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut mk = |id: u32, term: BlockTerminator| {
+            let mut b = BasicBlock::new(BasicBlockId::new(id), 0x1000 + u64::from(id) * 0x10);
+            b.terminator = term;
+            cfg.add_block(b);
+        };
+        mk(
+            0,
+            BlockTerminator::IndirectJump {
+                target: Operand::imm(0, 64),
+                possible_targets: vec![BasicBlockId::new(1), BasicBlockId::new(2)],
+            },
+        );
+        mk(1, BlockTerminator::Return);
+        mk(2, BlockTerminator::Return);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        let mut structurer = Structurer::new(&cfg);
+        let nodes = structurer.structure();
+        let (cases, default) = nodes
+            .iter()
+            .find_map(|n| match n {
+                StructuredNode::Switch { cases, default, .. } => Some((cases, default)),
+                _ => None,
+            })
+            .expect("expected a switch node");
+        assert_eq!(cases.len(), 1, "one explicit case, got {cases:?}");
+        assert!(default.is_some(), "second target should be the default");
     }
 }
