@@ -359,13 +359,16 @@ fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_reg: &str) -> bool 
             _ => false,
         }
     };
-    // LAST flag-setter before the branch wins (it feeds the condition flags).
+    // The flags the branch tests come from the LAST flag-setting instruction, so
+    // recompute at every flag-setter: an index zero-test sets the result, and any OTHER
+    // flag-setter (`and`, `xor`, `add`, `inc`, an unrelated `cmp`, ...) after it clears
+    // the result, since the branch would then be testing those flags, not the index.
     let mut result = false;
     for inst in &dispatch.instructions {
-        if matches!(
+        let index_zero_test = matches!(
             inst.operation,
             Operation::Test | Operation::Compare | Operation::Sub
-        ) {
+        ) && {
             let regs: Vec<String> = inst
                 .operands
                 .iter()
@@ -379,14 +382,36 @@ fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_reg: &str) -> bool 
             let is_self_test = matches!(inst.operation, Operation::Test)
                 && regs.len() >= 2
                 && regs.iter().all(|r| r == index_reg);
-            let against_zero =
-                inst.operands.iter().any(|o| is_zero_operand(o, &zero_regs));
-            result = mentions_index && (is_self_test || against_zero);
+            let against_zero = inst.operands.iter().any(|o| is_zero_operand(o, &zero_regs));
+            mentions_index && (is_self_test || against_zero)
+        };
+        if index_zero_test {
+            result = true;
+        } else if instruction_sets_flags(inst.operation) {
+            result = false;
         }
         // Track registers proven zero for the aarch64 `subs idx,idx,zreg` form.
         update_zero_regs(inst, &mut zero_regs);
     }
     result
+}
+
+/// Whether an operation writes the condition flags (over-approximated as anything that
+/// is not a pure data-move / address computation or a control transfer that reads —
+/// rather than writes — the flags). Used so a flag-setter after the index zero-test
+/// invalidates it: the branch would test the newer flags. `Call` is treated as
+/// flag-clobbering (a callee may leave the flags undefined).
+fn instruction_sets_flags(op: Operation) -> bool {
+    !matches!(
+        op,
+        Operation::Move
+            | Operation::Load
+            | Operation::Store
+            | Operation::LoadEffectiveAddress
+            | Operation::Jump
+            | Operation::ConditionalJump
+            | Operation::Return
+    )
 }
 
 /// Maintain the set of registers proven to hold zero within a block. Recognizes the
@@ -1778,6 +1803,40 @@ mod tests {
         body.terminator = BlockTerminator::Return;
         cfg.add_block(body);
         assert!(!target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+    }
+
+    fn test_ii(reg: Register) -> Instruction {
+        Instruction::new(0, 2, vec![], "test")
+            .with_operation(Operation::Test)
+            .with_operands(vec![Operand::Register(reg), Operand::Register(reg)])
+    }
+
+    fn je() -> Instruction {
+        Instruction::new(0, 6, vec![], "je").with_operation(Operation::ConditionalJump)
+    }
+
+    #[test]
+    fn zero_compare_recognizes_test_then_branch() {
+        // `test al,al; je` — the terminating conditional jump reads (not sets) flags.
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(test_ii(r(0, 8)));
+        block.instructions.push(je());
+        assert!(dispatch_zero_compares_index(&block, "rax"));
+    }
+
+    #[test]
+    fn zero_compare_invalidated_by_later_flag_setter() {
+        // `test al,al; add ecx,1; je` — the branch tests `add`'s flags, not the index,
+        // so this must NOT be treated as an index-zero dispatch.
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(test_ii(r(0, 8)));
+        block.instructions.push(
+            Instruction::new(0, 3, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![Operand::Register(r(1, 32)), imm1(32)]),
+        );
+        block.instructions.push(je());
+        assert!(!dispatch_zero_compares_index(&block, "rax"));
     }
 
     #[test]
