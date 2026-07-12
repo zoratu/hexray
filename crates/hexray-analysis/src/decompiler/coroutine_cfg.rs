@@ -95,6 +95,134 @@ pub fn detect_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ClangResum
     })
 }
 
+/// Rewrite a clang coroutine resume-clone CFG so the tail resume-index dispatch
+/// becomes an explicit `IndirectJump` over the resume states. The generic
+/// structurer then recovers a `switch` whose cases are the real resume-point
+/// bodies (through its `possible_targets` fallback, structurer/mod.rs) instead of
+/// collapsing the scattered tail-dispatch goto flow to `return`.
+///
+/// Returns a rewritten owned CFG, or `None` if this is not a recognized clang
+/// resume dispatch — in which case the caller keeps the original CFG. Only the
+/// compare-chain shape is rewritten here: the jump-table shape already reaches
+/// switch recovery through its native `IndirectJump` terminator (a following slice
+/// handles its `.o` relocation gap), so disturbing it would be counterproductive.
+pub fn rewrite_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ControlFlowGraph> {
+    let disp = detect_clang_resume_dispatch(cfg)?;
+    let targets = match &disp.shape {
+        DispatchShape::CompareChain { targets } => targets.clone(),
+        DispatchShape::JumpTable { .. } => return None,
+    };
+
+    // Deduplicate targets while preserving branch order (a degenerate chain could
+    // list the same resume state twice). Need >=2 distinct states to form a switch.
+    let mut states: Vec<BasicBlockId> = Vec::new();
+    for t in targets {
+        if !states.contains(&t) {
+            states.push(t);
+        }
+    }
+    if states.len() < 2 {
+        return None;
+    }
+
+    // The structurer's switch fallback does not read the IndirectJump target
+    // operand, but keep it honest: reuse the register holding the resume index.
+    let dispatch_block = cfg.block(disp.dispatch)?;
+    let index_operand =
+        resume_index_operand(dispatch_block, disp.index_offset, disp.index_size)?;
+
+    // Rebuild the CFG: clone every block, swap the dispatch terminator for the
+    // synthetic IndirectJump, then re-derive ALL edges from the (rewritten)
+    // terminators so successor/predecessor sets stay consistent. `add_block`
+    // seeds empty edge sets, so rebuilding from terminators cannot double-count.
+    let mut rewritten = ControlFlowGraph::new(cfg.entry);
+    for block in cfg.blocks() {
+        rewritten.add_block(block.clone());
+    }
+    repair_nop_jump_returns(&mut rewritten);
+    {
+        let d = rewritten.block_mut(disp.dispatch)?;
+        d.terminator = BlockTerminator::IndirectJump {
+            target: index_operand,
+            possible_targets: states,
+        };
+    }
+    let ids: Vec<BasicBlockId> = rewritten.block_ids().collect();
+    for id in ids {
+        let succs = rewritten
+            .block(id)
+            .map(|b| b.terminator.successors())
+            .unwrap_or_default();
+        for succ in succs {
+            rewritten.add_edge(id, succ);
+        }
+    }
+    Some(rewritten)
+}
+
+/// Undo the CFG builder's `__x86_return_thunk` heuristic within a coroutine resume
+/// clone: clang at -O0 emits `e9 00000000` (a `jmp` to the immediately-following
+/// instruction) as a plain no-op jump between logical blocks, but the generic CFG
+/// builder (cfg_builder.rs) misreads that encoding as an unresolved return-thunk
+/// relocation and rewrites the terminator to `Return`, severing a resume-point body
+/// from its entry (and internal body blocks from each other). That heuristic targets
+/// unlinked kernel modules; it never applies to a userspace clang coroutine (whose
+/// relocations are already resolved), so re-establish the fallthrough for every such
+/// block whose no-op jump lands on a real successor block. Terminal no-op jumps (no
+/// following block) are left as `Return`.
+fn repair_nop_jump_returns(cfg: &mut ControlFlowGraph) {
+    use std::collections::HashMap;
+    let start_to_id: HashMap<u64, BasicBlockId> =
+        cfg.blocks().map(|b| (b.start, b.id)).collect();
+    let ids: Vec<BasicBlockId> = cfg.block_ids().collect();
+    for id in ids {
+        let fallthrough = match cfg.block(id) {
+            Some(b) if matches!(b.terminator, BlockTerminator::Return) => match b
+                .instructions
+                .last()
+            {
+                Some(inst) if is_nop_jump(inst) => start_to_id.get(&inst.end_address()).copied(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(target) = fallthrough {
+            if let Some(b) = cfg.block_mut(id) {
+                b.terminator = BlockTerminator::Fallthrough { target };
+            }
+        }
+    }
+}
+
+/// `e9 00 00 00 00`: a near `jmp` with a zero relative displacement, i.e. a jump to
+/// the immediately-following instruction (a no-op jump / unresolved-reloc placeholder).
+fn is_nop_jump(inst: &hexray_core::Instruction) -> bool {
+    inst.bytes.len() >= 5 && inst.bytes[0] == 0xe9 && inst.bytes[1..5] == [0, 0, 0, 0]
+}
+
+/// The register operand holding the resume index in the dispatch block — the last
+/// small frame-field read matching the detected `(offset, size)` — reused as the
+/// synthetic IndirectJump target operand.
+fn resume_index_operand(dispatch: &BasicBlock, offset: i64, size: u8) -> Option<Operand> {
+    let mut found: Option<Operand> = None;
+    for inst in &dispatch.instructions {
+        if matches!(inst.operation, Operation::Move | Operation::Load) {
+            if let (Some(dst), Some(Operand::Memory(m))) =
+                (inst.operands.first(), inst.operands.get(1))
+            {
+                if matches!(dst, Operand::Register(_))
+                    && m.index.is_none()
+                    && m.displacement == offset
+                    && m.size == size
+                {
+                    found = Some(dst.clone());
+                }
+            }
+        }
+    }
+    found
+}
+
 /// Stack displacements `K` such that `mov [rbp - K], arg0reg` appears in the entry
 /// block — i.e. slots that hold a spilled copy of the frame pointer (arg0). On
 /// x86-64 SysV the first integer argument is `rdi`.
@@ -998,5 +1126,131 @@ mod tests {
         entry.terminator = BlockTerminator::Return;
         cfg.add_block(entry);
         assert!(detect_clang_resume_dispatch(&cfg).is_none());
+    }
+
+    /// A near `jmp` with a zero displacement at `addr` (`e9 00000000`), 5 bytes.
+    fn jmp_nop(addr: u64) -> Instruction {
+        Instruction::new(addr, 5, vec![0xe9, 0, 0, 0, 0], "jmp").with_operation(Operation::Move)
+    }
+
+    /// Build the shape-A entry+dispatch skeleton with two resume-state blocks.
+    fn shape_a_cfg(r0: BasicBlockId, r1: BasicBlockId) -> ControlFlowGraph {
+        let entry_id = BasicBlockId::new(0);
+        let dispatch_id = BasicBlockId::new(1);
+        let (rbp, rdi, rax, al) = (r(5, 64), r(7, 64), r(0, 64), r(0, 8));
+        let mut cfg = ControlFlowGraph::new(entry_id);
+
+        let mut entry = BasicBlock::new(entry_id, 0x400);
+        entry.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+            Operand::Register(rdi),
+        ));
+        entry.terminator = BlockTerminator::Jump {
+            target: dispatch_id,
+        };
+        cfg.add_block(entry);
+
+        let mut dispatch = BasicBlock::new(dispatch_id, 0x82e);
+        dispatch.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+        ));
+        dispatch.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)),
+        ));
+        dispatch.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: r0,
+            false_target: r1,
+        };
+        cfg.add_block(dispatch);
+        cfg
+    }
+
+    #[test]
+    fn rewrite_shape_a_produces_indirect_switch_dispatch() {
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_a_cfg(r0, r1);
+        cfg.add_block(BasicBlock::new(r0, 0x50e));
+        cfg.add_block(BasicBlock::new(r1, 0x608));
+
+        let rewritten = rewrite_clang_resume_dispatch(&cfg).expect("rewritten");
+        let dispatch = rewritten.block(BasicBlockId::new(1)).unwrap();
+        match &dispatch.terminator {
+            BlockTerminator::IndirectJump {
+                possible_targets, ..
+            } => assert_eq!(possible_targets, &vec![r0, r1]),
+            other => panic!("expected IndirectJump, got {other:?}"),
+        }
+        // Edges re-derived from the rewritten terminator point at the resume states.
+        let succ = rewritten.successors(BasicBlockId::new(1));
+        assert!(succ.contains(&r0) && succ.contains(&r1));
+    }
+
+    #[test]
+    fn rewrite_declines_jump_table_shape() {
+        // A native IndirectJump dispatch (shape B) already reaches switch recovery;
+        // the rewrite must leave it alone.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_a_cfg(r0, r1);
+        cfg.add_block(BasicBlock::new(r0, 0x50e));
+        cfg.add_block(BasicBlock::new(r1, 0x608));
+        cfg.block_mut(BasicBlockId::new(1)).unwrap().terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(r(0, 64)),
+            possible_targets: vec![r0, r1],
+        };
+        assert!(rewrite_clang_resume_dispatch(&cfg).is_none());
+    }
+
+    #[test]
+    fn repair_reconnects_nop_jump_return_to_fallthrough() {
+        // A block ending in `e9 00000000` at 0x100 (5 bytes) that the CFG builder
+        // mislabeled `Return`; a real block starts at the fallthrough 0x105.
+        let a = BasicBlockId::new(0);
+        let b = BasicBlockId::new(1);
+        let mut cfg = ControlFlowGraph::new(a);
+        let mut ba = BasicBlock::new(a, 0x100);
+        ba.instructions.push(jmp_nop(0x100));
+        ba.terminator = BlockTerminator::Return;
+        cfg.add_block(ba);
+        cfg.add_block(BasicBlock::new(b, 0x105));
+
+        repair_nop_jump_returns(&mut cfg);
+        assert_eq!(
+            cfg.block(a).unwrap().terminator,
+            BlockTerminator::Fallthrough { target: b }
+        );
+    }
+
+    #[test]
+    fn repair_leaves_terminal_nop_jump_as_return() {
+        // No block at the fallthrough address -> keep it a return (kernel thunk tail).
+        let a = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(a);
+        let mut ba = BasicBlock::new(a, 0x100);
+        ba.instructions.push(jmp_nop(0x100));
+        ba.terminator = BlockTerminator::Return;
+        cfg.add_block(ba);
+
+        repair_nop_jump_returns(&mut cfg);
+        assert_eq!(cfg.block(a).unwrap().terminator, BlockTerminator::Return);
+    }
+
+    #[test]
+    fn repair_leaves_real_return_untouched() {
+        // A genuine `ret` (0xc3) followed by a block must stay a return.
+        let a = BasicBlockId::new(0);
+        let b = BasicBlockId::new(1);
+        let mut cfg = ControlFlowGraph::new(a);
+        let mut ba = BasicBlock::new(a, 0x100);
+        ba.instructions
+            .push(Instruction::new(0x100, 1, vec![0xc3], "ret"));
+        ba.terminator = BlockTerminator::Return;
+        cfg.add_block(ba);
+        cfg.add_block(BasicBlock::new(b, 0x101));
+
+        repair_nop_jump_returns(&mut cfg);
+        assert_eq!(cfg.block(a).unwrap().terminator, BlockTerminator::Return);
     }
 }

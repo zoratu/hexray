@@ -15,10 +15,9 @@ pub mod comparison;
 pub mod config;
 mod constant_propagation;
 mod coroutine;
-// Slice 1a: CFG-level clang coroutine dispatch DETECTION (verified on real
-// fixtures). The CFG rewrite that consumes it is wired in a following slice, so the
-// detection API is not yet called from the pipeline.
-#[allow(dead_code)]
+// CFG-level clang coroutine resume-dispatch recognition + rewrite: turns the tail
+// resume-index dispatch into an explicit switch region so the generic structurer
+// preserves each resume-point body instead of collapsing the goto flow.
 mod coroutine_cfg;
 mod cse;
 mod dead_store;
@@ -1224,7 +1223,17 @@ impl Decompiler {
             merged_types.insert(k.clone(), v.clone());
         }
 
-        // Step 1: Structure the control flow
+        // Step 1: Structure the control flow.
+        // For clang C++20 coroutine `.resume` clones the resume-index dispatch is a
+        // tail block the generic structurer would collapse (folding the scattered
+        // resume-point bodies away to `return`). Rewrite it into an explicit switch
+        // region first so each resume-point body survives structuring.
+        let coro_rewritten = if coroutine::is_coroutine_resume_clone(func_name) {
+            coroutine_cfg::rewrite_clang_resume_dispatch(cfg)
+        } else {
+            None
+        };
+        let cfg = coro_rewritten.as_ref().unwrap_or(cfg);
         let structured = self.structure(cfg);
 
         // Step 2: Apply struct inference if enabled
