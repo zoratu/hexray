@@ -167,6 +167,18 @@ pub fn rewrite_clang_resume_dispatch(
         return None;
     }
 
+    // Both branch targets must be genuine resume-state BODIES. `dispatch_spills_index`
+    // catches multi-state chains that spill the index for later compares, but a chain
+    // can also carry the index in a register (no spill) into a continuation-compare on
+    // the false edge. Treating that continuation as case 1 would drop the states it
+    // guards, so decline if either target (after trivial routing) re-dispatches on the
+    // resume index.
+    if states.iter().any(|&t| {
+        target_redispatches_index(cfg, t, &index_reg, disp.index_offset, disp.index_size)
+    }) {
+        return None;
+    }
+
     // Rebuild the CFG: clone every block, swap the dispatch terminator for the
     // synthetic IndirectJump, then re-derive ALL edges from the (rewritten)
     // terminators so successor/predecessor sets stay consistent. `add_block`
@@ -411,6 +423,114 @@ fn update_zero_regs(inst: &hexray_core::Instruction, zero: &mut Vec<String>) {
 /// The architectural zero register (`wzr`/`xzr` on aarch64), which always reads as 0.
 fn is_zero_register(name: &str) -> bool {
     matches!(name.to_lowercase().as_str(), "wzr" | "xzr")
+}
+
+/// Whether `target`, after routing through trivial jump-only blocks, is a
+/// continuation-compare that re-dispatches on the resume index (a multi-state chain)
+/// rather than a genuine resume-state body. Such a block re-tests the index — either
+/// reloading the frame field or testing the index register still carried from the
+/// dispatch — and ends in a conditional branch.
+fn target_redispatches_index(
+    cfg: &ControlFlowGraph,
+    target: BasicBlockId,
+    index_reg: &str,
+    index_offset: i64,
+    index_size: u8,
+) -> bool {
+    let landing = route_trivial_jumps(cfg, target);
+    let Some(block) = cfg.block(landing) else {
+        return false;
+    };
+    if !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. }) {
+        return false;
+    }
+    // Track the index register carried from the dispatch (cleared on redefinition) and
+    // any fresh reload of the field, then look for a compare/test/sub that reads either.
+    let mut carried = true;
+    let mut fresh: Vec<String> = Vec::new();
+    for inst in &block.instructions {
+        if matches!(inst.operation, Operation::Move | Operation::Load) {
+            if let (Some(Operand::Register(d)), Some(Operand::Memory(m))) =
+                (inst.operands.first(), inst.operands.get(1))
+            {
+                if m.index.is_none()
+                    && m.displacement == index_offset
+                    && u16::from(m.size) == u16::from(index_size)
+                {
+                    fresh.push(canon_reg(d.name()));
+                    continue;
+                }
+            }
+        }
+        if matches!(
+            inst.operation,
+            Operation::Compare | Operation::Test | Operation::Sub
+        ) {
+            let touches_index = inst.operands.iter().any(|o| match o {
+                Operand::Register(r) => {
+                    let c = canon_reg(r.name());
+                    (carried && c == index_reg) || fresh.contains(&c)
+                }
+                _ => false,
+            });
+            if touches_index {
+                return true;
+            }
+            continue;
+        }
+        // Any other write to a register invalidates it as an index holder.
+        if let Some(Operand::Register(d)) = inst.operands.first() {
+            let c = canon_reg(d.name());
+            if c == index_reg {
+                carried = false;
+            }
+            fresh.retain(|r| r != &c);
+        }
+    }
+    false
+}
+
+/// Follow trivial routing blocks (a single unconditional `jmp`/fall-through, or a
+/// no-op `e9 00000000` jump the CFG builder mislabeled `Return`) from `start` to the
+/// first block that does real work, so a continuation reached only through clang's
+/// padding jumps is inspected. Bounded to avoid cycles.
+fn route_trivial_jumps(cfg: &ControlFlowGraph, start: BasicBlockId) -> BasicBlockId {
+    use std::collections::{HashMap, HashSet};
+    let start_to_id: HashMap<u64, BasicBlockId> = cfg.blocks().map(|b| (b.start, b.id)).collect();
+    let mut cur = start;
+    let mut seen = HashSet::new();
+    for _ in 0..16 {
+        if !seen.insert(cur) {
+            break;
+        }
+        let Some(b) = cfg.block(cur) else {
+            break;
+        };
+        let next = match &b.terminator {
+            // A block that is nothing but an unconditional jump / fall-through.
+            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target }
+                if b.instructions.len() <= 1 =>
+            {
+                Some(*target)
+            }
+            // A no-op jump mislabeled `Return`: its real successor is the block at the
+            // jump's fall-through address.
+            BlockTerminator::Return
+                if b.instructions.len() == 1
+                    && b.instructions.last().is_some_and(is_nop_jump) =>
+            {
+                b.instructions
+                    .last()
+                    .and_then(|i| start_to_id.get(&i.end_address()).copied())
+            }
+            _ => None,
+        };
+        match next {
+            Some(n) => cur = n,
+            None => break,
+        }
+    }
+    cur
 }
 
 /// The register operand holding the resume index in the dispatch block — the last
@@ -1559,6 +1679,70 @@ mod tests {
             1
         ));
         assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+    }
+
+    fn imm1(bits: u8) -> Operand {
+        Operand::Immediate(hexray_core::Immediate {
+            value: 1,
+            size: bits,
+            signed: false,
+        })
+    }
+
+    #[test]
+    fn redispatch_detects_carried_index_continuation_compare() {
+        // A continuation block that tests the carried index register `al` then branches
+        // is a multi-state chain compare (`cmp al,1; je ...`), not a state body.
+        let al = r(0, 8);
+        let bb = BasicBlockId::new(5);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut cont = BasicBlock::new(bb, 0x600);
+        cont.instructions.push(
+            Instruction::new(0, 2, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(al), imm1(8)]),
+        );
+        cont.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(6),
+            false_target: BasicBlockId::new(7),
+        };
+        cfg.add_block(cont);
+        assert!(target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+    }
+
+    #[test]
+    fn redispatch_ignores_state_body_that_overwrites_index_reg() {
+        // A state body whose own conditional tests a register it just overwrote
+        // (`mov al,1; test al,al`) is NOT re-dispatching on the resume index.
+        let al = r(0, 8);
+        let bb = BasicBlockId::new(5);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut body = BasicBlock::new(bb, 0x50e);
+        body.instructions.push(mov(Operand::Register(al), imm1(8)));
+        body.instructions.push(
+            Instruction::new(0, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
+        );
+        body.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::NotEqual,
+            true_target: BasicBlockId::new(6),
+            false_target: BasicBlockId::new(7),
+        };
+        cfg.add_block(body);
+        assert!(!target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+    }
+
+    #[test]
+    fn redispatch_ignores_non_conditional_state_body() {
+        // A target that is not a conditional-branch block is a state body.
+        let bb = BasicBlockId::new(5);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut body = BasicBlock::new(bb, 0x50e);
+        body.terminator = BlockTerminator::Return;
+        cfg.add_block(body);
+        assert!(!target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
     }
 
     #[test]
