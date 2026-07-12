@@ -186,8 +186,13 @@ pub fn rewrite_clang_resume_dispatch(
     // index in a register with neither a spill nor a re-read cannot be distinguished
     // here without whole-function dataflow, but clang -O0 does not emit that shape, so
     // it is out of scope.
-    if !index_field_read_only_in_dispatch(cfg, disp.dispatch, disp.index_offset, disp.index_size)
-    {
+    if !index_field_read_only_in_dispatch(
+        cfg,
+        disp.dispatch,
+        disp.index_offset,
+        disp.index_size,
+        &frame_slots,
+    ) {
         return None;
     }
 
@@ -324,19 +329,20 @@ fn dispatch_spills_index(
     false
 }
 
-/// Whether the resume-index field `frame[index_offset]` (of `index_size` bytes) is
-/// re-read by a CONTINUATION-DISPATCH block other than the dispatch. A multi-state
-/// compare chain re-reads the field in a further block that then branches on it for each
-/// extra state test, so a same-offset read in a block ending in a conditional branch
-/// means this is not a genuine two-state dispatch. The conditional-branch restriction
-/// stops an unrelated same-offset load in a straight-line resume body (`obj->field_0x11`)
-/// from spuriously declining a valid two-state dispatch. Provenance-free and
-/// deliberately conservative (see the caller's note).
+/// Whether the resume-index FRAME field is re-read by a CONTINUATION-DISPATCH block
+/// other than the dispatch. A multi-state compare chain re-reads the field — off a
+/// reloaded FRAME POINTER — in a further block that then branches on it for each extra
+/// state test. So a block that ends in a conditional branch and reads `frame[off]` off a
+/// frame pointer (reloaded from a spill slot in that block) is a continuation dispatch.
+/// Requiring frame-base provenance (not merely the same offset/width) keeps an unrelated
+/// same-offset load in a resume body (`obj->field_0x11` off some object) from spuriously
+/// declining a valid two-state dispatch.
 fn index_field_read_only_in_dispatch(
     cfg: &ControlFlowGraph,
     dispatch_id: BasicBlockId,
     index_offset: i64,
     index_size: u8,
+    frame_slots: &[SpillSlot],
 ) -> bool {
     for block in cfg.blocks() {
         if block.id == dispatch_id
@@ -344,18 +350,21 @@ fn index_field_read_only_in_dispatch(
         {
             continue;
         }
+        // Track frame reloads and index reads within the block; a frame-based index read
+        // (which populates `holders`) marks this as a continuation dispatch.
+        let mut frame_regs: Vec<String> = Vec::new();
+        let mut holders: Vec<(String, u16)> = Vec::new();
         for inst in &block.instructions {
-            if matches!(inst.operation, Operation::Move | Operation::Load) {
-                if let (Some(Operand::Register(_)), Some(Operand::Memory(m))) =
-                    (inst.operands.first(), inst.operands.get(1))
-                {
-                    if m.index.is_none()
-                        && m.displacement == index_offset
-                        && u16::from(m.size) == u16::from(index_size)
-                    {
-                        return false;
-                    }
-                }
+            update_index_holders(
+                inst,
+                index_offset,
+                index_size,
+                frame_slots,
+                &mut frame_regs,
+                &mut holders,
+            );
+            if !holders.is_empty() {
+                return false;
             }
         }
     }
@@ -1824,40 +1833,55 @@ mod tests {
     }
 
     #[test]
-    fn field_read_guard_ignores_straightline_body_load() {
-        // A resume body loading an unrelated same-offset field (`obj->field_0x11`) in a
-        // NON-branch block must NOT disable recovery.
+    fn field_read_guard_ignores_unrelated_conditional_load() {
+        // A same-offset load off a NON-frame object (`obj->field_0x11` via rcx), even in
+        // a conditional-branch block, must NOT disable recovery — it is not the index.
         let dispatch = BasicBlockId::new(0);
         let mut cfg = ControlFlowGraph::new(dispatch);
         cfg.add_block(BasicBlock::new(dispatch, 0x82e));
         let mut body = BasicBlock::new(BasicBlockId::new(1), 0x600);
         body.instructions.push(mov(
-            Operand::Register(r(0, 8)),
+            Operand::Register(r(2, 8)),
             Operand::Memory(MemoryRef::base_disp(r(1, 64), 0x11, 1)),
         ));
-        body.terminator = BlockTerminator::Return;
+        body.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
         cfg.add_block(body);
-        assert!(index_field_read_only_in_dispatch(&cfg, dispatch, 0x11, 1));
+        assert!(index_field_read_only_in_dispatch(
+            &cfg,
+            dispatch,
+            0x11,
+            1,
+            &x_frame_slots()
+        ));
     }
 
     #[test]
-    fn field_read_guard_rejects_continuation_reread() {
-        // A same-offset read in a block that then branches is a continuation dispatch.
+    fn field_read_guard_rejects_frame_based_continuation_reread() {
+        // A block that reloads the frame and re-reads `frame[0x11]` then branches is a
+        // continuation dispatch (a multi-state chain) -> decline.
         let dispatch = BasicBlockId::new(0);
         let mut cfg = ControlFlowGraph::new(dispatch);
         cfg.add_block(BasicBlock::new(dispatch, 0x82e));
         let mut cont = BasicBlock::new(BasicBlockId::new(1), 0x600);
-        cont.instructions.push(mov(
-            Operand::Register(r(0, 8)),
-            Operand::Memory(MemoryRef::base_disp(r(1, 64), 0x11, 1)),
-        ));
+        cont.instructions.push(frame_reload()); // mov rax,[rbp-0x70]
+        cont.instructions.push(read_index()); // mov al,[rax+0x11]
         cont.terminator = BlockTerminator::ConditionalBranch {
             condition: Condition::Equal,
             true_target: BasicBlockId::new(2),
             false_target: BasicBlockId::new(3),
         };
         cfg.add_block(cont);
-        assert!(!index_field_read_only_in_dispatch(&cfg, dispatch, 0x11, 1));
+        assert!(!index_field_read_only_in_dispatch(
+            &cfg,
+            dispatch,
+            0x11,
+            1,
+            &x_frame_slots()
+        ));
     }
 
     #[test]
