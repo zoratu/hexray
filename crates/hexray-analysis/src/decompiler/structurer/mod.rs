@@ -2366,13 +2366,19 @@ impl<'a> Structurer<'a> {
                         // continuation shared by several cases (e.g. the post-await join
                         // of a coroutine resume dispatch) is emitted once after the
                         // switch instead of being absorbed into the first-structured
-                        // case and dropped from the others. Only meaningful with >=2
-                        // targets — with a single target its successor is not a shared
-                        // join and must stay inside the case (it only runs when matched).
-                        let switch_end = if possible_targets.len() >= 2 {
-                            self.find_join_point_of_targets(possible_targets).or(end)
-                        } else {
-                            end
+                        // case and dropped from the others. Respect the enclosing region:
+                        // when this switch is inside a bounded region, `end` is already
+                        // the boundary and must be honored — computing a later common
+                        // block could let a case structure past `end` and steal code that
+                        // belongs after the region. Only synthesize a join at the top
+                        // level (`end` is None) and only with >=2 targets (a single
+                        // target's successor is not a shared join).
+                        let switch_end = match end {
+                            Some(_) => end,
+                            None if possible_targets.len() >= 2 => {
+                                self.find_join_point_of_targets(possible_targets)
+                            }
+                            None => None,
                         };
                         let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = possible_targets
                             .iter()

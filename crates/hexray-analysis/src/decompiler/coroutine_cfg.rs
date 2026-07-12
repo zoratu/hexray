@@ -465,14 +465,12 @@ fn update_index_holders(
                 }
             }
         }
-        // A mask (`and idx, #imm`) or a subtract of a holder (`subs idx, idx, zero`
-        // preserves the value; `sub idx, idx, K` keeps it index-DERIVED) keeps the
-        // destination index-related iff any operand is a holder. Erring toward keeping
-        // the holder is the safe direction for the re-dispatch guard: it can only cause
-        // an over-decline, never a multi-state chain slipping through as two cases. The
-        // zero-comparison check gates acceptance separately (only a subtract of zero
-        // counts as an index-zero test), so this does not loosen that.
-        Operation::And | Operation::Sub => {
+        // A mask of the index (`and idx, #imm`) keeps its zero-ness for the small
+        // resume-state range; the destination stays a holder iff any operand is one.
+        // (A `sub` is NOT preserved: `sub idx, K` yields `idx - K`, so a later
+        // `test idx,idx` would test `idx == K`, not `idx == 0` — falling through to the
+        // clobber branch keeps that from being mistaken for an index-zero dispatch.)
+        Operation::And => {
             if let Some(Operand::Register(d)) = inst.operands.first() {
                 let dc = canon_reg(d.name());
                 let inherits = inst.operands.iter().any(operand_is_holder);
@@ -1817,6 +1815,22 @@ mod tests {
                 .with_operation(Operation::Add)
                 .with_operands(vec![Operand::Register(r(1, 32)), imm1(32)]),
         );
+        block.instructions.push(je());
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
+    }
+
+    #[test]
+    fn zero_compare_rejects_nonzero_subtract_result() {
+        // `mov al,[frame+0x11]; sub al,1; test al,al` tests (index-1)==0 (i.e. index==1),
+        // NOT index==0, so it must not be accepted as an index-zero dispatch.
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(read_index());
+        block.instructions.push(
+            Instruction::new(0, 3, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![Operand::Register(r(0, 8)), imm1(8)]),
+        );
+        block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(je());
         assert!(!dispatch_zero_compares_index(&block, 0x11, 1));
     }
