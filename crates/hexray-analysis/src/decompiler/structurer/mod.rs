@@ -2394,6 +2394,20 @@ impl<'a> Structurer<'a> {
                         // join is the enclosing region end (or none exists), stop.
                         match switch_end {
                             Some(join) if end != Some(join) => {
+                                // The join has multiple predecessors (the cases converge
+                                // on it), so mark it inline-allowed — otherwise the next
+                                // iteration's multi-pred guard would emit a goto and defer
+                                // it to the orphan pass. Skip irreducible entry points,
+                                // which are legitimate goto targets (as the if/else path
+                                // does).
+                                let is_irreducible_entry = self
+                                    .irreducible_analysis
+                                    .regions
+                                    .iter()
+                                    .any(|r| r.entry_points.contains(&join));
+                                if !is_irreducible_entry {
+                                    self.inline_allowed.insert(join);
+                                }
                                 current = Some(join);
                                 continue;
                             }
