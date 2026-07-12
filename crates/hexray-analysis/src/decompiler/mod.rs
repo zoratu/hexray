@@ -1242,7 +1242,10 @@ impl Decompiler {
         } else {
             None
         };
-        let cfg = coro_rewritten.as_ref().unwrap_or(cfg);
+        // The resume-index offset from the rewrite, used later to name the recovered
+        // switch value `frame->__resume_index` (only set when the rewrite fired).
+        let clang_resume_offset = coro_rewritten.as_ref().map(|r| r.index_offset);
+        let cfg = coro_rewritten.as_ref().map(|r| &r.cfg).unwrap_or(cfg);
         let structured = self.structure(cfg);
 
         // Step 2: Apply struct inference if enabled
@@ -1384,6 +1387,12 @@ impl Decompiler {
             || coroutine::is_coroutine_resume_clone(func_name)
         {
             let body = coroutine::recover_resume_dispatch(structured.body);
+            // For clang `.resume` clones recovered by the CFG-level rewrite, name the
+            // synthetic `switch(switch_value)` as `switch(frame->__resume_index)`.
+            let body = match clang_resume_offset {
+                Some(offset) => coroutine::name_clang_resume_switch(body, offset),
+                None => body,
+            };
             let recovered = coroutine::body_has_resume_switch(&body);
             (
                 StructuredCfg {

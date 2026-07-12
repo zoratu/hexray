@@ -102,6 +102,128 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
     }
 }
 
+/// Name the CFG-recovered clang resume `switch(switch_value)` as
+/// `switch(frame->__resume_index)`.
+///
+/// clang's `.resume` dispatch is rebuilt as a synthetic switch at the CFG level
+/// ([`super::coroutine_cfg`]), where the resume-index frame offset is known exactly.
+/// The generic structurer's `possible_targets` fallback can only label that switch
+/// with an opaque `switch_value` placeholder, and the index-read that would carry the
+/// frame provenance is dead-code-eliminated (the synthetic `IndirectJump` doesn't
+/// consume it). So the offset is threaded in here and the placeholder is replaced
+/// directly with the named field, committing the recovery. Returns the body unchanged
+/// when the frame parameter can't be identified or no synthetic switch is present.
+pub fn name_clang_resume_switch(body: Vec<StructuredNode>, offset: i64) -> Vec<StructuredNode> {
+    let Some(frame) = build_frame(&flatten_spine_sequences(body.clone())) else {
+        return body;
+    };
+    let named = named_state_expr(&frame, &StateField { offset });
+    rename_synthetic_switch_value(body, &named)
+}
+
+/// Replace the value of every synthetic `switch (switch_value)` (the opaque
+/// placeholder emitted by the structurer's indirect-jump fallback) with `named`,
+/// recursing through the whole node tree. Only the CFG-recovered resume dispatch
+/// carries this exact placeholder, so no genuine switch is affected.
+fn rename_synthetic_switch_value(nodes: Vec<StructuredNode>, named: &Expr) -> Vec<StructuredNode> {
+    nodes
+        .into_iter()
+        .map(|n| rename_synthetic_in_node(n, named))
+        .collect()
+}
+
+fn rename_synthetic_in_node(node: StructuredNode, named: &Expr) -> StructuredNode {
+    let recurse = |b: Vec<StructuredNode>| rename_synthetic_switch_value(b, named);
+    match node {
+        StructuredNode::Switch {
+            value,
+            cases,
+            default,
+        } => {
+            let value = if matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value") {
+                named.clone()
+            } else {
+                value
+            };
+            StructuredNode::Switch {
+                value,
+                cases: cases.into_iter().map(|(l, b)| (l, recurse(b))).collect(),
+                default: default.map(recurse),
+            }
+        }
+        StructuredNode::If {
+            condition,
+            then_body,
+            else_body,
+        } => StructuredNode::If {
+            condition,
+            then_body: recurse(then_body),
+            else_body: else_body.map(recurse),
+        },
+        StructuredNode::While {
+            condition,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::While {
+            condition,
+            body: recurse(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::DoWhile {
+            body,
+            condition,
+            header,
+            exit_block,
+        } => StructuredNode::DoWhile {
+            body: recurse(body),
+            condition,
+            header,
+            exit_block,
+        },
+        StructuredNode::For {
+            init,
+            condition,
+            update,
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::For {
+            init,
+            condition,
+            update,
+            body: recurse(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Loop {
+            body,
+            header,
+            exit_block,
+        } => StructuredNode::Loop {
+            body: recurse(body),
+            header,
+            exit_block,
+        },
+        StructuredNode::Sequence(nodes) => StructuredNode::Sequence(recurse(nodes)),
+        StructuredNode::TryCatch {
+            try_body,
+            catch_handlers,
+        } => StructuredNode::TryCatch {
+            try_body: recurse(try_body),
+            catch_handlers: catch_handlers
+                .into_iter()
+                .map(|mut h| {
+                    h.body = recurse(h.body);
+                    h
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
 /// Splice transparent `Sequence` wrappers inline throughout the dispatch spine
 /// (the top-level node list and every `If` branch, recursively), so downstream
 /// detection/rewrite/flatten never see a `Sequence` between a frame copy and its
@@ -5253,5 +5375,75 @@ mod tests {
         let out = recover_resume_dispatch(body);
         let dump = format!("{out:?}");
         assert!(dump.contains(RESUME_FIELD_NAME));
+    }
+
+    /// A synthetic clang dispatch `switch (switch_value)` with an arg0 reference.
+    fn clang_synthetic_body() -> Vec<StructuredNode> {
+        vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::unknown("switch_value"),
+                cases: vec![
+                    (vec![0], vec![block(vec![Expr::unknown("body0")])]),
+                    (vec![1], vec![block(vec![Expr::unknown("body1")])]),
+                ],
+                default: None,
+            },
+        ]
+    }
+
+    #[test]
+    fn names_synthetic_clang_switch_as_resume_index() {
+        // The CFG-recovered clang dispatch is `switch (switch_value)`; naming it with
+        // the known offset must produce `switch (frame->__resume_index)` and commit.
+        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11);
+        assert!(body_has_resume_switch(&out), "recovery should commit: {out:?}");
+        let StructuredNode::Switch { value, .. } = &out[1] else {
+            panic!("expected switch, got {:?}", out[1]);
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
+            "value should be frame->__resume_index, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn name_clang_switch_leaves_genuine_switch_untouched() {
+        // A real switch (value is not the synthetic `switch_value` placeholder) must
+        // not be rewritten, even in a resume clone.
+        let body = vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::var(Variable::reg("edx", 4)),
+                cases: vec![(vec![0], vec![block(vec![Expr::unknown("body0")])])],
+                default: None,
+            },
+        ];
+        let out = name_clang_resume_switch(body.clone(), 0x11);
+        let StructuredNode::Switch { value, .. } = &out[1] else {
+            panic!("expected switch");
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Var(v) if v.name == "edx"),
+            "genuine switch value must be preserved, got {value:?}"
+        );
+    }
+
+    #[test]
+    fn name_clang_switch_no_frame_returns_body_unchanged() {
+        // Without a frame parameter (no arg0), the value can't be named; leave it.
+        let body = vec![StructuredNode::Switch {
+            value: Expr::unknown("switch_value"),
+            cases: vec![(vec![0], vec![block(vec![Expr::unknown("body0")])])],
+            default: None,
+        }];
+        let out = name_clang_resume_switch(body, 0x11);
+        assert!(!body_has_resume_switch(&out));
     }
 }

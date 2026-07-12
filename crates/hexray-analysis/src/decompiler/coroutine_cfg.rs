@@ -108,10 +108,18 @@ pub fn detect_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ClangResum
 /// compare-chain shape is rewritten here: the jump-table shape already reaches
 /// switch recovery through its native `IndirectJump` terminator (a following slice
 /// handles its `.o` relocation gap), so disturbing it would be counterproductive.
+/// A CFG rewritten so its clang resume dispatch is a switch region, plus the
+/// resume-index frame offset (needed later to name the switch value
+/// `frame->__resume_index`).
+pub struct ClangResumeRewrite {
+    pub cfg: ControlFlowGraph,
+    pub index_offset: i64,
+}
+
 pub fn rewrite_clang_resume_dispatch(
     cfg: &ControlFlowGraph,
     relocations: Option<&super::RelocationTable>,
-) -> Option<ControlFlowGraph> {
+) -> Option<ClangResumeRewrite> {
     let disp = detect_clang_resume_dispatch(cfg)?;
     if !matches!(disp.shape, DispatchShape::CompareChain { .. }) {
         // The jump-table shape already reaches switch recovery through its native
@@ -185,7 +193,10 @@ pub fn rewrite_clang_resume_dispatch(
             rewritten.add_edge(id, succ);
         }
     }
-    Some(rewritten)
+    Some(ClangResumeRewrite {
+        cfg: rewritten,
+        index_offset: disp.index_offset,
+    })
 }
 
 /// Undo the CFG builder's `__x86_return_thunk` heuristic within a coroutine resume
@@ -1383,7 +1394,7 @@ mod tests {
         cfg.add_block(BasicBlock::new(r0, 0x50e));
         cfg.add_block(BasicBlock::new(r1, 0x608));
 
-        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten");
+        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten").cfg;
         let dispatch = rewritten.block(BasicBlockId::new(1)).unwrap();
         match &dispatch.terminator {
             BlockTerminator::IndirectJump {
@@ -1426,7 +1437,7 @@ mod tests {
         {
             *condition = Condition::NotEqual;
         }
-        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten");
+        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten").cfg;
         match &rewritten.block(BasicBlockId::new(1)).unwrap().terminator {
             BlockTerminator::IndirectJump {
                 possible_targets, ..
