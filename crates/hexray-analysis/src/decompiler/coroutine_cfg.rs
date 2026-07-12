@@ -149,10 +149,9 @@ pub fn rewrite_clang_resume_dispatch(
     // (This operand is also reused, honestly, as the synthetic IndirectJump target.)
     let index_operand =
         resume_index_operand(dispatch_block, disp.index_offset, disp.index_size)?;
-    let Operand::Register(index_reg) = &index_operand else {
+    if !matches!(index_operand, Operand::Register(_)) {
         return None;
-    };
-    let index_reg = canon_reg(index_reg.name());
+    }
     let ordered = ordered_two_state_targets(dispatch_block, disp.index_offset, disp.index_size)?;
 
     // Deduplicate while preserving index order (a degenerate branch could list the
@@ -172,9 +171,12 @@ pub fn rewrite_clang_resume_dispatch(
     // can also carry the index in a register (no spill) into a continuation-compare on
     // the false edge. Treating that continuation as case 1 would drop the states it
     // guards, so decline if either target (after trivial routing) re-dispatches on the
-    // resume index.
+    // resume index. Seed the check with EVERY register holding the live index at the
+    // dispatch branch (through copies/masks), not just the field-read destination.
+    let index_holders =
+        dispatch_index_holders(dispatch_block, disp.index_offset, disp.index_size);
     if states.iter().any(|&t| {
-        target_redispatches_index(cfg, t, &index_reg, disp.index_offset, disp.index_size)
+        target_redispatches_index(cfg, t, &index_holders, disp.index_offset, disp.index_size)
     }) {
         return None;
     }
@@ -268,26 +270,14 @@ fn is_nop_jump(inst: &hexray_core::Instruction) -> bool {
 /// dispatch tests the in-register index directly (`test al,al; je`) and never spills
 /// it. Used to decline the 2-case rewrite on chains it cannot represent.
 fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> bool {
-    // Canonical names of registers currently holding the freshly-read resume index.
-    let mut index_regs: Vec<String> = Vec::new();
+    // Registers holding the live resume index (field read, copies, masks) — the same
+    // provenance model used everywhere in the guard, so a masked index (`ldrb w8,..;
+    // and w8,w8,#3; strb w8,..`) is still recognized as spilled.
+    let mut holders: Vec<String> = Vec::new();
     for inst in &dispatch.instructions {
-        // Resume-index read: `mov(zx) reg, [frameReg + index_offset]`. Records the
-        // destination as holding the index.
-        if matches!(inst.operation, Operation::Move | Operation::Load) {
-            if let (Some(Operand::Register(d)), Some(Operand::Memory(m))) =
-                (inst.operands.first(), inst.operands.get(1))
-            {
-                if m.index.is_none()
-                    && m.displacement == index_offset
-                    && u16::from(m.size) == u16::from(index_size)
-                {
-                    index_regs.push(canon_reg(d.name()));
-                    continue;
-                }
-            }
-        }
         // Spill: `mov [mem], idxreg` (x86) or `str idxreg, [mem]` (aarch64) writes an
-        // index-holding register back to a stack slot.
+        // index-holding register back to a stack slot. Checked before the holder update
+        // (a store's source register is not a redefinition of the index).
         let stored_src = match inst.operation {
             Operation::Move => match (inst.operands.first(), inst.operands.get(1)) {
                 (Some(Operand::Memory(_)), Some(Operand::Register(s))) => Some(s),
@@ -300,21 +290,24 @@ fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u
             _ => None,
         };
         if let Some(s) = stored_src {
-            if index_regs.contains(&canon_reg(s.name())) {
+            if holders.contains(&canon_reg(s.name())) {
                 return true;
             }
-            continue;
         }
-        // Any other write to a register (arithmetic like `sub al,K`, a reload, etc.)
-        // clobbers the pure index it held. Compares/tests write only flags.
-        if !matches!(inst.operation, Operation::Compare | Operation::Test) {
-            if let Some(Operand::Register(d)) = inst.operands.first() {
-                let dc = canon_reg(d.name());
-                index_regs.retain(|r| r != &dc);
-            }
-        }
+        update_index_holders(inst, index_offset, index_size, &mut holders);
     }
     false
+}
+
+/// Registers holding the live resume index at the dispatch block's terminating branch
+/// (after any copies/masks of the field read). Used to seed the target re-dispatch
+/// check with the register(s) actually carried into the branch targets.
+fn dispatch_index_holders(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> Vec<String> {
+    let mut holders: Vec<String> = Vec::new();
+    for inst in &dispatch.instructions {
+        update_index_holders(inst, index_offset, index_size, &mut holders);
+    }
+    holders
 }
 
 /// Order a two-state dispatch's resume targets by index value `[state0, state1]`, or
@@ -528,7 +521,7 @@ fn is_zero_register(name: &str) -> bool {
 fn target_redispatches_index(
     cfg: &ControlFlowGraph,
     target: BasicBlockId,
-    index_reg: &str,
+    seed_holders: &[String],
     index_offset: i64,
     index_size: u8,
 ) -> bool {
@@ -539,10 +532,11 @@ fn target_redispatches_index(
     if !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. }) {
         return false;
     }
-    // Registers holding the resume index: the register carried from the dispatch, any
-    // fresh reload of the frame field, and copies/masks of those (`mov ecx,eax`,
-    // `and eax,3`). A compare/test/sub reading any of them re-dispatches on the index.
-    let mut holders: Vec<String> = vec![index_reg.to_string()];
+    // Registers holding the resume index: everything carried live from the dispatch
+    // branch (`seed_holders`, which already accounts for copies/masks there), plus any
+    // fresh reload of the frame field or further copies/masks in this block. A
+    // compare/test/sub reading any of them re-dispatches on the index.
+    let mut holders: Vec<String> = seed_holders.to_vec();
     for inst in &block.instructions {
         if matches!(
             inst.operation,
@@ -1784,7 +1778,7 @@ mod tests {
             false_target: BasicBlockId::new(7),
         };
         cfg.add_block(cont);
-        assert!(target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+        assert!(target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
     }
 
     #[test]
@@ -1808,7 +1802,7 @@ mod tests {
             false_target: BasicBlockId::new(7),
         };
         cfg.add_block(cont);
-        assert!(target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+        assert!(target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
     }
 
     #[test]
@@ -1831,7 +1825,7 @@ mod tests {
             false_target: BasicBlockId::new(7),
         };
         cfg.add_block(body);
-        assert!(!target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+        assert!(!target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
     }
 
     #[test]
@@ -1842,7 +1836,62 @@ mod tests {
         let mut body = BasicBlock::new(bb, 0x50e);
         body.terminator = BlockTerminator::Return;
         cfg.add_block(body);
-        assert!(!target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+        assert!(!target_redispatches_index(&cfg, bb, &["rax".to_string()], 0x11, 1));
+    }
+
+    #[test]
+    fn dispatch_index_holders_track_copy_before_branch() {
+        // `mov al,[frame+0x11]; mov cl,al` — the index is live in BOTH al and cl at the
+        // branch, so a continuation comparing the copy `cl` is still caught downstream.
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(mov(
+            Operand::Register(r(0, 8)),
+            Operand::Memory(MemoryRef::base_disp(r(0, 64), 0x11, 1)),
+        ));
+        block
+            .instructions
+            .push(mov(Operand::Register(r(1, 8)), Operand::Register(r(0, 8))));
+        let holders = dispatch_index_holders(&block, 0x11, 1);
+        assert!(
+            holders.contains(&"rax".to_string()) && holders.contains(&"rcx".to_string()),
+            "both index registers should be tracked, got {holders:?}"
+        );
+    }
+
+    #[test]
+    fn spill_detected_for_masked_then_stored_index() {
+        // aarch64: `ldrb w8,[frame+0x11]; and w8,w8,#3; strb w8,[x29-0x38]` spills the
+        // masked resume index — must count as a spill (a multi-state chain).
+        let a = Architecture::Arm64;
+        let gp = |id: u16, bits: u16| Register::new(a, RegisterClass::General, id, bits);
+        let (x8, w8, x29) = (gp(8, 64), gp(8, 32), gp(29, 64));
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x7b8);
+        block.instructions.push(
+            Instruction::new(0, 4, vec![], "ldrb")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Memory(MemoryRef::base_disp(x8, 0x11, 1)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0, 4, vec![], "and")
+                .with_operation(Operation::And)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Register(w8),
+                    imm1(32),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0, 4, vec![], "strb")
+                .with_operation(Operation::Store)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0x38, 1)),
+                ]),
+        );
+        assert!(dispatch_spills_index(&block, 0x11, 1));
     }
 
     fn test_ii(reg: Register) -> Instruction {
