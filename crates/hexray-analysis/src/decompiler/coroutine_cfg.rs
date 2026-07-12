@@ -436,9 +436,14 @@ fn update_index_holders(
                 }
             }
         }
-        // A mask of the index (`and idx, #imm`) keeps its zero-ness for the small
-        // resume-state range; the destination stays a holder iff any operand is one.
-        Operation::And => {
+        // A mask (`and idx, #imm`) or a subtract of a holder (`subs idx, idx, zero`
+        // preserves the value; `sub idx, idx, K` keeps it index-DERIVED) keeps the
+        // destination index-related iff any operand is a holder. Erring toward keeping
+        // the holder is the safe direction for the re-dispatch guard: it can only cause
+        // an over-decline, never a multi-state chain slipping through as two cases. The
+        // zero-comparison check gates acceptance separately (only a subtract of zero
+        // counts as an index-zero test), so this does not loosen that.
+        Operation::And | Operation::Sub => {
             if let Some(Operand::Register(d)) = inst.operands.first() {
                 let dc = canon_reg(d.name());
                 let inherits = inst.operands.iter().any(operand_is_holder);
@@ -1855,6 +1860,37 @@ mod tests {
         assert!(
             holders.contains(&"rax".to_string()) && holders.contains(&"rcx".to_string()),
             "both index registers should be tracked, got {holders:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_index_holders_survive_zero_subtract() {
+        // aarch64 `ldrb w8,[frame+0x11]; subs w8,w8,w9` — `subs` of the index keeps it
+        // index-derived, so the holder set still carries it into the redispatch guard.
+        let a = Architecture::Arm64;
+        let gp = |id: u16, bits: u16| Register::new(a, RegisterClass::General, id, bits);
+        let (w8, w9, x29) = (gp(8, 32), gp(9, 32), gp(29, 64));
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x7b8);
+        block.instructions.push(
+            Instruction::new(0, 4, vec![], "ldrb")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Memory(MemoryRef::base_disp(x29, 0x11, 1)),
+                ]),
+        );
+        block.instructions.push(
+            Instruction::new(0, 4, vec![], "subs")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Register(w8),
+                    Operand::Register(w9),
+                ]),
+        );
+        assert!(
+            dispatch_index_holders(&block, 0x11, 1).contains(&"x8".to_string()),
+            "the index must survive a zero/holder subtract"
         );
     }
 
