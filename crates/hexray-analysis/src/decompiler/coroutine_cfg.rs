@@ -12,7 +12,9 @@
 //! dispatch block and the 1-byte resume-index frame field. The CFG rewrite that
 //! turns the tail dispatch into a clean switch region is a following slice.
 
-use hexray_core::{BasicBlock, BasicBlockId, BlockTerminator, ControlFlowGraph, Operand, Operation};
+use hexray_core::{
+    BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Operand, Operation,
+};
 
 /// A stack home holding the frame pointer, keyed by (canonical base register name,
 /// displacement) so a reload is matched against the SAME slot the entry spilled to —
@@ -111,28 +113,44 @@ pub fn rewrite_clang_resume_dispatch(
     relocations: Option<&super::RelocationTable>,
 ) -> Option<ControlFlowGraph> {
     let disp = detect_clang_resume_dispatch(cfg)?;
-    let targets = match &disp.shape {
-        DispatchShape::CompareChain { targets } => targets.clone(),
-        DispatchShape::JumpTable { .. } => return None,
-    };
+    if !matches!(disp.shape, DispatchShape::CompareChain { .. }) {
+        // The jump-table shape already reaches switch recovery through its native
+        // IndirectJump terminator; only compare-chains are handled here.
+        return None;
+    }
     let dispatch_block = cfg.block(disp.dispatch)?;
 
-    // Only a genuine two-way dispatch is safe to rewrite as `[true, false]` cases.
-    // For >2 resume states clang emits a compare CHAIN: the dispatch spills the
-    // freshly-read index to a stack slot and its false edge routes to another block
-    // that reloads and re-tests it. Rewriting that as a 2-case switch would turn a
-    // continuation-compare into a bogus case and drop the later states. A dispatch
-    // that spills its index is therefore a chain we don't yet flatten — decline it
-    // (a dedicated multi-state slice can walk the chain). A true two-state dispatch
-    // tests the index in-register and never spills it.
+    // Only a genuine two-way dispatch is safe to rewrite as two cases. For >2 resume
+    // states clang emits a compare CHAIN: the dispatch spills the freshly-read index
+    // to a stack slot and its false edge routes to another block that reloads and
+    // re-tests it. Rewriting that as a 2-case switch would turn a continuation-compare
+    // into a bogus case and drop the later states. A dispatch that spills its index is
+    // therefore a chain we don't yet flatten — decline it (a dedicated multi-state
+    // slice can walk the chain). A true two-state dispatch tests the index in-register
+    // and never spills it.
     if dispatch_spills_index(dispatch_block, disp.index_offset, disp.index_size) {
         return None;
     }
 
-    // Deduplicate targets while preserving branch order (a degenerate chain could
-    // list the same resume state twice). Need >=2 distinct states to form a switch.
+    // The structurer's switch fallback labels `possible_targets` by POSITION (case 0,
+    // case 1, ...), so they must be ordered by resume-index VALUE, not branch position.
+    // clang tests the index against zero and takes the equal edge to state 0, but may
+    // emit either branch sense (`je state0` / `jne state1`); trusting branch order
+    // would swap the case bodies. Derive [state0, state1] from the condition, and
+    // decline anything that isn't a proven zero-comparison of the index.
+    // (This operand is also reused, honestly, as the synthetic IndirectJump target.)
+    let index_operand =
+        resume_index_operand(dispatch_block, disp.index_offset, disp.index_size)?;
+    let Operand::Register(index_reg) = &index_operand else {
+        return None;
+    };
+    let index_reg = canon_reg(index_reg.name());
+    let ordered = ordered_two_state_targets(dispatch_block, &index_reg)?;
+
+    // Deduplicate while preserving index order (a degenerate branch could list the
+    // same target twice). Need >=2 distinct states to form a switch.
     let mut states: Vec<BasicBlockId> = Vec::new();
-    for t in targets {
+    for t in ordered {
         if !states.contains(&t) {
             states.push(t);
         }
@@ -140,11 +158,6 @@ pub fn rewrite_clang_resume_dispatch(
     if states.len() < 2 {
         return None;
     }
-
-    // The structurer's switch fallback does not read the IndirectJump target
-    // operand, but keep it honest: reuse the register holding the resume index.
-    let index_operand =
-        resume_index_operand(dispatch_block, disp.index_offset, disp.index_size)?;
 
     // Rebuild the CFG: clone every block, swap the dispatch terminator for the
     // synthetic IndirectJump, then re-derive ALL edges from the (rewritten)
@@ -279,6 +292,114 @@ fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u
         }
     }
     false
+}
+
+/// Order a two-state dispatch's resume targets by index value `[state0, state1]`, or
+/// return `None` to decline. clang tests the resume index against zero and branches to
+/// state 0 on equality; either branch sense may be emitted:
+///   `test idx,idx; je state0`  (Equal:    the taken/true edge is idx==0 = state0)
+///   `test idx,idx; jne state1` (NotEqual: the fall-through/false edge is idx==0 = state0)
+/// so the value-0 edge is state 0 regardless of sense. Only a proven zero-comparison of
+/// the index yields this mapping; a compare against a non-zero value (`cmp idx,1`) is
+/// declined so case bodies are never swapped.
+fn ordered_two_state_targets(dispatch: &BasicBlock, index_reg: &str) -> Option<Vec<BasicBlockId>> {
+    let (condition, true_target, false_target) = match &dispatch.terminator {
+        BlockTerminator::ConditionalBranch {
+            condition,
+            true_target,
+            false_target,
+        } => (*condition, *true_target, *false_target),
+        _ => return None,
+    };
+    if !dispatch_zero_compares_index(dispatch, index_reg) {
+        return None;
+    }
+    match condition {
+        Condition::Equal => Some(vec![true_target, false_target]),
+        Condition::NotEqual => Some(vec![false_target, true_target]),
+        _ => None,
+    }
+}
+
+/// Whether the dispatch's flag-setting instruction compares the resume index against
+/// zero: `test idx,idx` (x86), `cmp idx,0`, or `subs idx,idx,zreg` (aarch64, where
+/// `zreg` is the zero register or a register the block has proven to be zero, e.g.
+/// `mov w9,wzr; and w9,w9,#3`). This distinguishes the value-0 edge (state 0) from a
+/// non-zero comparison whose true edge would be a later state.
+fn dispatch_zero_compares_index(dispatch: &BasicBlock, index_reg: &str) -> bool {
+    // Canonical names of registers the block has proven to hold zero.
+    let mut zero_regs: Vec<String> = Vec::new();
+    let is_zero_operand = |op: &Operand, zero: &[String]| -> bool {
+        match op {
+            Operand::Immediate(imm) => imm.value == 0,
+            Operand::Register(r) => is_zero_register(r.name()) || zero.contains(&canon_reg(r.name())),
+            _ => false,
+        }
+    };
+    // LAST flag-setter before the branch wins (it feeds the condition flags).
+    let mut result = false;
+    for inst in &dispatch.instructions {
+        if matches!(
+            inst.operation,
+            Operation::Test | Operation::Compare | Operation::Sub
+        ) {
+            let regs: Vec<String> = inst
+                .operands
+                .iter()
+                .filter_map(|o| match o {
+                    Operand::Register(r) => Some(canon_reg(r.name())),
+                    _ => None,
+                })
+                .collect();
+            let mentions_index = regs.iter().any(|r| r == index_reg);
+            // `test idx,idx`: every register operand is the index -> a zero test.
+            let is_self_test = matches!(inst.operation, Operation::Test)
+                && regs.len() >= 2
+                && regs.iter().all(|r| r == index_reg);
+            let against_zero =
+                inst.operands.iter().any(|o| is_zero_operand(o, &zero_regs));
+            result = mentions_index && (is_self_test || against_zero);
+        }
+        // Track registers proven zero for the aarch64 `subs idx,idx,zreg` form.
+        update_zero_regs(inst, &mut zero_regs);
+    }
+    result
+}
+
+/// Maintain the set of registers proven to hold zero within a block. Recognizes the
+/// clang-emitted forms: `mov reg, 0` / `mov reg, wzr` (and copies of a zero register),
+/// and `and reg, zsrc, #imm` (`0 & x == 0`). Any other write clears the register.
+fn update_zero_regs(inst: &hexray_core::Instruction, zero: &mut Vec<String>) {
+    let source_is_zero = |op: Option<&Operand>| -> bool {
+        match op {
+            Some(Operand::Immediate(imm)) => imm.value == 0,
+            Some(Operand::Register(r)) => is_zero_register(r.name()) || zero.contains(&canon_reg(r.name())),
+            _ => false,
+        }
+    };
+    let (dst, becomes_zero) = match inst.operation {
+        Operation::Move => (inst.operands.first(), source_is_zero(inst.operands.get(1))),
+        // `and dst, src, #imm` (or reg): zero if any source is zero.
+        Operation::And => (
+            inst.operands.first(),
+            inst.operands.iter().skip(1).any(|o| source_is_zero(Some(o))),
+        ),
+        // Flag-only ops leave registers untouched.
+        Operation::Compare | Operation::Test => return,
+        _ => (inst.operands.first(), false),
+    };
+    if let Some(Operand::Register(d)) = dst {
+        let dc = canon_reg(d.name());
+        zero.retain(|r| r != &dc);
+        if becomes_zero {
+            zero.push(dc);
+        }
+    }
+}
+
+/// The architectural zero register (`wzr`/`xzr` on aarch64), which always reads as 0.
+fn is_zero_register(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "wzr" | "xzr")
 }
 
 /// The register operand holding the resume index in the dispatch block — the last
@@ -1240,6 +1361,12 @@ mod tests {
             Operand::Register(al),
             Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)),
         ));
+        // `test al, al` (zero-test of the resume index) feeds the `je`.
+        dispatch.instructions.push(
+            Instruction::new(0, 2, vec![], "test")
+                .with_operation(Operation::Test)
+                .with_operands(vec![Operand::Register(al), Operand::Register(al)]),
+        );
         dispatch.terminator = BlockTerminator::ConditionalBranch {
             condition: Condition::Equal,
             true_target: r0,
@@ -1282,6 +1409,120 @@ mod tests {
             possible_targets: vec![r0, r1],
         };
         assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn rewrite_orders_cases_by_index_for_inverted_branch_sense() {
+        // clang can invert the sense: `test al,al; jne state1` (NotEqual), so the
+        // TRUE edge is idx!=0 (state 1) and the FALSE edge is idx==0 (state 0). The
+        // switch cases must still be ordered [state0, state1], not by branch position.
+        let (state0, state1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_a_cfg(state1, state0); // true=state1, false=state0
+        cfg.add_block(BasicBlock::new(state0, 0x50e));
+        cfg.add_block(BasicBlock::new(state1, 0x608));
+        // Flip the condition to `jne`.
+        if let BlockTerminator::ConditionalBranch { condition, .. } =
+            &mut cfg.block_mut(BasicBlockId::new(1)).unwrap().terminator
+        {
+            *condition = Condition::NotEqual;
+        }
+        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten");
+        match &rewritten.block(BasicBlockId::new(1)).unwrap().terminator {
+            BlockTerminator::IndirectJump {
+                possible_targets, ..
+            } => assert_eq!(possible_targets, &vec![state0, state1]),
+            other => panic!("expected IndirectJump, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_declines_non_zero_index_compare() {
+        // `cmp al, 1; je state1` compares against 1, so the true edge is NOT state 0;
+        // the value->target mapping is ambiguous for a 2-case rewrite -> decline.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_a_cfg(r0, r1);
+        cfg.add_block(BasicBlock::new(r0, 0x50e));
+        cfg.add_block(BasicBlock::new(r1, 0x608));
+        let al = r(0, 8);
+        // Replace the `test al,al` with `cmp al, 1`.
+        let dispatch = cfg.block_mut(BasicBlockId::new(1)).unwrap();
+        dispatch.instructions.pop();
+        dispatch.instructions.push(
+            Instruction::new(0, 2, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Register(al),
+                    Operand::Immediate(hexray_core::Immediate {
+                        value: 1,
+                        size: 8,
+                        signed: false,
+                    }),
+                ]),
+        );
+        assert!(!dispatch_zero_compares_index(
+            cfg.block(BasicBlockId::new(1)).unwrap(),
+            "rax"
+        ));
+        assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn arm64_subs_against_computed_zero_is_a_zero_compare() {
+        // aarch64 clang: `ldrb w8,[..]; and w8,w8,#3; mov w9,wzr; and w9,w9,#3;
+        // subs w8,w8,w9; b.eq state0`. `w9` is a computed zero, so this IS a zero
+        // comparison of the (masked) index and must map the equal edge to state 0.
+        let a = Architecture::Arm64;
+        let gp = |id: u16, bits: u16| Register::new(a, RegisterClass::General, id, bits);
+        // arm64::XZR is register id 32 (names as `wzr`/`xzr`).
+        let (x8, w8, w9, wzr) = (gp(8, 64), gp(8, 32), gp(9, 32), gp(32, 32));
+        let mut dispatch = BasicBlock::new(BasicBlockId::new(1), 0x7b8);
+        let and = |d: Register, s: Register, imm: i128| {
+            Instruction::new(0, 4, vec![], "and")
+                .with_operation(Operation::And)
+                .with_operands(vec![
+                    Operand::Register(d),
+                    Operand::Register(s),
+                    Operand::Immediate(hexray_core::Immediate {
+                        value: imm,
+                        size: 32,
+                        signed: false,
+                    }),
+                ])
+        };
+        dispatch.instructions.push(
+            Instruction::new(0, 4, vec![], "ldrb")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Memory(MemoryRef::base_disp(x8, 0x11, 1)),
+                ]),
+        );
+        dispatch.instructions.push(and(w8, w8, 0x3));
+        dispatch.instructions.push(
+            Instruction::new(0, 4, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![Operand::Register(w9), Operand::Register(wzr)]),
+        );
+        dispatch.instructions.push(and(w9, w9, 0x3));
+        dispatch.instructions.push(
+            Instruction::new(0, 4, vec![], "subs")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Register(w8),
+                    Operand::Register(w9),
+                ]),
+        );
+        dispatch.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        assert!(dispatch_zero_compares_index(&dispatch, "x8"));
+        assert_eq!(
+            ordered_two_state_targets(&dispatch, "x8"),
+            Some(vec![BasicBlockId::new(2), BasicBlockId::new(3)])
+        );
     }
 
     #[test]
