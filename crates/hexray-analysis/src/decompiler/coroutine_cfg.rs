@@ -444,47 +444,58 @@ fn target_redispatches_index(
     if !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. }) {
         return false;
     }
-    // Track the index register carried from the dispatch (cleared on redefinition) and
-    // any fresh reload of the field, then look for a compare/test/sub that reads either.
-    let mut carried = true;
-    let mut fresh: Vec<String> = Vec::new();
+    // Registers currently holding the resume index: the register carried from the
+    // dispatch, any fresh reload of the frame field, and simple copies of those
+    // (`mov ecx, eax`). A compare/test/sub reading any of them re-dispatches on the
+    // index; a redefinition from a non-index source drops the register.
+    let mut holders: Vec<String> = vec![index_reg.to_string()];
     for inst in &block.instructions {
         if matches!(inst.operation, Operation::Move | Operation::Load) {
-            if let (Some(Operand::Register(d)), Some(Operand::Memory(m))) =
+            if let (Some(Operand::Register(d)), Some(src)) =
                 (inst.operands.first(), inst.operands.get(1))
             {
-                if m.index.is_none()
-                    && m.displacement == index_offset
-                    && u16::from(m.size) == u16::from(index_size)
-                {
-                    fresh.push(canon_reg(d.name()));
-                    continue;
+                let dc = canon_reg(d.name());
+                match src {
+                    // Fresh reload of the resume-index field.
+                    Operand::Memory(m)
+                        if m.index.is_none()
+                            && m.displacement == index_offset
+                            && u16::from(m.size) == u16::from(index_size) =>
+                    {
+                        if !holders.contains(&dc) {
+                            holders.push(dc);
+                        }
+                    }
+                    // Register copy: the destination inherits the source's index status.
+                    Operand::Register(s) => {
+                        let sc = canon_reg(s.name());
+                        holders.retain(|r| r != &dc);
+                        if holders.contains(&sc) {
+                            holders.push(dc);
+                        }
+                    }
+                    // Any other move overwrites the destination.
+                    _ => holders.retain(|r| r != &dc),
                 }
+                continue;
             }
         }
         if matches!(
             inst.operation,
             Operation::Compare | Operation::Test | Operation::Sub
         ) {
-            let touches_index = inst.operands.iter().any(|o| match o {
-                Operand::Register(r) => {
-                    let c = canon_reg(r.name());
-                    (carried && c == index_reg) || fresh.contains(&c)
-                }
-                _ => false,
+            let touches_index = inst.operands.iter().any(|o| {
+                matches!(o, Operand::Register(r) if holders.contains(&canon_reg(r.name())))
             });
             if touches_index {
                 return true;
             }
             continue;
         }
-        // Any other write to a register invalidates it as an index holder.
+        // Any other write to a register drops it as an index holder.
         if let Some(Operand::Register(d)) = inst.operands.first() {
-            let c = canon_reg(d.name());
-            if c == index_reg {
-                carried = false;
-            }
-            fresh.retain(|r| r != &c);
+            let dc = canon_reg(d.name());
+            holders.retain(|r| r != &dc);
         }
     }
     false
@@ -1701,6 +1712,30 @@ mod tests {
             Instruction::new(0, 2, vec![], "cmp")
                 .with_operation(Operation::Compare)
                 .with_operands(vec![Operand::Register(al), imm1(8)]),
+        );
+        cont.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(6),
+            false_target: BasicBlockId::new(7),
+        };
+        cfg.add_block(cont);
+        assert!(target_redispatches_index(&cfg, bb, "rax", 0x11, 1));
+    }
+
+    #[test]
+    fn redispatch_detects_copied_index_continuation_compare() {
+        // `mov ecx, eax; cmp ecx, 1; je ...` copies the carried index (eax) into ecx
+        // before testing it — still a multi-state chain compare.
+        let (eax, ecx) = (r(0, 32), r(1, 32));
+        let bb = BasicBlockId::new(5);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut cont = BasicBlock::new(bb, 0x600);
+        cont.instructions
+            .push(mov(Operand::Register(ecx), Operand::Register(eax)));
+        cont.instructions.push(
+            Instruction::new(0, 2, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(ecx), imm1(32)]),
         );
         cont.terminator = BlockTerminator::ConditionalBranch {
             condition: Condition::Equal,
