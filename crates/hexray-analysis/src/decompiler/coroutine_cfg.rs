@@ -567,9 +567,18 @@ fn update_index_holders(
                     Operand::Register(r) => src_holder_width(&canon_reg(r.name()), d.size),
                     _ => None,
                 });
+                // The mask must PROVABLY preserve `index == 0`. A 2-state index uses
+                // bit 0, so `& imm` keeps its zero-ness iff `imm` has bit 0 set; a
+                // register mask (`and idx, reg`) or a bit-0-clearing immediate does not,
+                // so drop the holder there. Every non-holder operand must be such a mask.
+                let masks_preserve_zero = inst.operands.iter().all(|o| match o {
+                    Operand::Register(r) => holder_width(holders, &canon_reg(r.name())).is_some(),
+                    Operand::Immediate(imm) => (imm.value & 1) == 1,
+                    _ => false,
+                });
                 holders.retain(|(r, _)| r != &dc);
                 frame_regs.retain(|r| r != &dc);
-                if let Some(w) = inherited {
+                if let (Some(w), true) = (inherited, masks_preserve_zero) {
                     holders.push((dc, w));
                 }
             }
@@ -1966,6 +1975,24 @@ mod tests {
             Instruction::new(0, 3, vec![], "sub")
                 .with_operation(Operation::Sub)
                 .with_operands(vec![Operand::Register(r(0, 8)), imm1(8)]),
+        );
+        block.instructions.push(test_ii(r(0, 8)));
+        block.instructions.push(je());
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
+    }
+
+    #[test]
+    fn zero_compare_rejects_register_masked_index() {
+        // `mov al,[frame+0x11]; and al, dl; test al,al` tests (index & dl)==0 — an
+        // unproven register mask, so it must NOT be accepted as an index-zero dispatch.
+        let dl = r(2, 8);
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
+        block.instructions.push(read_index());
+        block.instructions.push(
+            Instruction::new(0, 2, vec![], "and")
+                .with_operation(Operation::And)
+                .with_operands(vec![Operand::Register(r(0, 8)), Operand::Register(dl)]),
         );
         block.instructions.push(test_ii(r(0, 8)));
         block.instructions.push(je());
