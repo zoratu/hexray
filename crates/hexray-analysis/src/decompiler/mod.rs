@@ -759,6 +759,15 @@ impl RelocationTable {
             .map(|reloc| reloc.target_addr)
     }
 
+    /// Whether any relocation (call/branch or data) is anchored at `inst_addr`.
+    /// Used to tell a genuine no-op `jmp` (no relocation) from an unresolved
+    /// branch relocation such as `jmp __x86_return_thunk`, which shares the same
+    /// `e9 00000000` encoding.
+    pub fn has_relocation_at(&self, inst_addr: u64) -> bool {
+        self.call_relocations.contains_key(&inst_addr)
+            || self.data_relocations.contains_key(&inst_addr)
+    }
+
     /// Returns whether the data relocation at an instruction was PC-relative.
     pub fn data_is_pc_relative(&self, inst_addr: u64) -> bool {
         self.data_relocations
@@ -1229,7 +1238,7 @@ impl Decompiler {
         // resume-point bodies away to `return`). Rewrite it into an explicit switch
         // region first so each resume-point body survives structuring.
         let coro_rewritten = if coroutine::is_coroutine_resume_clone(func_name) {
-            coroutine_cfg::rewrite_clang_resume_dispatch(cfg)
+            coroutine_cfg::rewrite_clang_resume_dispatch(cfg, self.relocation_table.as_ref())
         } else {
             None
         };

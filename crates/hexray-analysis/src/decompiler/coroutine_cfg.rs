@@ -106,12 +106,28 @@ pub fn detect_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ClangResum
 /// compare-chain shape is rewritten here: the jump-table shape already reaches
 /// switch recovery through its native `IndirectJump` terminator (a following slice
 /// handles its `.o` relocation gap), so disturbing it would be counterproductive.
-pub fn rewrite_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ControlFlowGraph> {
+pub fn rewrite_clang_resume_dispatch(
+    cfg: &ControlFlowGraph,
+    relocations: Option<&super::RelocationTable>,
+) -> Option<ControlFlowGraph> {
     let disp = detect_clang_resume_dispatch(cfg)?;
     let targets = match &disp.shape {
         DispatchShape::CompareChain { targets } => targets.clone(),
         DispatchShape::JumpTable { .. } => return None,
     };
+    let dispatch_block = cfg.block(disp.dispatch)?;
+
+    // Only a genuine two-way dispatch is safe to rewrite as `[true, false]` cases.
+    // For >2 resume states clang emits a compare CHAIN: the dispatch spills the
+    // freshly-read index to a stack slot and its false edge routes to another block
+    // that reloads and re-tests it. Rewriting that as a 2-case switch would turn a
+    // continuation-compare into a bogus case and drop the later states. A dispatch
+    // that spills its index is therefore a chain we don't yet flatten — decline it
+    // (a dedicated multi-state slice can walk the chain). A true two-state dispatch
+    // tests the index in-register and never spills it.
+    if dispatch_spills_index(dispatch_block, disp.index_offset, disp.index_size) {
+        return None;
+    }
 
     // Deduplicate targets while preserving branch order (a degenerate chain could
     // list the same resume state twice). Need >=2 distinct states to form a switch.
@@ -127,7 +143,6 @@ pub fn rewrite_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ControlFl
 
     // The structurer's switch fallback does not read the IndirectJump target
     // operand, but keep it honest: reuse the register holding the resume index.
-    let dispatch_block = cfg.block(disp.dispatch)?;
     let index_operand =
         resume_index_operand(dispatch_block, disp.index_offset, disp.index_size)?;
 
@@ -139,7 +154,7 @@ pub fn rewrite_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ControlFl
     for block in cfg.blocks() {
         rewritten.add_block(block.clone());
     }
-    repair_nop_jump_returns(&mut rewritten);
+    repair_nop_jump_returns(&mut rewritten, relocations);
     {
         let d = rewritten.block_mut(disp.dispatch)?;
         d.terminator = BlockTerminator::IndirectJump {
@@ -170,7 +185,7 @@ pub fn rewrite_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ControlFl
 /// relocations are already resolved), so re-establish the fallthrough for every such
 /// block whose no-op jump lands on a real successor block. Terminal no-op jumps (no
 /// following block) are left as `Return`.
-fn repair_nop_jump_returns(cfg: &mut ControlFlowGraph) {
+fn repair_nop_jump_returns(cfg: &mut ControlFlowGraph, relocations: Option<&super::RelocationTable>) {
     use std::collections::HashMap;
     let start_to_id: HashMap<u64, BasicBlockId> =
         cfg.blocks().map(|b| (b.start, b.id)).collect();
@@ -181,7 +196,18 @@ fn repair_nop_jump_returns(cfg: &mut ControlFlowGraph) {
                 .instructions
                 .last()
             {
-                Some(inst) if is_nop_jump(inst) => start_to_id.get(&inst.end_address()).copied(),
+                // A `jmp` with a relocation anchored at it is a real branch to a
+                // symbol (e.g. an unresolved `jmp __x86_return_thunk` return under
+                // `-mfunction-return=thunk-extern`), which shares the `e9 00000000`
+                // encoding but is genuinely a return — never a no-op jump. Only a
+                // relocation-free no-op jump is a severed fallthrough to repair.
+                Some(inst)
+                    if is_nop_jump(inst)
+                        && !relocations
+                            .is_some_and(|r| r.has_relocation_at(inst.address)) =>
+                {
+                    start_to_id.get(&inst.end_address()).copied()
+                }
                 _ => None,
             },
             _ => None,
@@ -198,6 +224,61 @@ fn repair_nop_jump_returns(cfg: &mut ControlFlowGraph) {
 /// the immediately-following instruction (a no-op jump / unresolved-reloc placeholder).
 fn is_nop_jump(inst: &hexray_core::Instruction) -> bool {
     inst.bytes.len() >= 5 && inst.bytes[0] == 0xe9 && inst.bytes[1..5] == [0, 0, 0, 0]
+}
+
+/// Whether the dispatch block spills the freshly-read resume index to memory. clang
+/// does this only when the index is reused across a multi-way compare CHAIN (`sub
+/// al,K; je stateK; ...` reloads for each subsequent test); a genuine two-state
+/// dispatch tests the in-register index directly (`test al,al; je`) and never spills
+/// it. Used to decline the 2-case rewrite on chains it cannot represent.
+fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u8) -> bool {
+    // Canonical names of registers currently holding the freshly-read resume index.
+    let mut index_regs: Vec<String> = Vec::new();
+    for inst in &dispatch.instructions {
+        // Resume-index read: `mov(zx) reg, [frameReg + index_offset]`. Records the
+        // destination as holding the index.
+        if matches!(inst.operation, Operation::Move | Operation::Load) {
+            if let (Some(Operand::Register(d)), Some(Operand::Memory(m))) =
+                (inst.operands.first(), inst.operands.get(1))
+            {
+                if m.index.is_none()
+                    && m.displacement == index_offset
+                    && u16::from(m.size) == u16::from(index_size)
+                {
+                    index_regs.push(canon_reg(d.name()));
+                    continue;
+                }
+            }
+        }
+        // Spill: `mov [mem], idxreg` (x86) or `str idxreg, [mem]` (aarch64) writes an
+        // index-holding register back to a stack slot.
+        let stored_src = match inst.operation {
+            Operation::Move => match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(Operand::Memory(_)), Some(Operand::Register(s))) => Some(s),
+                _ => None,
+            },
+            Operation::Store => match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(Operand::Register(s)), Some(Operand::Memory(_))) => Some(s),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(s) = stored_src {
+            if index_regs.contains(&canon_reg(s.name())) {
+                return true;
+            }
+            continue;
+        }
+        // Any other write to a register (arithmetic like `sub al,K`, a reload, etc.)
+        // clobbers the pure index it held. Compares/tests write only flags.
+        if !matches!(inst.operation, Operation::Compare | Operation::Test) {
+            if let Some(Operand::Register(d)) = inst.operands.first() {
+                let dc = canon_reg(d.name());
+                index_regs.retain(|r| r != &dc);
+            }
+        }
+    }
+    false
 }
 
 /// The register operand holding the resume index in the dispatch block — the last
@@ -1175,7 +1256,7 @@ mod tests {
         cfg.add_block(BasicBlock::new(r0, 0x50e));
         cfg.add_block(BasicBlock::new(r1, 0x608));
 
-        let rewritten = rewrite_clang_resume_dispatch(&cfg).expect("rewritten");
+        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten");
         let dispatch = rewritten.block(BasicBlockId::new(1)).unwrap();
         match &dispatch.terminator {
             BlockTerminator::IndirectJump {
@@ -1200,7 +1281,64 @@ mod tests {
             target: Operand::Register(r(0, 64)),
             possible_targets: vec![r0, r1],
         };
-        assert!(rewrite_clang_resume_dispatch(&cfg).is_none());
+        assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn rewrite_declines_multi_state_chain_that_spills_index() {
+        // A >2-state dispatch reloads the index for later compares, so it spills the
+        // freshly-read index to a stack slot: `mov al,[rax+0x11]; mov [rbp-0xd5],al;
+        // sub al,2; je state2`. The two immediate targets are NOT the full state set,
+        // so the 2-case rewrite must decline.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_a_cfg(r0, r1);
+        cfg.add_block(BasicBlock::new(r0, 0x50e));
+        cfg.add_block(BasicBlock::new(r1, 0x608));
+        let (rbp, al) = (r(5, 64), r(0, 8));
+        // Insert the index spill right after the `mov al,[rax+0x11]` read.
+        let dispatch = cfg.block_mut(BasicBlockId::new(1)).unwrap();
+        dispatch.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xd5, 1)),
+            Operand::Register(al),
+        ));
+        assert!(dispatch_spills_index(
+            cfg.block(BasicBlockId::new(1)).unwrap(),
+            0x11,
+            1
+        ));
+        assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+    }
+
+    #[test]
+    fn two_state_dispatch_does_not_count_as_spilling_index() {
+        // The plain `test al,al; je` dispatch never stores the index to memory.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let cfg = shape_a_cfg(r0, r1);
+        assert!(!dispatch_spills_index(
+            cfg.block(BasicBlockId::new(1)).unwrap(),
+            0x11,
+            1
+        ));
+    }
+
+    #[test]
+    fn repair_skips_relocated_return_thunk_jump() {
+        // A real `jmp __x86_return_thunk` shares the `e9 00000000` encoding but has a
+        // relocation at its address; it must stay a return, not become a fallthrough.
+        use super::super::RelocationTable;
+        let a = BasicBlockId::new(0);
+        let b = BasicBlockId::new(1);
+        let mut cfg = ControlFlowGraph::new(a);
+        let mut ba = BasicBlock::new(a, 0x100);
+        ba.instructions.push(jmp_nop(0x100));
+        ba.terminator = BlockTerminator::Return;
+        cfg.add_block(ba);
+        cfg.add_block(BasicBlock::new(b, 0x105));
+
+        let mut reloc = RelocationTable::new();
+        reloc.insert_call(0x100, "__x86_return_thunk".to_string(), 0, true);
+        repair_nop_jump_returns(&mut cfg, Some(&reloc));
+        assert_eq!(cfg.block(a).unwrap().terminator, BlockTerminator::Return);
     }
 
     #[test]
@@ -1216,7 +1354,7 @@ mod tests {
         cfg.add_block(ba);
         cfg.add_block(BasicBlock::new(b, 0x105));
 
-        repair_nop_jump_returns(&mut cfg);
+        repair_nop_jump_returns(&mut cfg, None);
         assert_eq!(
             cfg.block(a).unwrap().terminator,
             BlockTerminator::Fallthrough { target: b }
@@ -1233,7 +1371,7 @@ mod tests {
         ba.terminator = BlockTerminator::Return;
         cfg.add_block(ba);
 
-        repair_nop_jump_returns(&mut cfg);
+        repair_nop_jump_returns(&mut cfg, None);
         assert_eq!(cfg.block(a).unwrap().terminator, BlockTerminator::Return);
     }
 
@@ -1250,7 +1388,7 @@ mod tests {
         cfg.add_block(ba);
         cfg.add_block(BasicBlock::new(b, 0x101));
 
-        repair_nop_jump_returns(&mut cfg);
+        repair_nop_jump_returns(&mut cfg, None);
         assert_eq!(cfg.block(a).unwrap().terminator, BlockTerminator::Return);
     }
 }
