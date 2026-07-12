@@ -2360,80 +2360,27 @@ impl<'a> Structurer<'a> {
                                 address_range,
                             });
                         }
-                        // Emit a basic switch with unknown values, using indices.
+                        // Emit a basic switch with unknown values, using indices. This is
+                        // the GENERIC fallback for any unrecovered indirect jump; keep it
+                        // minimal and side-effect-free. Coroutine-specific shaping (naming
+                        // the value, turning the two-way nonzero edge into `default`) is
+                        // done later by the coroutine pass on the structured output, not
+                        // here, so this stays correct for real computed dispatches.
                         let switch_expr = Expr::unknown("switch_value".to_string());
-                        // Stop each case at the point where the targets converge, so a
-                        // continuation shared by several cases (e.g. the post-await join
-                        // of a coroutine resume dispatch) is emitted once after the
-                        // switch instead of being absorbed into the first-structured
-                        // case and dropped from the others. Respect the enclosing region:
-                        // when this switch is inside a bounded region, `end` is already
-                        // the boundary and must be honored — computing a later common
-                        // block could let a case structure past `end` and steal code that
-                        // belongs after the region. Only synthesize a join at the top
-                        // level (`end` is None) and only with >=2 targets (a single
-                        // target's successor is not a shared join).
-                        let switch_end = match end {
-                            Some(_) => end,
-                            None if possible_targets.len() >= 2 => {
-                                self.find_join_point_of_targets(possible_targets)
-                            }
-                            None => None,
-                        };
-                        // A 2-target indirect dispatch is a two-way branch (an if/else,
-                        // e.g. `test idx,idx; je`): the second edge runs for EVERY value
-                        // that is not the first case, so emit it as the `default` rather
-                        // than a spurious `case 1` that would skip it for other values.
-                        // Genuine multi-entry jump tables reach the recovered-switch path
-                        // (with a real bound-check default) instead of this fallback.
-                        let two_way = possible_targets.len() == 2;
-                        let mut cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = Vec::new();
-                        let mut default: Option<Vec<StructuredNode>> = None;
-                        for (i, &target) in possible_targets.iter().enumerate() {
-                            let body =
-                                if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
-                                    self.mark_pure_return_chain_processed(target);
-                                    vec![StructuredNode::Return(ret_expr)]
-                                } else {
-                                    self.structure_region(target, switch_end)
-                                };
-                            if two_way && i == 1 {
-                                default = Some(body);
-                            } else {
-                                cases.push((vec![i as i128], body));
-                            }
-                        }
+                        let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = possible_targets
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &target)| {
+                                let body = self.structure_region(target, end);
+                                (vec![i as i128], body)
+                            })
+                            .collect();
                         result.push(StructuredNode::Switch {
                             value: switch_expr,
                             cases,
-                            default,
+                            default: None,
                         });
-                        // Continue structuring at the join so the shared continuation
-                        // is emitted immediately after the switch (each case's implicit
-                        // break falls into it). Leaving it to the address-sorted
-                        // orphan-block pass could interpose an unrelated block. When the
-                        // join is the enclosing region end (or none exists), stop.
-                        match switch_end {
-                            Some(join) if end != Some(join) => {
-                                // The join has multiple predecessors (the cases converge
-                                // on it), so mark it inline-allowed — otherwise the next
-                                // iteration's multi-pred guard would emit a goto and defer
-                                // it to the orphan pass. Skip irreducible entry points,
-                                // which are legitimate goto targets (as the if/else path
-                                // does).
-                                let is_irreducible_entry = self
-                                    .irreducible_analysis
-                                    .regions
-                                    .iter()
-                                    .any(|r| r.entry_points.contains(&join));
-                                if !is_irreducible_entry {
-                                    self.inline_allowed.insert(join);
-                                }
-                                current = Some(join);
-                                continue;
-                            }
-                            _ => break,
-                        }
+                        break;
                     }
 
                     // Fallback: emit block and break
@@ -10068,10 +10015,10 @@ mod tests {
     }
 
     #[test]
-    fn two_target_indirect_fallback_emits_default() {
-        // A 2-target IndirectJump with no jump table is a two-way branch: the second
-        // target must become the switch `default` (it runs for all non-first values),
-        // not a spurious `case 1`.
+    fn two_target_indirect_fallback_emits_two_cases() {
+        // The GENERIC fallback emits both targets as explicit cases with no default
+        // (coroutine-specific two-way `default` shaping happens later, in the coroutine
+        // pass, so this stays correct for real computed dispatches).
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
         let mut mk = |id: u32, term: BlockTerminator| {
             let mut b = BasicBlock::new(BasicBlockId::new(id), 0x1000 + u64::from(id) * 0x10);
@@ -10099,7 +10046,7 @@ mod tests {
                 _ => None,
             })
             .expect("expected a switch node");
-        assert_eq!(cases.len(), 1, "one explicit case, got {cases:?}");
-        assert!(default.is_some(), "second target should be the default");
+        assert_eq!(cases.len(), 2, "both targets are explicit cases, got {cases:?}");
+        assert!(default.is_none(), "generic fallback emits no default");
     }
 }

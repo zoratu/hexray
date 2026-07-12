@@ -146,9 +146,22 @@ fn rename_first_spine_switch(nodes: &mut [StructuredNode], named: &Expr, done: &
             return;
         }
         match node {
-            StructuredNode::Switch { value, .. } => {
+            StructuredNode::Switch {
+                value,
+                cases,
+                default,
+            } => {
                 if matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value") {
                     *value = named.clone();
+                    // The resume dispatch is a two-way `test idx,idx; je state0` recovered
+                    // as `case 0` / `case 1`. The second (nonzero) edge runs for EVERY
+                    // value != 0, so present it as `default` rather than a `case 1` that
+                    // would skip it for other values. (The generic structurer fallback
+                    // stays neutral; this coroutine-scoped step does the shaping.)
+                    if default.is_none() && cases.len() == 2 {
+                        let (_, body) = cases.pop().expect("len checked");
+                        *default = Some(body);
+                    }
                     *done = true;
                 }
                 // Whether or not this was the dispatch switch, do NOT descend into its
@@ -5357,6 +5370,18 @@ mod tests {
             matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
             "value should be frame->__resume_index, got {value:?}"
         );
+    }
+
+    #[test]
+    fn clang_switch_nonzero_edge_becomes_default() {
+        // The two-way dispatch's second (nonzero) edge must be the `default`, not a
+        // `case 1` that would skip it for index values other than 1.
+        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11);
+        let StructuredNode::Switch { cases, default, .. } = &out[1] else {
+            panic!("expected switch, got {:?}", out[1]);
+        };
+        assert_eq!(cases.len(), 1, "only case 0 stays explicit, got {cases:?}");
+        assert!(default.is_some(), "the nonzero edge should be the default");
     }
 
     #[test]
