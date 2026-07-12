@@ -2384,13 +2384,24 @@ impl<'a> Structurer<'a> {
                             .iter()
                             .enumerate()
                             .map(|(i, &target)| {
-                                let body =
-                                    if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
-                                        self.mark_pure_return_chain_processed(target);
-                                        vec![StructuredNode::Return(ret_expr)]
-                                    } else {
-                                        self.structure_region(target, switch_end)
-                                    };
+                                // The pure-return shortcut folds a target's whole chain
+                                // to a `return`, which would follow THROUGH a shared join
+                                // and mark it processed before it can be emitted after the
+                                // switch. So only take it when there is no join to respect;
+                                // otherwise structure up to the join.
+                                let body = match switch_end {
+                                    None => {
+                                        if let Some(ret_expr) =
+                                            self.get_return_expr_if_pure_return(target)
+                                        {
+                                            self.mark_pure_return_chain_processed(target);
+                                            vec![StructuredNode::Return(ret_expr)]
+                                        } else {
+                                            self.structure_region(target, None)
+                                        }
+                                    }
+                                    Some(_) => self.structure_region(target, switch_end),
+                                };
                                 (vec![i as i128], body)
                             })
                             .collect();

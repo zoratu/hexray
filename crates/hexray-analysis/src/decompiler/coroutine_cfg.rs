@@ -290,11 +290,12 @@ fn dispatch_spills_index(
     // masked index (`ldrb w8,..; and w8,w8,#3; strb w8,..`) is still recognized as
     // spilled, and a same-offset load off a non-frame base is not taken for the index.
     let mut frame_regs: Vec<String> = Vec::new();
-    let mut holders: Vec<String> = Vec::new();
+    let mut holders: Vec<(String, u16)> = Vec::new();
     for inst in &dispatch.instructions {
         // Spill: `mov [mem], idxreg` (x86) or `str idxreg, [mem]` (aarch64) writes an
         // index-holding register back to a stack slot. Checked before the holder update
-        // (a store's source register is not a redefinition of the index).
+        // (a store's source register is not a redefinition of the index). Width does not
+        // matter here — a spill of any part of the index is a multi-state signal.
         let stored_src = match inst.operation {
             Operation::Move => match (inst.operands.first(), inst.operands.get(1)) {
                 (Some(Operand::Memory(_)), Some(Operand::Register(s))) => Some(s),
@@ -307,7 +308,7 @@ fn dispatch_spills_index(
             _ => None,
         };
         if let Some(s) = stored_src {
-            if holders.contains(&canon_reg(s.name())) {
+            if holder_width(&holders, &canon_reg(s.name())).is_some() {
                 return true;
             }
         }
@@ -412,7 +413,10 @@ fn dispatch_zero_compares_index(
     // a register overwritten after the read (`mov al,[frame+off]; mov al,0; test al,al`)
     // is dropped.
     let mut frame_regs: Vec<String> = Vec::new();
-    let mut holders: Vec<String> = Vec::new();
+    // Each holder is (canonical register, bit-width DEFINED by the read/copy/mask), so a
+    // byte index in `al` (width 8) is not accepted when a WIDER `test eax,eax` (width 32)
+    // reads its undefined upper bits.
+    let mut holders: Vec<(String, u16)> = Vec::new();
     let is_zero_operand = |op: &Operand, zero: &[String]| -> bool {
         match op {
             Operand::Immediate(imm) => imm.value == 0,
@@ -430,21 +434,27 @@ fn dispatch_zero_compares_index(
             inst.operation,
             Operation::Test | Operation::Compare | Operation::Sub
         ) && {
-            let regs: Vec<String> = inst
+            // A register operand IS the index when it holds the index AND is not read
+            // WIDER than the holder was defined (an over-wide read pulls in undefined
+            // upper bits, so the test is not `index == 0`).
+            let reg_is_index = |o: &Operand| {
+                matches!(o, Operand::Register(r)
+                    if holder_width(&holders, &canon_reg(r.name())).is_some_and(|w| r.size <= w))
+            };
+            let mentions_index = inst.operands.iter().any(&reg_is_index);
+            // `test idx,idx`: every register operand holds the index -> a zero test.
+            let reg_count = inst
                 .operands
                 .iter()
-                .filter_map(|o| match o {
-                    Operand::Register(r) => Some(canon_reg(r.name())),
-                    _ => None,
-                })
-                .collect();
-            // The tested register(s) must currently HOLD the index, not merely share
-            // its name.
-            let mentions_index = regs.iter().any(|r| holders.contains(r));
-            // `test idx,idx`: every register operand holds the index -> a zero test.
+                .filter(|o| matches!(o, Operand::Register(_)))
+                .count();
             let is_self_test = matches!(inst.operation, Operation::Test)
-                && regs.len() >= 2
-                && regs.iter().all(|r| holders.contains(r));
+                && reg_count >= 2
+                && inst
+                    .operands
+                    .iter()
+                    .filter(|o| matches!(o, Operand::Register(_)))
+                    .all(&reg_is_index);
             let against_zero = inst.operands.iter().any(|o| is_zero_operand(o, &zero_regs));
             mentions_index && (is_self_test || against_zero)
         };
@@ -483,8 +493,13 @@ fn update_index_holders(
     index_size: u8,
     frame_slots: &[SpillSlot],
     frame_regs: &mut Vec<String>,
-    holders: &mut Vec<String>,
+    holders: &mut Vec<(String, u16)>,
 ) {
+    // The DEFINED bit-width of the index in a source register, capped at the destination
+    // width (a copy/mask into a wider dest still only defines the source's bits).
+    let src_holder_width = |name: &str, dst_bits: u16| -> Option<u16> {
+        holder_width(holders, name).map(|w| w.min(dst_bits))
+    };
     match inst.operation {
         Operation::Move | Operation::Load => {
             let Some(Operand::Register(d)) = inst.operands.first() else {
@@ -509,30 +524,33 @@ fn update_index_holders(
                             && u16::from(m.size) == u16::from(index_size)
                             && frame_regs.contains(&canon_reg(b.name()))
                     });
-                    holders.retain(|r| r != &dc);
+                    holders.retain(|(r, _)| r != &dc);
                     frame_regs.retain(|r| r != &dc);
                     if is_frame_reload {
                         frame_regs.push(dc);
                     } else if is_index_read {
-                        holders.push(dc);
+                        // The read defines the destination register's bits (a byte load
+                        // into `al` defines 8 bits; `movzx`/`ldrb` into a 32-bit dest
+                        // defines 32).
+                        holders.push((dc, d.size));
                     }
                 }
                 // Register copy: the destination inherits both statuses from the source.
                 Some(Operand::Register(s)) => {
                     let sc = canon_reg(s.name());
-                    let src_holder = holders.contains(&sc);
+                    let src_width = src_holder_width(&sc, d.size);
                     let src_frame = frame_regs.contains(&sc);
-                    holders.retain(|r| r != &dc);
+                    holders.retain(|(r, _)| r != &dc);
                     frame_regs.retain(|r| r != &dc);
-                    if src_holder {
-                        holders.push(dc.clone());
+                    if let Some(w) = src_width {
+                        holders.push((dc.clone(), w));
                     }
                     if src_frame {
                         frame_regs.push(dc);
                     }
                 }
                 _ => {
-                    holders.retain(|r| r != &dc);
+                    holders.retain(|(r, _)| r != &dc);
                     frame_regs.retain(|r| r != &dc);
                 }
             }
@@ -545,13 +563,14 @@ fn update_index_holders(
         Operation::And => {
             if let Some(Operand::Register(d)) = inst.operands.first() {
                 let dc = canon_reg(d.name());
-                let inherits = inst.operands.iter().any(|o| {
-                    matches!(o, Operand::Register(r) if holders.contains(&canon_reg(r.name())))
+                let inherited = inst.operands.iter().find_map(|o| match o {
+                    Operand::Register(r) => src_holder_width(&canon_reg(r.name()), d.size),
+                    _ => None,
                 });
-                holders.retain(|r| r != &dc);
+                holders.retain(|(r, _)| r != &dc);
                 frame_regs.retain(|r| r != &dc);
-                if inherits {
-                    holders.push(dc);
+                if let Some(w) = inherited {
+                    holders.push((dc, w));
                 }
             }
         }
@@ -560,11 +579,16 @@ fn update_index_holders(
         _ => {
             if let Some(Operand::Register(d)) = inst.operands.first() {
                 let dc = canon_reg(d.name());
-                holders.retain(|r| r != &dc);
+                holders.retain(|(r, _)| r != &dc);
                 frame_regs.retain(|r| r != &dc);
             }
         }
     }
+}
+
+/// The bit-width at which `name` currently holds the resume index, or `None`.
+fn holder_width(holders: &[(String, u16)], name: &str) -> Option<u16> {
+    holders.iter().find(|(r, _)| r == name).map(|(_, w)| *w)
 }
 
 /// Whether an operation writes the condition flags (over-approximated as anything that
@@ -1944,6 +1968,18 @@ mod tests {
                 .with_operands(vec![Operand::Register(r(0, 8)), imm1(8)]),
         );
         block.instructions.push(test_ii(r(0, 8)));
+        block.instructions.push(je());
+        assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
+    }
+
+    #[test]
+    fn zero_compare_rejects_wider_test_of_byte_index() {
+        // `mov al,[frame+0x11]` defines only the low 8 bits; a later `test eax,eax`
+        // (32-bit) reads undefined upper bits, so it is NOT a byte-index zero-test.
+        let mut block = BasicBlock::new(BasicBlockId::new(1), 0x82e);
+        block.instructions.push(frame_reload());
+        block.instructions.push(read_index());
+        block.instructions.push(test_ii(r(0, 32)));
         block.instructions.push(je());
         assert!(!dispatch_zero_compares_index(&block, 0x11, 1, &x_frame_slots()));
     }
