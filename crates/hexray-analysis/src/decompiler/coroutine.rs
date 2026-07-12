@@ -4167,6 +4167,55 @@ mod tests {
     }
 
     #[test]
+    fn bounded_branch_register_reload_recovers_nested_switch() {
+        // local = arg0;
+        // if (local[18] <= 1) { rax = local; tmp = rax[18]; if(tmp==0)A else if(tmp==1)B }
+        // else { if (local[18] == 2) C else trap }
+        // The resume index is reloaded through a register COPY of the frame
+        // (`rax = local; tmp = rax[18]`) inside a bounded branch. The nested dispatch
+        // is recovered as `switch(frame->__resume_index)` on {0,1}. Fully PEELING the
+        // frame-copy reload prefix to merge the outer `<= 1` bound check + the else's
+        // `== 2` into one flat switch{0,1,2} is deliberately NOT done: dropping /
+        // relocating the frame register copy `rax = local` is only sound with
+        // register liveness across the post-dispatch region (a copy live after the
+        // switch, or as an indirect call target, must not be dropped; moving it before
+        // the switch changes `rax` for the state-2 path). That peel is a documented
+        // follow-up gated on liveness; the recovered nested switch here is correct.
+        let local = || Expr::var(Variable::stack(-8, 8));
+        let lstate = || Expr::array_access(local(), Expr::int(18), 2);
+        let rax = || Expr::var(Variable::reg("rax", 8));
+        let tmp = || Expr::var(Variable::reg("edx", 4));
+        let mut body = vec![block(vec![Expr::assign(local(), frame())])];
+        body.push(iff(
+            cmp(BinOpKind::Le, lstate(), 1),
+            vec![
+                block(vec![
+                    Expr::assign(rax(), local()),
+                    Expr::assign(tmp(), Expr::array_access(rax(), Expr::int(18), 2)),
+                ]),
+                iff(
+                    cmp(BinOpKind::Eq, tmp(), 0),
+                    vec![block(vec![Expr::unknown("body_a")])],
+                    vec![iff(
+                        cmp(BinOpKind::Eq, tmp(), 1),
+                        vec![block(vec![Expr::unknown("body_b")])],
+                        vec![],
+                    )],
+                ),
+            ],
+            vec![iff(
+                cmp(BinOpKind::Eq, lstate(), 2),
+                vec![block(vec![Expr::unknown("body_c")])],
+                vec![block(vec![Expr::unknown("trap")])],
+            )],
+        ));
+        let out = recover_resume_dispatch(body);
+        // The resume dispatch is recovered as a switch (nested; states 0 and 1).
+        assert!(body_has_resume_switch(&out));
+        assert_eq!(switch_labels(&out), Some(vec![0, 1]));
+    }
+
+    #[test]
     fn flattens_dispatch_with_leading_reload_block_in_branch() {
         // if (arg0[18] <= 1) { tmp = arg0[18]; if (tmp==0) A else if (tmp==1) B }
         // else                { if (arg0[18] == 2) C else trap }
