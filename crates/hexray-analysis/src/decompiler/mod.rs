@@ -15,6 +15,11 @@ pub mod comparison;
 pub mod config;
 mod constant_propagation;
 mod coroutine;
+// Slice 1a: CFG-level clang coroutine dispatch DETECTION (verified on real
+// fixtures). The CFG rewrite that consumes it is wired in a following slice, so the
+// detection API is not yet called from the pipeline.
+#[allow(dead_code)]
+mod coroutine_cfg;
 mod cse;
 mod dead_store;
 mod emitter;
