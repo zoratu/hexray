@@ -301,11 +301,14 @@ fn dispatch_spills_index(dispatch: &BasicBlock, index_offset: i64, index_size: u
     false
 }
 
-/// Whether the resume-index field `frame[index_offset]` (of `index_size` bytes) is read
-/// in NO block other than the dispatch. A multi-state compare chain re-reads the field
-/// (or a spilled reload of it) in a continuation block for each extra state test, so a
-/// read outside the dispatch means this is not a genuine two-state dispatch. Provenance
-/// -free and deliberately conservative (see the caller's note).
+/// Whether the resume-index field `frame[index_offset]` (of `index_size` bytes) is
+/// re-read by a CONTINUATION-DISPATCH block other than the dispatch. A multi-state
+/// compare chain re-reads the field in a further block that then branches on it for each
+/// extra state test, so a same-offset read in a block ending in a conditional branch
+/// means this is not a genuine two-state dispatch. The conditional-branch restriction
+/// stops an unrelated same-offset load in a straight-line resume body (`obj->field_0x11`)
+/// from spuriously declining a valid two-state dispatch. Provenance-free and
+/// deliberately conservative (see the caller's note).
 fn index_field_read_only_in_dispatch(
     cfg: &ControlFlowGraph,
     dispatch_id: BasicBlockId,
@@ -313,7 +316,9 @@ fn index_field_read_only_in_dispatch(
     index_size: u8,
 ) -> bool {
     for block in cfg.blocks() {
-        if block.id == dispatch_id {
+        if block.id == dispatch_id
+            || !matches!(block.terminator, BlockTerminator::ConditionalBranch { .. })
+        {
             continue;
         }
         for inst in &block.instructions {
@@ -1697,6 +1702,43 @@ mod tests {
             size: bits,
             signed: false,
         })
+    }
+
+    #[test]
+    fn field_read_guard_ignores_straightline_body_load() {
+        // A resume body loading an unrelated same-offset field (`obj->field_0x11`) in a
+        // NON-branch block must NOT disable recovery.
+        let dispatch = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(dispatch);
+        cfg.add_block(BasicBlock::new(dispatch, 0x82e));
+        let mut body = BasicBlock::new(BasicBlockId::new(1), 0x600);
+        body.instructions.push(mov(
+            Operand::Register(r(0, 8)),
+            Operand::Memory(MemoryRef::base_disp(r(1, 64), 0x11, 1)),
+        ));
+        body.terminator = BlockTerminator::Return;
+        cfg.add_block(body);
+        assert!(index_field_read_only_in_dispatch(&cfg, dispatch, 0x11, 1));
+    }
+
+    #[test]
+    fn field_read_guard_rejects_continuation_reread() {
+        // A same-offset read in a block that then branches is a continuation dispatch.
+        let dispatch = BasicBlockId::new(0);
+        let mut cfg = ControlFlowGraph::new(dispatch);
+        cfg.add_block(BasicBlock::new(dispatch, 0x82e));
+        let mut cont = BasicBlock::new(BasicBlockId::new(1), 0x600);
+        cont.instructions.push(mov(
+            Operand::Register(r(0, 8)),
+            Operand::Memory(MemoryRef::base_disp(r(1, 64), 0x11, 1)),
+        ));
+        cont.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(3),
+        };
+        cfg.add_block(cont);
+        assert!(!index_field_read_only_in_dispatch(&cfg, dispatch, 0x11, 1));
     }
 
     #[test]
