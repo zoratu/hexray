@@ -2360,18 +2360,37 @@ impl<'a> Structurer<'a> {
                                 address_range,
                             });
                         }
-                        // Emit a basic switch with unknown values, using indices. This is
-                        // the GENERIC fallback for any unrecovered indirect jump; keep it
-                        // minimal and side-effect-free. Coroutine-specific shaping (naming
-                        // the value, turning the two-way nonzero edge into `default`) is
-                        // done later by the coroutine pass on the structured output, not
-                        // here, so this stays correct for real computed dispatches.
+                        // Emit a basic switch with sequential case indices. Coroutine
+                        // VALUE naming and two-way `default` shaping are done later by the
+                        // coroutine pass (not here), so this stays neutral for real
+                        // computed dispatches. But structure each case only up to the
+                        // point where the targets converge, so a continuation shared by
+                        // several cases (e.g. a common cleanup/frame-store block before a
+                        // return) is emitted ONCE after the switch instead of being
+                        // absorbed by the first-structured case and lost from the others.
+                        // This mirrors the recovered-switch path (find_switch_join_point).
+                        // Only synthesize a join at the top level: inside a bounded region
+                        // `end` is already the boundary and a later block must not be
+                        // structured past it.
                         let switch_expr = Expr::unknown("switch_value".to_string());
+                        let switch_end = match end {
+                            Some(_) => end,
+                            None if possible_targets.len() >= 2 => {
+                                self.find_join_point_of_targets(possible_targets)
+                            }
+                            None => None,
+                        };
                         let cases: Vec<(Vec<i128>, Vec<StructuredNode>)> = possible_targets
                             .iter()
                             .enumerate()
                             .map(|(i, &target)| {
-                                let body = self.structure_region(target, end);
+                                let body =
+                                    if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
+                                        self.mark_pure_return_chain_processed(target);
+                                        vec![StructuredNode::Return(ret_expr)]
+                                    } else {
+                                        self.structure_region(target, switch_end)
+                                    };
                                 (vec![i as i128], body)
                             })
                             .collect();
@@ -2380,7 +2399,25 @@ impl<'a> Structurer<'a> {
                             cases,
                             default: None,
                         });
-                        break;
+                        // Continue structuring at the join so the shared continuation is
+                        // emitted immediately after the switch. The join has multiple
+                        // predecessors (the cases converge on it), so mark it inline so the
+                        // next iteration's multi-pred guard does not defer it to a goto.
+                        match switch_end {
+                            Some(join) if end != Some(join) => {
+                                let is_irreducible_entry = self
+                                    .irreducible_analysis
+                                    .regions
+                                    .iter()
+                                    .any(|r| r.entry_points.contains(&join));
+                                if !is_irreducible_entry {
+                                    self.inline_allowed.insert(join);
+                                }
+                                current = Some(join);
+                                continue;
+                            }
+                            _ => break,
+                        }
                     }
 
                     // Fallback: emit block and break
