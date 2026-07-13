@@ -12,8 +12,10 @@
 //! dispatch block and the 1-byte resume-index frame field. The CFG rewrite that
 //! turns the tail dispatch into a clean switch region is a following slice.
 
+use super::{BinaryDataContext, SwitchRecovery};
 use hexray_core::{
-    BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Operand, Operation,
+    BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, MemoryRef, Operand,
+    Operation, Register,
 };
 
 /// A stack home holding the frame pointer, keyed by (canonical base register name,
@@ -114,22 +116,96 @@ pub fn detect_clang_resume_dispatch(cfg: &ControlFlowGraph) -> Option<ClangResum
 pub struct ClangResumeRewrite {
     pub cfg: ControlFlowGraph,
     pub index_offset: i64,
+    /// Whether the recovered switch's nonzero edge should be shaped into `default`.
+    /// True for the compare-chain 2-state shape (`test idx,idx; je state0` routes
+    /// EVERY nonzero value to the false edge); false for a jump table, whose cases
+    /// are already explicit `0..N-1` and must be left as-is.
+    pub two_way_default: bool,
 }
 
 pub fn rewrite_clang_resume_dispatch(
     cfg: &ControlFlowGraph,
     relocations: Option<&super::RelocationTable>,
+    binary_data: Option<&BinaryDataContext>,
 ) -> Option<ClangResumeRewrite> {
     let disp = detect_clang_resume_dispatch(cfg)?;
-    if !matches!(disp.shape, DispatchShape::CompareChain { .. }) {
-        // The jump-table shape already reaches switch recovery through its native
-        // IndirectJump terminator; only compare-chains are handled here.
-        return None;
-    }
     let dispatch_block = cfg.block(disp.dispatch)?;
     // The stack homes holding the frame pointer (arg0), so a reload in the dispatch is
     // recognized and only a read off a frame pointer is taken for the resume index.
     let frame_slots = frame_pointer_spill_slots(cfg.entry_block()?);
+
+    // Many-state dispatch: a `.rodata` jump table. It already reaches switch recovery
+    // through its native `IndirectJump` — we do NOT rebuild the terminator; but clang's
+    // `e9 00000000` no-op jumps still sever the resume-point bodies (the CFG builder
+    // mislabels them `Return`), collapsing the recovered switch cases to bare `return`s.
+    // Repair those (keeping the jump table) so the bodies survive structuring.
+    //
+    // Gate on the table actually RESOLVING here — run the same jump-table recovery the
+    // structurer will (reading the `.rodata` table from binary data), and only proceed if
+    // it yields a real multi-case switch. `possible_targets` alone can't be checked: the
+    // CFG builder often leaves it empty for a resolvable table (resolution happens
+    // downstream), so an emptiness check would wrongly decline linked tables — while an
+    // unresolvable `.o` table (no binary data / unrelocated base) forms NO dispatch switch,
+    // and proceeding there would run the naming pass with no dispatch to name, letting it
+    // rename an unrelated user switch. Resolving up front guarantees the dispatch switch
+    // exists before we claim recovery.
+    if matches!(disp.shape, DispatchShape::JumpTable { .. }) {
+        // Require a 1-byte resume index (clang's form). The table resolver has no bounds
+        // check to size the table and falls back to a 256-entry default, which exactly
+        // covers a 1-byte index (<= 256 states) but would silently TRUNCATE a wider one:
+        // a 2-byte index with > 256 states would read as a dense `0..255` prefix and commit
+        // with the higher states' edges/cases missing. Decline wider indices rather than
+        // accept a truncated prefix.
+        if disp.index_size != 1 {
+            return None;
+        }
+        // Prove the indirect jump is DRIVEN by the resume-index field (not an unrelated
+        // computed jump that merely happens to sit after a small frame read), and that the
+        // table actually resolves to a multi-case switch. Both must hold before we claim
+        // recovery — otherwise the naming pass could rename an unrelated switch.
+        if !dispatch_jump_indexed_by_resume_read(
+            dispatch_block,
+            disp.index_offset,
+            disp.index_size,
+            &frame_slots,
+        ) {
+            return None;
+        }
+        let targets = resolved_jump_table_targets(
+            cfg,
+            disp.dispatch,
+            disp.index_offset,
+            disp.index_size,
+            &frame_slots,
+            binary_data,
+        )?;
+        let mut rewritten = repaired_cfg(cfg, relocations);
+        // Merge the resolved table targets into the dispatch's `possible_targets`, so
+        // `rederive_edges` connects the dispatch to EVERY resume state — whether the CFG
+        // builder left the list empty or populated it incompletely. Otherwise loop/dominator
+        // analyses (run on CFG edges BEFORE switch recovery) would treat a table-only-
+        // reachable state as unreachable and degrade its loops to gotos. Merge (not
+        // overwrite) so any extra target the builder found — e.g. a bounds-check default — is
+        // preserved.
+        if let Some(block) = rewritten.block_mut(disp.dispatch) {
+            if let BlockTerminator::IndirectJump {
+                possible_targets, ..
+            } = &mut block.terminator
+            {
+                for t in targets {
+                    if !possible_targets.contains(&t) {
+                        possible_targets.push(t);
+                    }
+                }
+            }
+        }
+        rederive_edges(&mut rewritten);
+        return Some(ClangResumeRewrite {
+            cfg: rewritten,
+            index_offset: disp.index_offset,
+            two_way_default: false,
+        });
+    }
 
     // Only a genuine two-way dispatch is safe to rewrite as two cases. For >2 resume
     // states clang emits a compare CHAIN: the dispatch spills the freshly-read index
@@ -196,15 +272,11 @@ pub fn rewrite_clang_resume_dispatch(
         return None;
     }
 
-    // Rebuild the CFG: clone every block, swap the dispatch terminator for the
-    // synthetic IndirectJump, then re-derive ALL edges from the (rewritten)
-    // terminators so successor/predecessor sets stay consistent. `add_block`
-    // seeds empty edge sets, so rebuilding from terminators cannot double-count.
-    let mut rewritten = ControlFlowGraph::new(cfg.entry);
-    for block in cfg.blocks() {
-        rewritten.add_block(block.clone());
-    }
-    repair_nop_jump_returns(&mut rewritten, relocations);
+    // Rebuild the CFG (blocks cloned + no-op jumps repaired), swap the dispatch
+    // terminator for the synthetic IndirectJump over the resume states, then re-derive
+    // ALL edges from the (rewritten) terminators so successor/predecessor sets stay
+    // consistent.
+    let mut rewritten = repaired_cfg(cfg, relocations);
     {
         let d = rewritten.block_mut(disp.dispatch)?;
         d.terminator = BlockTerminator::IndirectJump {
@@ -212,20 +284,445 @@ pub fn rewrite_clang_resume_dispatch(
             possible_targets: states,
         };
     }
-    let ids: Vec<BasicBlockId> = rewritten.block_ids().collect();
+    rederive_edges(&mut rewritten);
+    Some(ClangResumeRewrite {
+        cfg: rewritten,
+        index_offset: disp.index_offset,
+        two_way_default: true,
+    })
+}
+
+/// Whether the dispatch's indirect jump is INDEXED BY the resume-index field read — i.e.
+/// the value read from `frame[index_offset]` reaches the jump-table index register
+/// `[base + idx*scale]`. This proves the computed jump is the resume dispatch (driven by
+/// the resume index) rather than an unrelated computed jump that merely follows a small
+/// frame read. The value is followed within the dispatch block through register
+/// copies/extends and a scratch-slot spill/reload (clang -O0 spills the index and reloads
+/// it before the table load); the indexed table LOAD produces a jump-target address, and
+/// the check succeeds only when the actual `IndirectJump` target is that table-derived
+/// address (register, after the usual `add base` adjustment) or is itself a `jmp
+/// *table(,idx,scale)` indexed by the resume index. Tying success to the terminator target
+/// avoids both accepting an unrelated indexed load and missing a direct indexed jump.
+fn dispatch_jump_indexed_by_resume_read(
+    dispatch: &BasicBlock,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+) -> bool {
+    // Registers holding the reloaded frame pointer / the index value / a table-derived jump
+    // target, and scratch stack slots holding a spilled copy of the index.
+    let mut frame_regs: Vec<String> = Vec::new();
+    let mut holders: Vec<String> = Vec::new();
+    let mut target_regs: Vec<String> = Vec::new();
+    let mut index_slots: Vec<SpillSlot> = Vec::new();
+
+    // Whether a memory operand is indexed by a register currently holding the resume index.
+    let uses_index = |m: &MemoryRef, holders: &[String]| {
+        m.index
+            .as_ref()
+            .is_some_and(|i| holders.contains(&canon_reg(i.name())))
+    };
+
+    for inst in &dispatch.instructions {
+        match inst.operation {
+            // `SignExtend` covers `movsxd rax, [table + idx*4]` (the sign-extending
+            // jump-table load) and register sign-extends of the index.
+            Operation::Move | Operation::Load | Operation::SignExtend => {
+                match (inst.operands.first(), inst.operands.get(1)) {
+                    // `reg <- [mem]`: a frame reload, the index field read, a reload of the
+                    // spilled index, or the jump-table load (indexed by the resume index).
+                    (Some(Operand::Register(d)), Some(Operand::Memory(m))) => {
+                        let dc = canon_reg(d.name());
+                        let base = m.base.as_ref();
+                        // Classify against the CURRENT state before clobbering `dc` — the
+                        // index read `movzbl off(rax), eax` reuses its base register as the
+                        // destination, so removing `dc` first would hide `base in frame_regs`.
+                        let is_frame_reload = base.is_some_and(|b| {
+                            is_frame_base_register(b.name())
+                                && m.index.is_none()
+                                && frame_slots.contains(&(canon_reg(b.name()), m.displacement))
+                                && d.size >= b.size
+                        });
+                        // The index must land in a >= 32-bit destination so it fills the
+                        // (32/64-bit) table-index register: reading the 1-byte field into a
+                        // subregister (`mov al, [frame+off]`) leaves the upper bits stale, so
+                        // a later `[table + rax*scale]` would be indexed by garbage. clang
+                        // zero-extends (`movzbl ..., eax`), which x86 also clears rax's upper
+                        // 32 bits, so a 32-bit destination is enough.
+                        let defines_full_index = d.size >= 32;
+                        let is_index_read = defines_full_index
+                            && base.is_some_and(|b| {
+                                m.index.is_none()
+                                    && m.displacement == index_offset
+                                    && u16::from(m.size) == u16::from(index_size)
+                                    && frame_regs.contains(&canon_reg(b.name()))
+                            });
+                        let is_index_reload = defines_full_index
+                            && base.is_some_and(|b| {
+                                m.index.is_none()
+                                    && index_slots.contains(&(canon_reg(b.name()), m.displacement))
+                            });
+                        // The jump-table load: `movslq dst, [base + idx*scale]`. Its result
+                        // is a (relative) jump-target address, not the index any more.
+                        let is_table_load = uses_index(m, &holders);
+                        holders.retain(|r| r != &dc);
+                        frame_regs.retain(|r| r != &dc);
+                        target_regs.retain(|r| r != &dc);
+                        if is_frame_reload {
+                            frame_regs.push(dc);
+                        } else if is_index_read || is_index_reload {
+                            holders.push(dc);
+                        } else if is_table_load {
+                            target_regs.push(dc);
+                        }
+                    }
+                    // `[mem] <- anything` (x86 `mov [slot], idx` / `mov [slot], 0`): a store.
+                    // Any store to a scratch slot INVALIDATES a prior index spill there; only
+                    // a store of the index register re-records it.
+                    (Some(Operand::Memory(m)), src) => {
+                        record_index_spill(m, register_operand(src), &holders, &mut index_slots);
+                    }
+                    // `reg <- reg`: a copy/extend propagates every status to the dest.
+                    (Some(Operand::Register(d)), Some(Operand::Register(s))) => {
+                        let dc = canon_reg(d.name());
+                        let sc = canon_reg(s.name());
+                        // A copy into a subregister (`mov cl, eax`) doesn't fully define the
+                        // index register, so it doesn't carry index-holder status.
+                        let src_holder = d.size >= 32 && holders.contains(&sc);
+                        let src_frame = frame_regs.contains(&sc);
+                        let src_target = target_regs.contains(&sc);
+                        holders.retain(|r| r != &dc);
+                        frame_regs.retain(|r| r != &dc);
+                        target_regs.retain(|r| r != &dc);
+                        if src_holder {
+                            holders.push(dc.clone());
+                        }
+                        if src_frame {
+                            frame_regs.push(dc.clone());
+                        }
+                        if src_target {
+                            target_regs.push(dc);
+                        }
+                    }
+                    // `reg <- immediate` / any other form still WRITES the destination
+                    // register (e.g. `mov eax, 0`), so its stale provenance must be cleared.
+                    (Some(Operand::Register(d)), _) => {
+                        clobber_register(&canon_reg(d.name()), &mut holders, &mut frame_regs, &mut target_regs);
+                    }
+                    _ => {}
+                }
+            }
+            // aarch64 `str idx, [sp, #slot]`: operands are `[src, Memory(dst)]` (source
+            // FIRST), so this is a spill (or slot-invalidating store), not a clobber.
+            Operation::Store => {
+                if let Some(Operand::Memory(m)) = inst.operands.get(1) {
+                    record_index_spill(m, register_operand(inst.operands.first()), &holders, &mut index_slots);
+                }
+            }
+            // Address arithmetic on the table-loaded value keeps it a jump-target register,
+            // but ONLY `add` (`add rax, table_base`, turning the relative offset into the
+            // absolute target). `SwitchRecovery` models table entries as absolute addresses
+            // or `table_base + entry` — never `table_base - entry` — so a `sub` would compute
+            // a jump target the resolver does not model; let it fall through to the clobber
+            // arm so the mismatch is declined rather than wired to the wrong address.
+            Operation::Add => {
+                if let Some(Operand::Register(d)) = inst.operands.first() {
+                    let dc = canon_reg(d.name());
+                    // Two-operand `add dst, src` (x86) reads its destination, so the dest's
+                    // own table-target status carries; three-operand `add dst, s1, s2`
+                    // (aarch64) does NOT — it fully overwrites `dst`, so only the explicit
+                    // source registers can make the result a jump target.
+                    let dst_is_source = inst.operands.len() == 2;
+                    let stays_target = (dst_is_source && target_regs.contains(&dc))
+                        || inst.operands.iter().skip(1).any(|o| {
+                            matches!(o, Operand::Register(r) if target_regs.contains(&canon_reg(r.name())))
+                        });
+                    clobber_register(&dc, &mut holders, &mut frame_regs, &mut target_regs);
+                    if stays_target {
+                        target_regs.push(dc);
+                    }
+                }
+            }
+            // clang can fuse the base-add into the address computation: `lea reg,
+            // [table_base + table_result]` (or `[table_result + base]`). The dest is the
+            // absolute jump target iff the address arithmetic combines a table-loaded
+            // register (as base or index).
+            Operation::LoadEffectiveAddress => {
+                if let Some(Operand::Register(d)) = inst.operands.first() {
+                    let dc = canon_reg(d.name());
+                    // Only a `[base + index]` computation combining a table-loaded register
+                    // makes the dest a jump target; any other LEA form still WRITES the dest,
+                    // so it must at least clear that register's stale provenance.
+                    let from_target = matches!(inst.operands.get(1), Some(Operand::Memory(m))
+                        if m.base.as_ref().is_some_and(|b| target_regs.contains(&canon_reg(b.name())))
+                            || m.index.as_ref().is_some_and(|i| target_regs.contains(&canon_reg(i.name()))));
+                    clobber_register(&dc, &mut holders, &mut frame_regs, &mut target_regs);
+                    if from_target {
+                        target_regs.push(dc);
+                    }
+                }
+            }
+            // Flag-only and control-transfer ops leave registers untouched — in
+            // particular `jmp *rax` READS `rax` (the jump target) rather than writing it,
+            // so it must not clear the target register just before the terminator check.
+            Operation::Compare
+            | Operation::Test
+            | Operation::Jump
+            | Operation::ConditionalJump
+            | Operation::Return => {}
+            // Any other write clobbers its destination register's status.
+            _ => {
+                if let Some(Operand::Register(d)) = inst.operands.first() {
+                    clobber_register(&canon_reg(d.name()), &mut holders, &mut frame_regs, &mut target_regs);
+                }
+            }
+        }
+    }
+
+    // The jump is driven by the resume index iff its target is a register holding the
+    // table-derived address. A direct `jmp *table(,idx,scale)` (indexed memory on the
+    // terminator) is deliberately NOT accepted: `SwitchRecovery` only scans block
+    // instructions to find the table base, so it could not resolve that form anyway —
+    // accepting it here would claim recovery the resolver then declines. clang -O0 loads the
+    // target into a register first, so this costs no real coverage.
+    match &dispatch.terminator {
+        BlockTerminator::IndirectJump { target, .. } => {
+            matches!(target, Operand::Register(r) if target_regs.contains(&canon_reg(r.name())))
+        }
+        _ => false,
+    }
+}
+
+/// Update the index-spill slots for a store to `[base - K]`. ANY store to a scratch slot
+/// first INVALIDATES a prior index spill recorded there (the value is now something else);
+/// a store of a register that currently holds the index then re-records the slot, so a
+/// later reload re-establishes the index. `src` is `None` for a non-register store (e.g.
+/// `mov [slot], 0`), which only invalidates.
+fn record_index_spill(
+    m: &MemoryRef,
+    src: Option<&Register>,
+    holders: &[String],
+    index_slots: &mut Vec<SpillSlot>,
+) {
+    if let Some(b) = &m.base {
+        if m.index.is_none() {
+            let key = (canon_reg(b.name()), m.displacement);
+            index_slots.retain(|k| k != &key);
+            if src.is_some_and(|s| holders.contains(&canon_reg(s.name()))) {
+                index_slots.push(key);
+            }
+        }
+    }
+}
+
+/// The register of an operand, if it is a register operand.
+fn register_operand(op: Option<&Operand>) -> Option<&Register> {
+    match op {
+        Some(Operand::Register(r)) => Some(r),
+        _ => None,
+    }
+}
+
+/// Drop every index/frame/target provenance for a register that has just been written, so a
+/// later use of the (now unrelated) value can't be mistaken for the resume index or a
+/// table-derived jump target.
+fn clobber_register(
+    dc: &str,
+    holders: &mut Vec<String>,
+    frame_regs: &mut Vec<String>,
+    target_regs: &mut Vec<String>,
+) {
+    holders.retain(|r| r != dc);
+    frame_regs.retain(|r| r != dc);
+    target_regs.retain(|r| r != dc);
+}
+
+/// The resume-state target blocks of the jump table at `dispatch`, IF it genuinely resolves
+/// to the complete, dense resume dispatch `switch (0..N-1)` by READING the `.rodata` table
+/// from binary data — the same read the structurer will perform downstream. Returns the
+/// unique target blocks (ordered by ascending resume-state index), or `None` when the table
+/// can't be read or isn't dense.
+///
+/// This proves the recovered switch will form AND that its case labels are complete: the
+/// deduplicated `possible_targets` fallback is deliberately NOT accepted, because it
+/// collapses duplicate table entries (two states resuming at the same block) into unique
+/// targets with sequential labels, which would drop a state yet still look "dense" to the
+/// naming pass. An unresolvable table (no binary data, or an unrelocated `.o` base) yields
+/// no read, so the rewrite declines rather than commit an incorrect switch.
+///
+/// Completeness: a bounded table's read fails if any entry is unmapped (see
+/// [`SwitchRecovery::try_recover_switch_read_from_binary`]); an unbounded table (clang's
+/// coroutine form) has its length BOUNDED here by the largest resume-index the function
+/// stores into the frame field (`mov [frame+off], N`) — the highest state the coroutine can
+/// ever dispatch. That rejects a garbage word just past the real table that happens to
+/// decode to an in-function block and would otherwise extend the dense labels by a spurious
+/// case; the dense-`0..N-1` contiguity check catches a non-adjacent accidental map.
+fn resolved_jump_table_targets(
+    cfg: &ControlFlowGraph,
+    dispatch: BasicBlockId,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+    binary_data: Option<&BinaryDataContext>,
+) -> Option<Vec<BasicBlockId>> {
+    let mut recovery = SwitchRecovery::new(cfg);
+    if let Some(ctx) = binary_data {
+        recovery = recovery.with_binary_context(ctx);
+    }
+    let info = recovery.try_recover_switch_read_from_binary(dispatch)?;
+
+    // The read table must span the dense resume states `0..N-1` (N >= 2). Flatten grouped
+    // labels — `read_jump_table` groups duplicate targets into one multi-label case.
+    let mut labels: Vec<i128> = info.cases.iter().flat_map(|(vs, _)| vs.iter().copied()).collect();
+    if labels.len() < 2 {
+        return None;
+    }
+    labels.sort_unstable();
+    if !labels.iter().enumerate().all(|(i, &v)| v == i as i128) {
+        return None;
+    }
+
+    // Bound the (possibly unbounded) table by the highest resume index the function stores:
+    // the dense states must run EXACTLY `0..=max_state`. A higher top label is a spurious
+    // entry read past the real table's end; a lower one means the table's last state was
+    // dropped (unmapped target / truncated section) — both are wrong, so require an exact
+    // match. (Skipped only when no such store is found — e.g. an aarch64 register store —
+    // falling back to the contiguity check alone.)
+    if let Some(max_state) = max_resume_index_store(cfg, index_offset, index_size, frame_slots) {
+        let max_label = labels.last().copied().unwrap_or(0);
+        if max_label != i128::from(max_state) {
+            return None;
+        }
+    }
+
+    // Unique target blocks, ordered by each case's smallest resume-state index, so the
+    // dispatch's successors can be populated even when the CFG builder left them empty.
+    let mut ordered: Vec<(i128, BasicBlockId)> = info
+        .cases
+        .iter()
+        .filter_map(|(vs, block)| vs.iter().min().map(|&m| (m, *block)))
+        .collect();
+    ordered.sort_by_key(|(min_label, _)| *min_label);
+    let mut targets: Vec<BasicBlockId> = Vec::new();
+    for (_, block) in ordered {
+        if !targets.contains(&block) {
+            targets.push(block);
+        }
+    }
+    Some(targets)
+}
+
+/// The largest resume-index value the function stores into the FRAME field
+/// `frame->__resume_index` (`mov byte [framereg + index_offset], N`), i.e. the highest state
+/// the coroutine ever arms for a later resume. Used to bound an unbounded resume jump table.
+///
+/// The store's base register must PROVABLY hold the frame pointer (reloaded from a frame
+/// spill slot within the same block), so an unrelated `[obj + index_offset] = N` store to a
+/// different object that merely shares the offset/width does not contribute. `None` if no
+/// such frame-field immediate store is found (e.g. an aarch64 register store).
+fn max_resume_index_store(
+    cfg: &ControlFlowGraph,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+) -> Option<i64> {
+    let mut max: Option<i64> = None;
+    for block in cfg.blocks() {
+        // Registers currently holding a reloaded frame pointer, tracked per block.
+        let mut frame_regs: Vec<String> = Vec::new();
+        for inst in &block.instructions {
+            match inst.operation {
+                Operation::Move | Operation::Load => {
+                    match (inst.operands.first(), inst.operands.get(1)) {
+                        // `reg <- [framebase - K]`: a frame-pointer reload.
+                        (Some(Operand::Register(d)), Some(Operand::Memory(m))) => {
+                            let dc = canon_reg(d.name());
+                            let is_frame_reload = m.base.as_ref().is_some_and(|b| {
+                                is_frame_base_register(b.name())
+                                    && m.index.is_none()
+                                    && frame_slots.contains(&(canon_reg(b.name()), m.displacement))
+                                    && d.size >= b.size
+                            });
+                            frame_regs.retain(|r| r != &dc);
+                            if is_frame_reload {
+                                frame_regs.push(dc);
+                            }
+                        }
+                        // `[framereg + index_offset] <- imm`: a resume-index store.
+                        (Some(Operand::Memory(m)), Some(Operand::Immediate(i))) => {
+                            let to_frame_field = m.index.is_none()
+                                && m.displacement == index_offset
+                                && u16::from(m.size) == u16::from(index_size)
+                                && (0..256).contains(&i.value)
+                                && m.base
+                                    .as_ref()
+                                    .is_some_and(|b| frame_regs.contains(&canon_reg(b.name())));
+                            if to_frame_field {
+                                let v = i.value as i64;
+                                max = Some(max.map_or(v, |mx: i64| mx.max(v)));
+                            }
+                        }
+                        // `reg <- reg`: a copy propagates the frame-pointer status.
+                        (Some(Operand::Register(d)), Some(Operand::Register(s))) => {
+                            let dc = canon_reg(d.name());
+                            let src_frame = frame_regs.contains(&canon_reg(s.name()));
+                            frame_regs.retain(|r| r != &dc);
+                            if src_frame {
+                                frame_regs.push(dc);
+                            }
+                        }
+                        // Any other `reg <- ...` write clears that register's frame status.
+                        (Some(Operand::Register(d)), _) => {
+                            let dc = canon_reg(d.name());
+                            frame_regs.retain(|r| r != &dc);
+                        }
+                        _ => {}
+                    }
+                }
+                Operation::Compare
+                | Operation::Test
+                | Operation::Jump
+                | Operation::ConditionalJump
+                | Operation::Return => {}
+                _ => {
+                    if let Some(Operand::Register(d)) = inst.operands.first() {
+                        let dc = canon_reg(d.name());
+                        frame_regs.retain(|r| r != &dc);
+                    }
+                }
+            }
+        }
+    }
+    max
+}
+
+/// Clone `cfg` and repair clang's no-op-jump `Return`s (reconnecting severed
+/// resume-point bodies). Edges are NOT re-derived — the caller does that after any
+/// terminator change, so a single `rederive_edges` pass cannot double-count.
+fn repaired_cfg(
+    cfg: &ControlFlowGraph,
+    relocations: Option<&super::RelocationTable>,
+) -> ControlFlowGraph {
+    let mut rewritten = ControlFlowGraph::new(cfg.entry);
+    for block in cfg.blocks() {
+        rewritten.add_block(block.clone());
+    }
+    repair_nop_jump_returns(&mut rewritten, relocations);
+    rewritten
+}
+
+/// Rebuild all successor/predecessor edges from each block's terminator.
+fn rederive_edges(cfg: &mut ControlFlowGraph) {
+    let ids: Vec<BasicBlockId> = cfg.block_ids().collect();
     for id in ids {
-        let succs = rewritten
+        let succs = cfg
             .block(id)
             .map(|b| b.terminator.successors())
             .unwrap_or_default();
         for succ in succs {
-            rewritten.add_edge(id, succ);
+            cfg.add_edge(id, succ);
         }
     }
-    Some(ClangResumeRewrite {
-        cfg: rewritten,
-        index_offset: disp.index_offset,
-    })
 }
 
 /// Undo the CFG builder's `__x86_return_thunk` heuristic within a coroutine resume
@@ -1637,6 +2134,91 @@ mod tests {
         cfg
     }
 
+    /// Base address of the synthetic `.rodata` jump table used by the jump-table tests.
+    const JT_BASE: u64 = 0x9000;
+
+    /// A clang jump-table `.resume` dispatch:
+    ///   entry:    mov [rbp-0x70], rdi ; jmp dispatch
+    ///   dispatch: mov rax, [rbp-0x70]         ; frame reload
+    ///             movzx eax, [rax + 0x11]     ; resume-index field read
+    ///             mov   rax, [JT_BASE + rax*4]; jump-table load INDEXED BY the index
+    ///             jmp   *rax                  ; IndirectJump(possible_targets)
+    /// so the resume index provably drives the indirect jump.
+    fn shape_jump_table_cfg(
+        possible_targets: Vec<BasicBlockId>,
+    ) -> ControlFlowGraph {
+        let entry_id = BasicBlockId::new(0);
+        let dispatch_id = BasicBlockId::new(1);
+        let (rbp, rdi, rax, eax) = (r(5, 64), r(7, 64), r(0, 64), r(0, 32));
+        let mut cfg = ControlFlowGraph::new(entry_id);
+
+        let mut entry = BasicBlock::new(entry_id, 0x400);
+        entry.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+            Operand::Register(rdi),
+        ));
+        entry.terminator = BlockTerminator::Jump {
+            target: dispatch_id,
+        };
+        cfg.add_block(entry);
+
+        let mut dispatch = BasicBlock::new(dispatch_id, 0xd12);
+        dispatch.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+        ));
+        dispatch.instructions.push(mov(
+            Operand::Register(eax),
+            Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)),
+        ));
+        // `mov rax, [JT_BASE + rax*4]` — a readable absolute-SIB jump-table load, indexed by
+        // the resume index (so `SwitchRecovery` can resolve the table from binary data).
+        dispatch.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::sib(None, Some(rax), 4, JT_BASE as i64, 4)),
+        ));
+        dispatch.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets,
+        };
+        cfg.add_block(dispatch);
+        cfg
+    }
+
+    /// A `BinaryDataContext` holding a 256-entry, 4-byte ABSOLUTE jump table at `JT_BASE`
+    /// whose first entries point at `targets` (block start addresses); the rest are 0, which
+    /// resolve to no block and are dropped, mirroring a real table read.
+    /// Prepend `mov rax, [rbp-0x70]; mov byte [rax+0x11], value` to `block` so
+    /// `max_resume_index_store` sees the frame reload + resume-index store (frame slot
+    /// `(rbp, -0x70)`, matching `shape_jump_table_cfg`).
+    fn set_max_resume_store(block: &mut BasicBlock, value: i128) {
+        let (rbp, rax) = (r(5, 64), r(0, 64));
+        block.instructions.insert(
+            0,
+            mov(
+                Operand::Register(rax),
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+            ),
+        );
+        block.instructions.insert(
+            1,
+            mov(
+                Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)),
+                Operand::Immediate(hexray_core::Immediate { value, size: 8, signed: false }),
+            ),
+        );
+    }
+
+    fn jump_table_binary(targets: &[u32]) -> BinaryDataContext {
+        let mut data = vec![0u8; 256 * 4];
+        for (i, &t) in targets.iter().enumerate() {
+            data[i * 4..i * 4 + 4].copy_from_slice(&t.to_le_bytes());
+        }
+        let mut ctx = BinaryDataContext::new();
+        ctx.add_section(JT_BASE, data);
+        ctx
+    }
+
     #[test]
     fn rewrite_shape_a_produces_indirect_switch_dispatch() {
         let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
@@ -1644,7 +2226,7 @@ mod tests {
         cfg.add_block(BasicBlock::new(r0, 0x50e));
         cfg.add_block(BasicBlock::new(r1, 0x608));
 
-        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten").cfg;
+        let rewritten = rewrite_clang_resume_dispatch(&cfg, None, None).expect("rewritten").cfg;
         let dispatch = rewritten.block(BasicBlockId::new(1)).unwrap();
         match &dispatch.terminator {
             BlockTerminator::IndirectJump {
@@ -1658,18 +2240,539 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_declines_jump_table_shape() {
-        // A native IndirectJump dispatch (shape B) already reaches switch recovery;
-        // the rewrite must leave it alone.
+    fn rewrite_repairs_jump_table_but_keeps_terminator() {
+        // A native IndirectJump dispatch (jump table) reaches switch recovery on its own, so
+        // the rewrite repairs the (no-op-jump-severed) resume bodies but must NOT rebuild the
+        // terminator. The table is READ from binary data (entries 0/1 -> r0/r1), proving the
+        // dispatch switch will form with complete case labels.
         let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
-        let mut cfg = shape_a_cfg(r0, r1);
+        let mut cfg = shape_jump_table_cfg(vec![]);
+        // Give the resume blocks a non-zero span so the read table's target addresses map.
+        let mut b0 = BasicBlock::new(r0, 0x50e);
+        b0.end = 0x510;
+        let mut b1 = BasicBlock::new(r1, 0x608);
+        b1.end = 0x610;
+        cfg.add_block(b0);
+        cfg.add_block(b1);
+        let ctx = jump_table_binary(&[0x50e, 0x608]);
+        let out = rewrite_clang_resume_dispatch(&cfg, None, Some(&ctx))
+            .expect("jump-table repaired");
+        // The dispatch keeps its original IndirectJump terminator, now with its
+        // `possible_targets` populated from the resolved table.
+        match &out.cfg.block(BasicBlockId::new(1)).unwrap().terminator {
+            BlockTerminator::IndirectJump { possible_targets, .. } => {
+                assert!(possible_targets.contains(&r0) && possible_targets.contains(&r1));
+            }
+            other => panic!("expected IndirectJump preserved, got {other:?}"),
+        }
+        // Edges are rederived so the dispatch connects to every resume state (otherwise
+        // loop/dominator analysis would treat table-only-reachable states as unreachable).
+        let succ = out.cfg.successors(BasicBlockId::new(1));
+        assert!(succ.contains(&r0) && succ.contains(&r1), "dispatch must reach resume states");
+        assert!(!out.two_way_default, "jump table keeps explicit cases");
+    }
+
+    #[test]
+    fn rewrite_declines_table_longer_than_max_resume_store() {
+        // The function only ever stores resume index 1 (`mov byte [rax+0x11], 1`), so the
+        // highest dispatchable state is 1. A read table with a THIRD entry (state 2, from a
+        // garbage word past the real table that happens to map) exceeds that bound and must
+        // be declined rather than committing a spurious case.
+        let (r0, r1, r2) = (BasicBlockId::new(2), BasicBlockId::new(3), BasicBlockId::new(4));
+        let mut cfg = shape_jump_table_cfg(vec![]);
+        for (id, start) in [(r0, 0x50e_u64), (r1, 0x608), (r2, 0x700)] {
+            let mut b = BasicBlock::new(id, start);
+            b.end = start + 2;
+            cfg.add_block(b);
+        }
+        // A body block arms resume index 1 (`mov rax, [rbp-0x70]; mov byte [rax+0x11], 1`),
+        // so the max dispatchable state is 1.
+        set_max_resume_store(cfg.block_mut(r0).unwrap(), 1);
+        let ctx = jump_table_binary(&[0x50e, 0x608, 0x700]); // 3 states, but max store is 1
+        assert!(
+            rewrite_clang_resume_dispatch(&cfg, None, Some(&ctx)).is_none(),
+            "a table longer than the max resume-index store must decline"
+        );
+    }
+
+    #[test]
+    fn rewrite_declines_table_shorter_than_max_resume_store() {
+        // The function stores resume index 2 (`mov byte [rax+0x11], 2`), so state 2 exists —
+        // but the read table only reaches state 1 (its last entry was dropped/unmapped). The
+        // dense `[0,1]` prefix must be rejected rather than committing a switch missing state 2.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_jump_table_cfg(vec![]);
+        let mut b0 = BasicBlock::new(r0, 0x50e);
+        b0.end = 0x510;
+        let mut b1 = BasicBlock::new(r1, 0x608);
+        b1.end = 0x610;
+        cfg.add_block(b0);
+        cfg.add_block(b1);
+        // A body block arms resume index 2, so state 2 exists.
+        set_max_resume_store(cfg.block_mut(r0).unwrap(), 2);
+        // Only 2 mapped entries (states 0,1); state 2's target (0x700) has no block.
+        let ctx = jump_table_binary(&[0x50e, 0x608, 0x700]);
+        assert!(
+            rewrite_clang_resume_dispatch(&cfg, None, Some(&ctx)).is_none(),
+            "a table missing the max resume state must decline"
+        );
+    }
+
+    #[test]
+    fn rewrite_completes_incomplete_possible_targets() {
+        // The CFG builder populated `possible_targets` but MISSED r1. The resolved table
+        // (r0, r1) must be merged in so every resume state is connected.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_jump_table_cfg(vec![r0]); // incomplete: r1 missing
+        let mut b0 = BasicBlock::new(r0, 0x50e);
+        b0.end = 0x510;
+        let mut b1 = BasicBlock::new(r1, 0x608);
+        b1.end = 0x610;
+        cfg.add_block(b0);
+        cfg.add_block(b1);
+        let ctx = jump_table_binary(&[0x50e, 0x608]);
+        let out = rewrite_clang_resume_dispatch(&cfg, None, Some(&ctx)).expect("resolved");
+        let succ = out.cfg.successors(BasicBlockId::new(1));
+        assert!(
+            succ.contains(&r0) && succ.contains(&r1),
+            "the missing resolved target must be merged in, got {succ:?}"
+        );
+    }
+
+    #[test]
+    fn rewrite_reads_grouped_duplicate_table_entries() {
+        // States 0 and 2 both resume at r0, state 1 at r1: `[r0, r1, r0]`. Reading the table
+        // groups the duplicate into `case [0,2] -> r0`, so all three states are covered
+        // (dense 0..2) — the deduped-`possible_targets` path would have dropped state 2.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_jump_table_cfg(vec![]);
+        let mut b0 = BasicBlock::new(r0, 0x50e);
+        b0.end = 0x510;
+        let mut b1 = BasicBlock::new(r1, 0x608);
+        b1.end = 0x610;
+        cfg.add_block(b0);
+        cfg.add_block(b1);
+        let ctx = jump_table_binary(&[0x50e, 0x608, 0x50e]);
+        assert!(
+            rewrite_clang_resume_dispatch(&cfg, None, Some(&ctx)).is_some(),
+            "a dense table with duplicate targets must resolve via the real read"
+        );
+    }
+
+    #[test]
+    fn rewrite_declines_unresolvable_jump_table() {
+        // A jump table indexed by the resume field (linkage holds) but with no binary data to
+        // read the `.rodata` table from is genuinely unresolvable: the deduped
+        // `possible_targets` fallback is NOT accepted (it can drop states), so no complete
+        // dispatch switch is proven. The rewrite must decline rather than commit an incorrect
+        // `frame->__resume_index` switch.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_jump_table_cfg(vec![r0, r1]); // targets known, but table unreadable
+        cfg.add_block(BasicBlock::new(r0, 0x50e));
+        cfg.add_block(BasicBlock::new(r1, 0x608));
+        assert!(
+            rewrite_clang_resume_dispatch(&cfg, None, None).is_none(),
+            "a jump table whose entries can't be read must decline, not use deduped targets"
+        );
+    }
+
+    #[test]
+    fn rewrite_declines_jump_table_not_indexed_by_resume_field() {
+        // A `.resume` clone whose tail reads a small frame field but whose indirect jump is
+        // driven by something ELSE (no table load indexed by the resume index) is not a real
+        // resume dispatch. Even with resolvable targets, the rewrite must decline so the
+        // naming pass can't rename an unrelated computed switch as `frame->__resume_index`.
+        let (r0, r1) = (BasicBlockId::new(2), BasicBlockId::new(3));
+        let mut cfg = shape_a_cfg(r0, r1); // reads [rax+0x11] but no table load using it
         cfg.add_block(BasicBlock::new(r0, 0x50e));
         cfg.add_block(BasicBlock::new(r1, 0x608));
         cfg.block_mut(BasicBlockId::new(1)).unwrap().terminator = BlockTerminator::IndirectJump {
-            target: Operand::Register(r(0, 64)),
+            target: Operand::Register(r(1, 64)), // jumps on rcx, unrelated to the index read
             possible_targets: vec![r0, r1],
         };
-        assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+        assert!(
+            rewrite_clang_resume_dispatch(&cfg, None, None).is_none(),
+            "a jump not indexed by the resume field must decline"
+        );
+    }
+
+    // A dispatch block that reloads the frame ptr and reads the resume index into `eax`,
+    // then runs `tail`, with `terminator`. `frame_slots` = [(rbp, -0x70)].
+    fn index_read_dispatch(tail: Vec<Instruction>, terminator: BlockTerminator) -> (BasicBlock, Vec<SpillSlot>) {
+        let (rbp, rax, eax) = (r(5, 64), r(0, 64), r(0, 32));
+        let mut b = BasicBlock::new(BasicBlockId::new(1), 0xd12);
+        b.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+        ));
+        b.instructions.push(mov(
+            Operand::Register(eax),
+            Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)),
+        ));
+        b.instructions.extend(tail);
+        b.terminator = terminator;
+        (b, vec![(canon_reg(rbp.name()), -0x70)])
+    }
+
+    fn op(mnem: &str, operation: Operation, operands: Vec<Operand>) -> Instruction {
+        Instruction::new(0, 1, vec![], mnem)
+            .with_operation(operation)
+            .with_operands(operands)
+    }
+
+    #[test]
+    fn linkage_declines_direct_indexed_jump_terminator() {
+        // `jmp *table(,%idx,8)` — the indexed memory operand is on the terminator itself.
+        // `SwitchRecovery` only scans block instructions for the table base, so it can't
+        // resolve this form; the linkage must therefore not accept it (else the rewrite would
+        // claim recovery the resolver then declines). clang -O0 never emits this form.
+        let (rcx, rax) = (r(1, 64), r(0, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![],
+            BlockTerminator::IndirectJump {
+                target: Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 8, 0, 8)),
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_follows_aarch64_store_spill_reload() {
+        // aarch64 spills the index via `str`/`Store` (source-first operands), reloads it,
+        // then loads the table. The Store must be recorded as a spill, not a clobber.
+        let (rbp, rax, rcx) = (r(5, 64), r(0, 64), r(1, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                // str rax, [rbp-0x120]   (Store: [src, mem])
+                op(
+                    "str",
+                    Operation::Store,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::base_disp(rbp, -0x120, 8)),
+                    ],
+                ),
+                // ldr rax, [rbp-0x120]
+                op(
+                    "ldr",
+                    Operation::Load,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::base_disp(rbp, -0x120, 8)),
+                    ],
+                ),
+                // ldr rax, [rcx + rax*8]  (table load indexed by the index)
+                op(
+                    "ldr",
+                    Operation::Load,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 8, 0, 8)),
+                    ],
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_accepts_lea_materialized_target() {
+        // clang can fuse the base-add: `movsxd rax,[rcx+rax*4]; lea rax,[rcx+rax]; jmp *rax`.
+        // The LEA (not an `add`) forms the absolute target from the table-loaded value.
+        let (rcx, rax) = (r(1, 64), r(0, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                // movsxd rax, [rcx + rax*4]  (table load)
+                op(
+                    "movsxd",
+                    Operation::SignExtend,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+                    ],
+                ),
+                // lea rax, [rcx + rax]  (absolute target = base + table result)
+                op(
+                    "lea",
+                    Operation::LoadEffectiveAddress,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 1, 0, 8)),
+                    ],
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_declines_when_target_overwritten_by_immediate_move() {
+        // `movsxd rax,[table+idx*4]; mov rax, 0; jmp *rax` — the immediate move overwrites
+        // the table target, so the jump is no longer index-driven.
+        let (rcx, rax) = (r(1, 64), r(0, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                op(
+                    "movsxd",
+                    Operation::SignExtend,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+                    ],
+                ),
+                // mov rax, 0  (immediate source: still writes rax, clearing its target status)
+                mov(
+                    Operand::Register(rax),
+                    Operand::Immediate(hexray_core::Immediate { value: 0, size: 8, signed: false }),
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_declines_when_target_overwritten_by_non_memory_lea() {
+        // An `lea` whose second operand is not a `[base+index]` memory form still writes its
+        // destination, so a table target previously there is cleared.
+        let (rcx, rax, rbx) = (r(1, 64), r(0, 64), r(3, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                op(
+                    "movsxd",
+                    Operation::SignExtend,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+                    ],
+                ),
+                // lea rax, rbx  (non-memory second operand — clobbers rax)
+                op(
+                    "lea",
+                    Operation::LoadEffectiveAddress,
+                    vec![Operand::Register(rax), Operand::Register(rbx)],
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_declines_sub_target_adjustment() {
+        // `movsxd rax,[table+idx*4]; sub rax, rcx; jmp rax` — the resolver models
+        // `table_base + entry`, never a subtraction, so a `sub` adjustment must not keep the
+        // register as a jump target (the resolver would wire cases to the wrong addresses).
+        let (rcx, rax) = (r(1, 64), r(0, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                op(
+                    "movsxd",
+                    Operation::SignExtend,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+                    ],
+                ),
+                op(
+                    "sub",
+                    Operation::Sub,
+                    vec![Operand::Register(rax), Operand::Register(rcx)],
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_declines_subregister_index_read() {
+        // `mov al, [frame+0x11]` defines only the low 8 bits; using the full `rax` as the
+        // table index would read stale upper bits, so this is not a valid index.
+        let (rax, al, rcx, rbp) = (r(0, 64), r(0, 8), r(1, 64), r(5, 64));
+        let mut b = BasicBlock::new(BasicBlockId::new(1), 0xd12);
+        b.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+        ));
+        // mov al, [rax+0x11]  — subregister (8-bit) read
+        b.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)),
+        ));
+        // mov rax, [rcx + rax*4]  (table load indexed by the full, partly-stale rax)
+        b.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+        ));
+        b.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        let slots = vec![(canon_reg(rbp.name()), -0x70)];
+        assert!(!dispatch_jump_indexed_by_resume_read(&b, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn rewrite_declines_two_byte_index_jump_table() {
+        // A 2-byte resume index could address > 256 states, but the resolver has no bounds
+        // check and defaults to 256 entries — committing would truncate the higher states.
+        // Build a jump-table dispatch whose index read is 2 bytes and confirm it declines.
+        let (rbp, rdi, rax, eax) = (r(5, 64), r(7, 64), r(0, 64), r(0, 32));
+        let entry_id = BasicBlockId::new(0);
+        let dispatch_id = BasicBlockId::new(1);
+        let mut cfg = ControlFlowGraph::new(entry_id);
+        let mut entry = BasicBlock::new(entry_id, 0x400);
+        entry.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+            Operand::Register(rdi),
+        ));
+        entry.terminator = BlockTerminator::Jump { target: dispatch_id };
+        cfg.add_block(entry);
+        let mut dispatch = BasicBlock::new(dispatch_id, 0xd12);
+        dispatch.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+        ));
+        // movzwl eax, [rax+0x11]  — a 2-byte index read
+        dispatch.instructions.push(mov(
+            Operand::Register(eax),
+            Operand::Memory(MemoryRef::base_disp(rax, 0x11, 2)),
+        ));
+        dispatch.instructions.push(mov(
+            Operand::Register(rax),
+            Operand::Memory(MemoryRef::sib(None, Some(rax), 4, JT_BASE as i64, 4)),
+        ));
+        dispatch.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(dispatch);
+        let mut b0 = BasicBlock::new(BasicBlockId::new(2), 0x50e);
+        b0.end = 0x510;
+        let mut b1 = BasicBlock::new(BasicBlockId::new(3), 0x608);
+        b1.end = 0x610;
+        cfg.add_block(b0);
+        cfg.add_block(b1);
+        let ctx = jump_table_binary(&[0x50e, 0x608]);
+        assert!(
+            rewrite_clang_resume_dispatch(&cfg, None, Some(&ctx)).is_none(),
+            "a 2-byte index jump table must decline (table size can't be bounded)"
+        );
+    }
+
+    #[test]
+    fn linkage_declines_three_operand_add_overwriting_target() {
+        // aarch64 `add x0, x2, #8` fully OVERWRITES x0 (it is not read), so a table target
+        // previously in x0 is gone. `br x0` then jumps to an unrelated address.
+        let (rcx, rax, rdx) = (r(1, 64), r(0, 64), r(2, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                // ldr rax, [rcx + rax*8]  (table load -> rax is a target)
+                op(
+                    "ldr",
+                    Operation::Load,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 8, 0, 8)),
+                    ],
+                ),
+                // add rax, rdx, #8  (3-operand: rax := rdx + 8, overwriting the target)
+                op(
+                    "add",
+                    Operation::Add,
+                    vec![
+                        Operand::Register(rax),
+                        Operand::Register(rdx),
+                        Operand::Immediate(hexray_core::Immediate { value: 8, size: 8, signed: false }),
+                    ],
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_declines_reload_after_slot_overwritten() {
+        // `mov [slot], idx ; mov [slot], 0 ; mov rax, [slot]` — the slot no longer holds the
+        // index when reloaded, so the reload must NOT be treated as the resume index.
+        let (rbp, rax, rcx) = (r(5, 64), r(0, 64), r(1, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                // mov [rbp-0x120], eax  (spill index)
+                mov(
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x120, 8)),
+                    Operand::Register(r(0, 32)),
+                ),
+                // mov [rbp-0x120], 0   (overwrite the slot with a non-index value)
+                mov(
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x120, 8)),
+                    Operand::Immediate(hexray_core::Immediate { value: 0, size: 8, signed: false }),
+                ),
+                // mov rax, [rbp-0x120]  (reload — NOT the index any more)
+                mov(
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -0x120, 8)),
+                ),
+                // mov rax, [rcx + rax*4]  (indexed load using the stale value)
+                mov(
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rax),
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
+    }
+
+    #[test]
+    fn linkage_declines_unrelated_indexed_load_then_other_jump() {
+        // An indexed load USES the index register but its result never reaches the jump; the
+        // indirect jump goes through an unrelated register. Must NOT be taken as a dispatch.
+        let (rcx, rax, rdx, rsi) = (r(1, 64), r(0, 64), r(2, 64), r(6, 64));
+        let (dispatch, slots) = index_read_dispatch(
+            vec![
+                // mov rdx, [rcx + rax*4]  — an indexed load into rdx (unrelated to the jump)
+                op(
+                    "mov",
+                    Operation::Move,
+                    vec![
+                        Operand::Register(rdx),
+                        Operand::Memory(MemoryRef::sib(Some(rcx), Some(rax), 4, 0, 4)),
+                    ],
+                ),
+            ],
+            BlockTerminator::IndirectJump {
+                target: Operand::Register(rsi), // jumps through rsi, not the table result
+                possible_targets: vec![],
+            },
+        );
+        assert!(!dispatch_jump_indexed_by_resume_read(&dispatch, 0x11, 1, &slots));
     }
 
     #[test]
@@ -1687,7 +2790,7 @@ mod tests {
         {
             *condition = Condition::NotEqual;
         }
-        let rewritten = rewrite_clang_resume_dispatch(&cfg, None).expect("rewritten").cfg;
+        let rewritten = rewrite_clang_resume_dispatch(&cfg, None, None).expect("rewritten").cfg;
         match &rewritten.block(BasicBlockId::new(1)).unwrap().terminator {
             BlockTerminator::IndirectJump {
                 possible_targets, ..
@@ -1726,7 +2829,7 @@ mod tests {
             1,
             &x_frame_slots()
         ));
-        assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+        assert!(rewrite_clang_resume_dispatch(&cfg, None, None).is_none());
     }
 
     #[test]
@@ -1821,7 +2924,7 @@ mod tests {
             1,
             &x_frame_slots()
         ));
-        assert!(rewrite_clang_resume_dispatch(&cfg, None).is_none());
+        assert!(rewrite_clang_resume_dispatch(&cfg, None, None).is_none());
     }
 
     fn imm1(bits: u8) -> Operand {

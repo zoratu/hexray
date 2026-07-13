@@ -1238,13 +1238,19 @@ impl Decompiler {
         // resume-point bodies away to `return`). Rewrite it into an explicit switch
         // region first so each resume-point body survives structuring.
         let coro_rewritten = if coroutine::is_coroutine_resume_clone(func_name) {
-            coroutine_cfg::rewrite_clang_resume_dispatch(cfg, self.relocation_table.as_ref())
+            coroutine_cfg::rewrite_clang_resume_dispatch(
+                cfg,
+                self.relocation_table.as_ref(),
+                self.binary_data.as_deref(),
+            )
         } else {
             None
         };
         // The resume-index offset from the rewrite, used later to name the recovered
         // switch value `frame->__resume_index` (only set when the rewrite fired).
-        let clang_resume_offset = coro_rewritten.as_ref().map(|r| r.index_offset);
+        let clang_resume_offset = coro_rewritten
+            .as_ref()
+            .map(|r| (r.index_offset, r.two_way_default));
         let cfg = coro_rewritten.as_ref().map(|r| &r.cfg).unwrap_or(cfg);
         let structured = self.structure(cfg);
 
@@ -1390,7 +1396,9 @@ impl Decompiler {
             // For clang `.resume` clones recovered by the CFG-level rewrite, name the
             // synthetic `switch(switch_value)` as `switch(frame->__resume_index)`.
             let body = match clang_resume_offset {
-                Some(offset) => coroutine::name_clang_resume_switch(body, offset),
+                Some((offset, two_way_default)) => {
+                    coroutine::name_clang_resume_switch(body, offset, two_way_default)
+                }
                 None => body,
             };
             let recovered = coroutine::body_has_resume_switch(&body);

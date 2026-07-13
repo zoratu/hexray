@@ -23,6 +23,15 @@ use super::expression::{BinOpKind, Expr, ExprKind};
 use super::structurer::StructuredNode;
 use super::BinaryDataContext;
 
+/// Whether a register is the STACK pointer (x86 `rsp`/`esp`/`sp`, aarch64 `sp`). A
+/// bounds-check comparison never targets it, so a prologue `sub rsp, K` must not be mistaken
+/// for a jump-table bounds check. The frame pointer (`rbp`/`x29`) is deliberately NOT
+/// excluded: with the frame pointer omitted it is an ordinary callee-saved register that can
+/// legitimately hold the switch index (`cmp ebp, 3; ja default`).
+fn is_stack_pointer(name: &str) -> bool {
+    matches!(name.to_lowercase().as_str(), "rsp" | "esp" | "sp")
+}
+
 /// Information about a detected switch statement.
 #[derive(Debug, Clone)]
 pub struct SwitchInfo {
@@ -119,6 +128,45 @@ impl<'a> SwitchRecovery<'a> {
         None
     }
 
+    /// Recover a jump-table switch ONLY when its entries were actually read from binary
+    /// data — never the deduplicated `possible_targets` fallback used by
+    /// [`Self::try_recover_switch`]. The fallback collapses duplicate table entries (states
+    /// sharing a resume block) into unique targets with sequential labels, dropping states;
+    /// callers that must not mislabel states (e.g. coroutine resume-dispatch recovery) use
+    /// this to require the complete, correctly-grouped case labels.
+    ///
+    /// When the table is explicitly BOUNDED (a real `cmp idx, N; ja default` bounds check
+    /// sized it), every one of its `N+1` entries must map to a block: if `read_jump_table`
+    /// dropped any (e.g. a target with no CFG block), the read is incomplete and would
+    /// silently omit a state, so this returns `None` rather than a truncated switch.
+    pub fn try_recover_switch_read_from_binary(&self, block_id: BasicBlockId) -> Option<SwitchInfo> {
+        let block = self.cfg.block(block_id)?;
+        if !matches!(block.terminator, BlockTerminator::IndirectJump { .. }) {
+            return None;
+        }
+        let (switch_var, bound_check, table_info, bounds_checked) =
+            self.analyze_jump_table_block(block)?;
+        let cases = self.read_jump_table(&table_info)?;
+        // A REAL bounds check pins the exact entry count, so require all of those entries to
+        // have mapped — no bounded state may be silently dropped. (Keyed off the actual
+        // presence of a `cmp`/`sub`, NOT `entry_count < 256`: a genuine `cmp idx, 255` also
+        // sizes 256 entries yet must still be checked.) Without a bounds check the entry count
+        // is an over-approximation — trailing garbage entries legitimately drop out — so
+        // completeness is instead the caller's dense-`0..N-1` contiguity requirement.
+        if bounds_checked {
+            let mapped: usize = cases.iter().map(|(values, _)| values.len()).sum();
+            if mapped != table_info.entry_count as usize {
+                return None;
+            }
+        }
+        Some(SwitchInfo {
+            switch_value: switch_var,
+            cases,
+            default: bound_check.map(|(_, default)| default),
+            kind: SwitchKind::JumpTable,
+        })
+    }
+
     /// Detects a jump table switch pattern.
     ///
     /// Jump table pattern (x86_64):
@@ -153,7 +201,8 @@ impl<'a> SwitchRecovery<'a> {
         };
 
         // Analyze the block to find the comparison and table access pattern
-        let (switch_var, bound_check, table_info) = self.analyze_jump_table_block(block)?;
+        let (switch_var, bound_check, table_info, _bounds_checked) =
+            self.analyze_jump_table_block(block)?;
 
         // Try to read actual case values from the jump table (requires binary data).
         // This gives us the correct case values instead of just sequential indices.
@@ -184,12 +233,14 @@ impl<'a> SwitchRecovery<'a> {
 
     /// Analyzes a block to extract jump table information.
     ///
-    /// Returns (switch_variable, (max_value, default_block), jump_table_info)
+    /// Returns (switch_variable, (max_value, default_block), jump_table_info, bounds_checked).
+    /// `bounds_checked` is true only when a real `cmp`/`sub` bounds check sized the table (the
+    /// returned `(max_value, default_block)` otherwise falls back to a 255/entry-0 default).
     #[allow(clippy::type_complexity)]
     fn analyze_jump_table_block(
         &self,
         block: &BasicBlock,
-    ) -> Option<(Expr, Option<(i64, BasicBlockId)>, JumpTableInfo)> {
+    ) -> Option<(Expr, Option<(i64, BasicBlockId)>, JumpTableInfo, bool)> {
         let mut switch_var: Option<Expr> = None;
         let mut bound_check: Option<(i64, BasicBlockId)> = None;
         let mut table_base: Option<u64> = None;
@@ -264,7 +315,15 @@ impl<'a> SwitchRecovery<'a> {
                 match inst.operation {
                     // Look for comparison (bounds check) - but only if we don't have one yet
                     Operation::Compare | Operation::Sub => {
-                        if bound_check.is_none() && inst.operands.len() >= 2 {
+                        // A bounds check compares the SWITCH VALUE; a prologue `sub rsp, K`
+                        // is NOT one, even though its immediate is small — exclude ops on the
+                        // stack pointer so they aren't mistaken for a bound. (The frame
+                        // pointer is left in play: it can be a general-purpose index register.)
+                        let on_stack_ptr = matches!(
+                            inst.operands.first(),
+                            Some(Operand::Register(reg)) if is_stack_pointer(reg.name())
+                        );
+                        if bound_check.is_none() && !on_stack_ptr && inst.operands.len() >= 2 {
                             // Check if second operand is an immediate that looks like a small switch bound
                             // (large values like stack frame size should be ignored)
                             if let Operand::Immediate(imm) = &inst.operands[1] {
@@ -393,6 +452,7 @@ impl<'a> SwitchRecovery<'a> {
         let table_base = table_base?;
 
         // Construct jump table info
+        let bounds_checked = bound_check.is_some();
         let (max_value, default_block) = bound_check.unwrap_or((255, BasicBlockId::new(0)));
         let table_info = JumpTableInfo {
             table_base,
@@ -412,7 +472,12 @@ impl<'a> SwitchRecovery<'a> {
             })
         });
 
-        Some((switch_var, Some((max_value, default_block)), table_info))
+        Some((
+            switch_var,
+            Some((max_value, default_block)),
+            table_info,
+            bounds_checked,
+        ))
     }
 
     fn extract_absolute_table_base(mem: &hexray_core::MemoryRef) -> Option<u64> {
@@ -1006,9 +1071,10 @@ mod tests {
 
         let recovery = SwitchRecovery::new(&cfg);
         let block = cfg.block(BasicBlockId::new(1)).expect("jump table block");
-        let (switch_var, bound_check, table_info) = recovery
+        let (switch_var, bound_check, table_info, bounds_checked) = recovery
             .analyze_jump_table_block(block)
             .expect("jump table should be recognized");
+        assert!(bounds_checked, "a real cmp bounds check was present");
 
         assert_eq!(table_info.table_base, 0x402008);
         assert_eq!(table_info.entry_size, 8);
@@ -1018,6 +1084,235 @@ mod tests {
             format!("{switch_var}").contains("rbp + -0x4"),
             "expected switch value to come from the compared stack slot, got {switch_var}"
         );
+    }
+
+    /// Build a bounded (`cmp idx, 2`) 3-entry absolute jump table whose entries are `targets`
+    /// (8-byte addresses). Returns the CFG plus a binary context holding the table.
+    #[cfg(test)]
+    fn bounded_jump_table(targets: [u64; 3]) -> (ControlFlowGraph, super::super::BinaryDataContext) {
+        use hexray_core::{
+            Architecture, BasicBlock, BlockTerminator, Instruction, MemoryRef, Operand, Operation,
+            Register, RegisterClass,
+        };
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut pred = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        pred.push_instruction(
+            Instruction::new(0x1000, 4, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Memory(MemoryRef::base_disp(rbp, -4, 4)),
+                    Operand::imm_unsigned(2, 32),
+                ]),
+        );
+        pred.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Above,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(pred);
+
+        let mut jump = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        jump.push_instruction(
+            Instruction::new(0x1010, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -4, 4)),
+                ]),
+        );
+        jump.push_instruction(
+            Instruction::new(0x1013, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(None, Some(rax), 8, 0x402008, 8)),
+                ]),
+        );
+        jump.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(jump);
+
+        let mut default = BasicBlock::new(BasicBlockId::new(2), 0x40118d);
+        default.terminator = BlockTerminator::Return;
+        cfg.add_block(default);
+        // Edges so the bounds-check predecessor is found (sizes the table to 3 entries).
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        // Resume-state blocks the table can point at.
+        for (i, id) in [3u32, 4].into_iter().enumerate() {
+            let start = 0x500000 + (i as u64) * 0x10;
+            let mut b = BasicBlock::new(BasicBlockId::new(id), start);
+            b.end = start + 1;
+            cfg.add_block(b);
+        }
+
+        let mut data = vec![0u8; 3 * 8];
+        for (i, &t) in targets.iter().enumerate() {
+            data[i * 8..i * 8 + 8].copy_from_slice(&t.to_le_bytes());
+        }
+        let mut ctx = super::super::BinaryDataContext::new();
+        ctx.add_section(0x402008, data);
+        (cfg, ctx)
+    }
+
+    #[test]
+    fn prologue_sub_rsp_is_not_a_table_bound() {
+        // An unbounded table whose only `sub` is a prologue `sub rsp, 0x70` must NOT be
+        // treated as bounded (which would wrongly demand 0x71 mapped entries). The 2-entry
+        // read must still resolve.
+        use hexray_core::{
+            Architecture, BasicBlock, BlockTerminator, Instruction, MemoryRef, Operand, Operation,
+            Register, RegisterClass,
+        };
+        let (rbp, rsp, eax, rax) = (
+            Register::new(Architecture::X86_64, RegisterClass::General, 5, 64),
+            Register::new(Architecture::X86_64, RegisterClass::General, 4, 64),
+            Register::new(Architecture::X86_64, RegisterClass::General, 0, 32),
+            Register::new(Architecture::X86_64, RegisterClass::General, 0, 64),
+        );
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        // entry: sub rsp, 0x70 ; jmp dispatch  (prologue only, no real bounds check)
+        let mut entry = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        entry.push_instruction(
+            Instruction::new(0x1000, 7, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![Operand::Register(rsp), Operand::imm_unsigned(0x70, 32)]),
+        );
+        entry.terminator = BlockTerminator::Jump { target: BasicBlockId::new(1) };
+        cfg.add_block(entry);
+        // dispatch: mov eax,[rbp-4] ; mov rax,[0x402008 + rax*8] ; jmp rax
+        let mut jump = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        jump.push_instruction(
+            Instruction::new(0x1010, 3, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -4, 4)),
+                ]),
+        );
+        jump.push_instruction(
+            Instruction::new(0x1013, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(None, Some(rax), 8, 0x402008, 8)),
+                ]),
+        );
+        jump.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(jump);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        for (i, id) in [2u32, 3].into_iter().enumerate() {
+            let start = 0x500000 + (i as u64) * 0x10;
+            let mut b = BasicBlock::new(BasicBlockId::new(id), start);
+            b.end = start + 1;
+            cfg.add_block(b);
+        }
+        let mut data = vec![0u8; 3 * 8];
+        data[0..8].copy_from_slice(&0x500000u64.to_le_bytes());
+        data[8..16].copy_from_slice(&0x500010u64.to_le_bytes());
+        let mut ctx = super::super::BinaryDataContext::new();
+        ctx.add_section(0x402008, data);
+
+        let recovery = SwitchRecovery::new(&cfg).with_binary_context(&ctx);
+        let (_, _, _, bounds_checked) = recovery
+            .analyze_jump_table_block(cfg.block(BasicBlockId::new(1)).unwrap())
+            .expect("recognized");
+        assert!(!bounds_checked, "a prologue sub rsp must not count as a bounds check");
+        assert!(
+            recovery
+                .try_recover_switch_read_from_binary(BasicBlockId::new(1))
+                .is_some(),
+            "the 2-entry table must resolve despite the prologue sub"
+        );
+    }
+
+    #[test]
+    fn rbp_as_index_bounds_check_is_kept() {
+        // With the frame pointer omitted, `rbp`/`ebp` is a general-purpose register that can
+        // hold the switch index. `cmp ebp, 3` in a predecessor is a real bounds check and must
+        // still be recognized (max_value 3, real default), not discarded like `sub rsp`.
+        use hexray_core::{
+            Architecture, BasicBlock, BlockTerminator, Instruction, MemoryRef, Operand, Operation,
+            Register, RegisterClass,
+        };
+        let ebp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 32);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut pred = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        pred.push_instruction(
+            Instruction::new(0x1000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(ebp), Operand::imm_unsigned(3, 32)]),
+        );
+        pred.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Above,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(pred);
+        let mut jump = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        jump.push_instruction(
+            Instruction::new(0x1010, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(None, Some(rax), 8, 0x402008, 8)),
+                ]),
+        );
+        jump.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(jump);
+        let mut default = BasicBlock::new(BasicBlockId::new(2), 0x2000);
+        default.terminator = BlockTerminator::Return;
+        cfg.add_block(default);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        let recovery = SwitchRecovery::new(&cfg);
+        let (_, bound_check, table_info, bounds_checked) = recovery
+            .analyze_jump_table_block(cfg.block(BasicBlockId::new(1)).unwrap())
+            .expect("recognized");
+        assert!(bounds_checked, "cmp ebp, 3 is a real bounds check");
+        assert_eq!(bound_check, Some((3, BasicBlockId::new(2))));
+        assert_eq!(table_info.entry_count, 4);
+    }
+
+    #[test]
+    fn read_from_binary_declines_bounded_table_with_unmapped_entry() {
+        // A bounded 3-entry table (`cmp idx, 2`) where entry 2 points at an address with no
+        // block: the read is incomplete (a bounded state is dropped), so it must decline.
+        let (cfg, ctx) = bounded_jump_table([0x500000, 0x500010, 0xdead_beef]);
+        let recovery = SwitchRecovery::new(&cfg).with_binary_context(&ctx);
+        assert!(
+            recovery
+                .try_recover_switch_read_from_binary(BasicBlockId::new(1))
+                .is_none(),
+            "an incomplete bounded table read must decline"
+        );
+    }
+
+    #[test]
+    fn read_from_binary_accepts_bounded_table_all_entries_mapped() {
+        // All 3 bounded entries map (state 2 shares state 0's block): recovery succeeds.
+        let (cfg, ctx) = bounded_jump_table([0x500000, 0x500010, 0x500000]);
+        let recovery = SwitchRecovery::new(&cfg).with_binary_context(&ctx);
+        let info = recovery
+            .try_recover_switch_read_from_binary(BasicBlockId::new(1))
+            .expect("complete bounded table should resolve");
+        let labels: usize = info.cases.iter().map(|(v, _)| v.len()).sum();
+        assert_eq!(labels, 3, "all three bounded entries must be present");
     }
 
     #[test]

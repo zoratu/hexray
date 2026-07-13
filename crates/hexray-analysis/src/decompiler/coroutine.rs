@@ -113,7 +113,11 @@ pub fn recover_resume_dispatch(body: Vec<StructuredNode>) -> Vec<StructuredNode>
 /// consume it). So the offset is threaded in here and the placeholder is replaced
 /// directly with the named field, committing the recovery. Returns the body unchanged
 /// when the frame parameter can't be identified or no synthetic switch is present.
-pub fn name_clang_resume_switch(body: Vec<StructuredNode>, offset: i64) -> Vec<StructuredNode> {
+pub fn name_clang_resume_switch(
+    body: Vec<StructuredNode>,
+    offset: i64,
+    two_way_default: bool,
+) -> Vec<StructuredNode> {
     // Naming the switch value needs the frame parameter; the two-way `default` shaping
     // does NOT. Compute the name when the frame is identifiable, but shape the switch
     // either way so a `.resume` clone whose frame this structured pass can't recognize
@@ -122,12 +126,13 @@ pub fn name_clang_resume_switch(body: Vec<StructuredNode>, offset: i64) -> Vec<S
         .map(|frame| named_state_expr(&frame, &StateField { offset }));
     let mut nodes = body;
     let mut done = false;
-    shape_first_spine_switch(&mut nodes, named.as_ref(), &mut done);
+    shape_first_spine_switch(&mut nodes, named.as_ref(), two_way_default, &mut done);
     nodes
 }
 
-/// Shape the resume-dispatch `switch (switch_value)`: turn its two-way nonzero edge into
-/// `default`, and (when `named` is available) replace the opaque value placeholder.
+/// Shape the resume-dispatch switch: when `named` is available replace the opaque value
+/// placeholder, and (only for the compare-chain 2-state shape, `two_way_default`) turn its
+/// two-way nonzero edge into `default`. A jump-table dispatch keeps its explicit cases.
 ///
 /// The structurer's indirect-jump fallback labels EVERY unrecovered computed switch with
 /// the same `Unknown("switch_value")` placeholder, so a nested/user switch inside a
@@ -137,7 +142,12 @@ pub fn name_clang_resume_switch(body: Vec<StructuredNode>, offset: i64) -> Vec<S
 /// [`flatten_spine_sequences`] normalizes). So descend only that spine and shape the
 /// FIRST synthetic switch found, never recursing into switch cases, loops, or try-blocks
 /// where unrelated computed switches live.
-fn shape_first_spine_switch(nodes: &mut [StructuredNode], named: Option<&Expr>, done: &mut bool) {
+fn shape_first_spine_switch(
+    nodes: &mut [StructuredNode],
+    named: Option<&Expr>,
+    two_way_default: bool,
+    done: &mut bool,
+) {
     for node in nodes.iter_mut() {
         if *done {
             return;
@@ -148,35 +158,54 @@ fn shape_first_spine_switch(nodes: &mut [StructuredNode], named: Option<&Expr>, 
                 cases,
                 default,
             } => {
-                if matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value") {
-                    // Name the value if the frame was identified (otherwise leave the
-                    // placeholder — recovery is not committed, but control flow is right).
+                // The resume dispatch is the FIRST switch on the spine (the entry jumps
+                // straight to it). This pass runs only when the CFG rewrite fired, and for
+                // the jump-table shape that rewrite already proved the table RESOLVES (so
+                // its dispatch switch is guaranteed to have formed). As defense-in-depth we
+                // still require a shape-specific signature before touching the switch — so a
+                // stray non-dispatch switch is never renamed to `frame->__resume_index` (nor
+                // its `case 1` folded into `default`) — and stop scanning either way (never
+                // descend past the first spine switch).
+                let is_dispatch = if two_way_default {
+                    // Compare-chain: the CFG rewrite labels its synthetic dispatch with the
+                    // opaque `switch_value` placeholder. A user switch carries a real value.
+                    matches!(&value.kind, ExprKind::Unknown(s) if s == "switch_value")
+                } else {
+                    // Jump table: the dispatch switches over the dense resume states
+                    // `0..N-1` (state 0 is the initial suspend, always present, and a jump
+                    // table is emitted precisely because the states are contiguous). An
+                    // unrelated user switch with sparse/offset labels fails this.
+                    cases_are_dense_from_zero(cases)
+                };
+                if is_dispatch {
                     if let Some(named) = named {
                         *value = named.clone();
                     }
-                    // The resume dispatch is a two-way `test idx,idx; je state0` recovered
-                    // as `case 0` / `case 1`. The second (nonzero) edge runs for EVERY
-                    // value != 0, so present it as `default` rather than a `case 1` that
-                    // would skip it for other values. This does not depend on naming.
-                    if default.is_none() && cases.len() == 2 {
+                    // Two-way `default` shaping applies ONLY to the compare-chain 2-state
+                    // shape: `test idx,idx; je state0` runs the nonzero edge for EVERY value
+                    // != 0, so its `case 1` must become `default`. A jump table keeps its
+                    // explicit cases (even a 2-entry table stays `case 0`/`case 1`).
+                    if two_way_default && default.is_none() && cases.len() == 2 {
                         let (_, body) = cases.pop().expect("len checked");
                         *default = Some(body);
                     }
-                    *done = true;
                 }
-                // Whether or not this was the dispatch switch, do NOT descend into its
-                // cases: a nested computed switch there keeps its own placeholder.
+                *done = true;
+                // Do NOT descend into the cases: a nested computed switch there keeps its
+                // own placeholder.
                 return;
             }
-            StructuredNode::Sequence(inner) => shape_first_spine_switch(inner, named, done),
+            StructuredNode::Sequence(inner) => {
+                shape_first_spine_switch(inner, named, two_way_default, done)
+            }
             StructuredNode::If {
                 then_body,
                 else_body,
                 ..
             } => {
-                shape_first_spine_switch(then_body, named, done);
+                shape_first_spine_switch(then_body, named, two_way_default, done);
                 if let Some(b) = else_body {
-                    shape_first_spine_switch(b, named, done);
+                    shape_first_spine_switch(b, named, two_way_default, done);
                 }
             }
             // Off-spine (Block, loops, TryCatch, ...) — the resume dispatch is never
@@ -184,6 +213,27 @@ fn shape_first_spine_switch(nodes: &mut [StructuredNode], named: Option<&Expr>, 
             _ => {}
         }
     }
+}
+
+/// Whether a recovered switch's case labels are exactly the dense set `{0, 1, .., N-1}`,
+/// the signature of a clang coroutine jump-table resume dispatch: state 0 (the initial
+/// suspend) is always present and clang only emits a jump table when the resume states are
+/// contiguous. Labels are FLATTENED across cases first: switch recovery groups table
+/// entries that share a target block into one multi-label case (e.g. two states resuming
+/// at the same block yield `case [0, 2]` / `case [1]`), which is still a dense dispatch.
+/// Used to distinguish the dispatch from an unrelated user `switch` with sparse or offset
+/// labels, so the naming pass never renames the wrong switch if the real dispatch didn't
+/// form.
+fn cases_are_dense_from_zero(cases: &[(Vec<i128>, Vec<StructuredNode>)]) -> bool {
+    let mut labels: Vec<i128> = cases.iter().flat_map(|(values, _)| values.iter().copied()).collect();
+    if labels.is_empty() {
+        return false;
+    }
+    labels.sort_unstable();
+    labels
+        .iter()
+        .enumerate()
+        .all(|(i, &v)| v == i as i128)
 }
 
 /// Splice transparent `Sequence` wrappers inline throughout the dispatch spine
@@ -5361,7 +5411,7 @@ mod tests {
     fn names_synthetic_clang_switch_as_resume_index() {
         // The CFG-recovered clang dispatch is `switch (switch_value)`; naming it with
         // the known offset must produce `switch (frame->__resume_index)` and commit.
-        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11);
+        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11, true);
         assert!(body_has_resume_switch(&out), "recovery should commit: {out:?}");
         let StructuredNode::Switch { value, .. } = &out[1] else {
             panic!("expected switch, got {:?}", out[1]);
@@ -5376,7 +5426,7 @@ mod tests {
     fn clang_switch_nonzero_edge_becomes_default() {
         // The two-way dispatch's second (nonzero) edge must be the `default`, not a
         // `case 1` that would skip it for index values other than 1.
-        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11);
+        let out = name_clang_resume_switch(clang_synthetic_body(), 0x11, true);
         let StructuredNode::Switch { cases, default, .. } = &out[1] else {
             panic!("expected switch, got {:?}", out[1]);
         };
@@ -5385,9 +5435,11 @@ mod tests {
     }
 
     #[test]
-    fn name_clang_switch_leaves_genuine_switch_untouched() {
-        // A real switch (value is not the synthetic `switch_value` placeholder) must
-        // not be rewritten, even in a resume clone.
+    fn name_clang_switch_names_jump_table_recovered_value() {
+        // The dispatch switch of a jump-table `.resume` clone is recovered with an index
+        // value (e.g. `edx`/`val`), not the `switch_value` placeholder. It is still the
+        // FIRST switch on the spine (the entry jumps straight to it), so it must be named
+        // `frame->__resume_index`. Its explicit N cases are left as-is (no two-way default).
         let body = vec![
             block(vec![Expr::assign(
                 Expr::var(Variable::reg("rax", 8)),
@@ -5395,18 +5447,138 @@ mod tests {
             )]),
             StructuredNode::Switch {
                 value: Expr::var(Variable::reg("edx", 4)),
-                cases: vec![(vec![0], vec![block(vec![Expr::unknown("body0")])])],
+                cases: vec![
+                    (vec![0], vec![block(vec![Expr::unknown("state0")])]),
+                    (vec![1], vec![block(vec![Expr::unknown("state1")])]),
+                    (vec![2], vec![block(vec![Expr::unknown("state2")])]),
+                ],
                 default: None,
             },
         ];
-        let out = name_clang_resume_switch(body.clone(), 0x11);
+        let out = name_clang_resume_switch(body, 0x11, false);
+        let StructuredNode::Switch { value, cases, default } = &out[1] else {
+            panic!("expected switch");
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
+            "jump-table dispatch value should be named, got {value:?}"
+        );
+        assert_eq!(cases.len(), 3, "explicit cases kept for a jump table");
+        assert!(default.is_none(), "no two-way default for a >2-case jump table");
+    }
+
+    #[test]
+    fn name_clang_switch_names_jump_table_with_grouped_labels() {
+        // Switch recovery groups jump-table entries that share a target block into one
+        // multi-label case (`case [0, 2]` / `case [1]` when states 0 and 2 resume at the
+        // same block). That is still a dense `{0,1,2}` dispatch and must be named.
+        let body = vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::var(Variable::reg("edx", 4)),
+                cases: vec![
+                    (vec![0, 2], vec![block(vec![Expr::unknown("state0_2")])]),
+                    (vec![1], vec![block(vec![Expr::unknown("state1")])]),
+                ],
+                default: None,
+            },
+        ];
+        let out = name_clang_resume_switch(body, 0x11, false);
+        let StructuredNode::Switch { value, .. } = &out[1] else {
+            panic!("expected switch");
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::FieldAccess { field_name, .. } if field_name == RESUME_FIELD_NAME),
+            "a dense grouped-label jump table must be named, got {value:?}"
+        );
+        assert!(body_has_resume_switch(&out));
+    }
+
+    #[test]
+    fn name_clang_switch_two_entry_jump_table_keeps_both_cases() {
+        // A jump table with exactly two entries must stay `case 0`/`case 1`. Only the
+        // compare-chain shape (`two_way_default = true`) routes every nonzero value to the
+        // false edge; a 2-entry table's `case 1` is genuine, so passing `false` must NOT
+        // fold it into `default` (which would misroute indices != 1 to state 1).
+        let body = vec![
+            block(vec![Expr::assign(
+                Expr::var(Variable::reg("rax", 8)),
+                frame(),
+            )]),
+            StructuredNode::Switch {
+                value: Expr::var(Variable::reg("edx", 4)),
+                cases: vec![
+                    (vec![0], vec![block(vec![Expr::unknown("state0")])]),
+                    (vec![1], vec![block(vec![Expr::unknown("state1")])]),
+                ],
+                default: None,
+            },
+        ];
+        let out = name_clang_resume_switch(body, 0x11, false);
+        let StructuredNode::Switch { cases, default, .. } = &out[1] else {
+            panic!("expected switch");
+        };
+        assert_eq!(cases.len(), 2, "both jump-table cases stay explicit, got {cases:?}");
+        assert!(default.is_none(), "a 2-entry jump table must not synthesize a default");
+    }
+
+    #[test]
+    fn name_clang_switch_leaves_unrelated_user_switch_untouched() {
+        // If the CFG rewrite fired but the real dispatch switch did NOT form (e.g. an
+        // unresolved jump table), the first spine switch may be a genuine USER switch with
+        // a real value and sparse labels. It must NOT be renamed to `frame->__resume_index`
+        // nor have a case folded into `default`.
+        let user_switch = |two_way_default: bool, value: Expr, cases: Vec<(Vec<i128>, Vec<StructuredNode>)>| {
+            let body = vec![
+                block(vec![Expr::assign(
+                    Expr::var(Variable::reg("rax", 8)),
+                    frame(),
+                )]),
+                StructuredNode::Switch { value, cases, default: None },
+            ];
+            name_clang_resume_switch(body, 0x11, two_way_default)
+        };
+
+        // Compare-chain context, but the switch has a REAL value (not `switch_value`).
+        let out = user_switch(
+            true,
+            Expr::var(Variable::reg("edx", 4)),
+            vec![
+                (vec![0], vec![block(vec![Expr::unknown("a")])]),
+                (vec![1], vec![block(vec![Expr::unknown("b")])]),
+            ],
+        );
+        let StructuredNode::Switch { value, cases, default } = &out[1] else {
+            panic!("expected switch");
+        };
+        assert!(
+            matches!(&value.kind, ExprKind::Var(v) if v.name == "edx"),
+            "a real-valued user switch must keep its value, got {value:?}"
+        );
+        assert_eq!(cases.len(), 2, "no default folding on a user switch");
+        assert!(default.is_none());
+        assert!(!body_has_resume_switch(&out), "must not claim recovery");
+
+        // Jump-table context, but the labels are sparse/offset (not dense from 0).
+        let out = user_switch(
+            false,
+            Expr::var(Variable::reg("edx", 4)),
+            vec![
+                (vec![3], vec![block(vec![Expr::unknown("a")])]),
+                (vec![7], vec![block(vec![Expr::unknown("b")])]),
+            ],
+        );
         let StructuredNode::Switch { value, .. } = &out[1] else {
             panic!("expected switch");
         };
         assert!(
             matches!(&value.kind, ExprKind::Var(v) if v.name == "edx"),
-            "genuine switch value must be preserved, got {value:?}"
+            "a sparse-label switch must keep its value, got {value:?}"
         );
+        assert!(!body_has_resume_switch(&out), "must not claim recovery");
     }
 
     #[test]
@@ -5430,7 +5602,7 @@ mod tests {
                 default: None,
             },
         ];
-        let out = name_clang_resume_switch(body, 0x11);
+        let out = name_clang_resume_switch(body, 0x11, true);
         let StructuredNode::Switch { value, cases, .. } = &out[1] else {
             panic!("expected outer switch");
         };
@@ -5457,7 +5629,7 @@ mod tests {
             cases: vec![(vec![0], vec![block(vec![Expr::unknown("body0")])])],
             default: None,
         }];
-        let out = name_clang_resume_switch(body, 0x11);
+        let out = name_clang_resume_switch(body, 0x11, true);
         assert!(!body_has_resume_switch(&out));
     }
 
@@ -5474,7 +5646,7 @@ mod tests {
             ],
             default: None,
         }];
-        let out = name_clang_resume_switch(body, 0x11);
+        let out = name_clang_resume_switch(body, 0x11, true);
         let StructuredNode::Switch { value, cases, default } = &out[0] else {
             panic!("expected switch, got {:?}", out[0]);
         };
