@@ -386,6 +386,7 @@ impl StructuredCfg {
             &known_noreturn_targets,
             &known_ubsan_targets,
             &HashMap::new(),
+            &[],
         )
     }
 
@@ -405,9 +406,11 @@ impl StructuredCfg {
             known_noreturn_targets,
             &known_ubsan_targets,
             &HashMap::new(),
+            &[],
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
         cfg: &ControlFlowGraph,
         config: &super::config::DecompilerConfig,
@@ -416,6 +419,7 @@ impl StructuredCfg {
         known_noreturn_targets: &HashMap<u64, String>,
         known_ubsan_targets: &HashMap<u64, String>,
         known_throw_targets: &HashMap<u64, String>,
+        coroutine_targets: &[BasicBlockId],
     ) -> Self {
         use super::config::OptimizationPass;
 
@@ -428,6 +432,16 @@ impl StructuredCfg {
             known_ubsan_targets.clone(),
             known_throw_targets.clone(),
         );
+        structurer.coroutine_dispatch_targets = coroutine_targets.iter().copied().collect();
+        // The coroutine body-extraction breaks resume targets out into their own labeled regions
+        // via `goto`. That composes with the straight-line multi-suspend shape it targets, but
+        // NOT with a loop around a `co_await`: hoisting a loop-internal resume target out of the
+        // loop strands the loop's backedge. When any resume target lies inside a detected loop,
+        // decline extraction entirely and fall back to ordinary structuring (no worse than before
+        // the feature) rather than emit broken loop control flow.
+        if structurer.coroutine_targets_touch_loop() {
+            structurer.coroutine_dispatch_targets.clear();
+        }
         let mut body = structurer.structure();
         if !structurer.known_noreturn_targets.is_empty() {
             body = rewrite_known_noreturn_calls(body, &structurer.known_noreturn_targets);
@@ -527,22 +541,36 @@ impl StructuredCfg {
 
         // Post-process to convert gotos to break/continue where applicable
         if config.is_pass_enabled(OptimizationPass::GotoConversion) {
+            // A clang coroutine resume dispatch is IRREDUCIBLE — `case i: goto L_si` jumps
+            // into a shared labeled body — so the goto-TRANSFORMING passes (inline-into-case,
+            // switch-goto-to-break, early-return/cleanup folding) must NOT touch its dispatch
+            // gotos, or they would inline/duplicate the body or drop the dispatch.
+            let has_coroutine_dispatch = !structurer.coroutine_dispatch_targets.is_empty();
+
+            // Loop break/continue conversion rewrites gotos targeting loop headers/exits. This
+            // is safe to run even for a `.resume` clone: `coroutine_targets_touch_loop` declines
+            // extraction whenever any resume target sits in a cycle, so when a dispatch IS active
+            // its targets are loop-free and these passes never rewrite a `case i: goto L_si` edge
+            // — while an ORDINARY loop elsewhere in the clone still gets its `continue`/`break`.
             body = convert_gotos_to_break_continue(body, None);
             // Second pass: convert global gotos (in orphan labeled blocks) to continue
             // when they target loop headers (common in getopt/switch patterns)
             let loop_headers = collect_loop_headers(&body);
             body = convert_global_gotos_to_continue(body, &loop_headers);
             // Third pass: convert gotos in switch cases to break when they target
-            // a common exit point (common in option parsing switches)
-            body = convert_switch_gotos_to_break(body);
-            // Fourth pass: convert gotos to labeled cleanup blocks into inlined cleanup
-            body = convert_cleanup_gotos(body);
-            // Fifth pass: convert gotos to return labels into direct returns
-            body = convert_gotos_to_early_returns(body);
-            // Sixth pass: convert multi-level escape gotos to breaks
-            body = convert_multilevel_breaks(body);
-            // Seventh pass: structure shared exit paths
-            body = structure_shared_exits(body);
+            // a common exit point (common in option parsing switches). Exempts coroutine
+            // dispatch gotos internally.
+            body = convert_switch_gotos_to_break(body, &structurer.coroutine_dispatch_targets);
+            if !has_coroutine_dispatch {
+                // Fourth pass: convert gotos to labeled cleanup blocks into inlined cleanup
+                body = convert_cleanup_gotos(body);
+                // Fifth pass: convert gotos to return labels into direct returns
+                body = convert_gotos_to_early_returns(body);
+                // Sixth pass: convert multi-level escape gotos to breaks
+                body = convert_multilevel_breaks(body);
+                // Seventh pass: structure shared exit paths
+                body = structure_shared_exits(body);
+            }
             // Eighth pass: remove orphan labels that no longer have gotos
             body = remove_orphan_labels(body);
             // Final cleanup: remove gotos to non-existent labels
@@ -643,6 +671,10 @@ struct Structurer<'a> {
     /// Blocks that are allowed to be inlined even if they have multiple predecessors.
     /// This is used for join points after if-else structures.
     inline_allowed: HashSet<BasicBlockId>,
+    /// clang coroutine resume-state blocks. The dispatch is irreducible (each state jumps
+    /// into a shared body), so these are rendered as `case i: goto L_si;` and each is emitted
+    /// once as a labeled region rather than structured into a switch case.
+    coroutine_dispatch_targets: HashSet<BasicBlockId>,
     /// Irreducible CFG analysis results.
     irreducible_analysis: super::irreducible_cfg::IrreducibleCfgAnalysis,
     /// Pre-structuring annotations for folded condition blocks and EH side blocks.
@@ -801,6 +833,7 @@ impl<'a> Structurer<'a> {
             processed: HashSet::new(),
             multi_pred_blocks,
             inline_allowed: HashSet::new(),
+            coroutine_dispatch_targets: HashSet::new(),
             irreducible_analysis,
             annotations,
             binary_data,
@@ -1805,17 +1838,30 @@ impl<'a> Structurer<'a> {
             // emit a goto and let it be handled as a labeled block later.
             // However, skip this if the block is marked as "inline allowed" (e.g., join points
             // after if-else structures that should be processed inline).
-            if self.multi_pred_blocks.contains(&block_id)
+            //
+            // Coroutine resume-state blocks are irreducible dispatch entries: reaching one
+            // mid-region ends this segment with a `goto` so the target is emitted once as its
+            // own labeled region (preserving the `case i: goto L_si;` dispatch). Such a segment
+            // start is typically reached here as a fall-through join of state 0's linear body
+            // and marked `inline_allowed` (an if-else join), but for coroutine dispatch we must
+            // still break it out so the `case i:` goto has a landing point — so coro targets
+            // override the `inline_allowed` suppression. Force a goto even for a pure-return
+            // state so the label survives for the switch case to target.
+            let is_coro_target = self.coroutine_dispatch_targets.contains(&block_id);
+            if (self.multi_pred_blocks.contains(&block_id) || is_coro_target)
                 && block_id != start
-                && !self.inline_allowed.contains(&block_id)
+                && (is_coro_target || !self.inline_allowed.contains(&block_id))
             {
                 // Check if target is a pure return block - if so, emit return instead of goto
-                if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
-                    self.mark_pure_return_chain_processed(block_id);
-                    result.push(StructuredNode::Return(ret_expr));
-                } else {
-                    result.push(StructuredNode::Goto(block_id));
+                // (but never for a coroutine target — its label must remain a goto destination).
+                if !is_coro_target {
+                    if let Some(ret_expr) = self.get_return_expr_if_pure_return(block_id) {
+                        self.mark_pure_return_chain_processed(block_id);
+                        result.push(StructuredNode::Return(ret_expr));
+                        break;
+                    }
                 }
+                result.push(StructuredNode::Goto(block_id));
                 break;
             }
 
@@ -2373,7 +2419,15 @@ impl<'a> Structurer<'a> {
                         // `end` is already the boundary and a later block must not be
                         // structured past it.
                         let switch_expr = Expr::unknown("switch_value".to_string());
+                        // A coroutine resume dispatch has NO post-switch join to synthesize: its
+                        // states jump into a shared body whose merges/segments are already broken
+                        // out as their own labeled regions (coroutine_dispatch_targets). Emitting
+                        // an unlabeled join here would strand those `goto L_si` edges as orphans.
+                        let is_coroutine_dispatch = possible_targets
+                            .iter()
+                            .any(|t| self.coroutine_dispatch_targets.contains(t));
                         let switch_end = match end {
+                            _ if is_coroutine_dispatch => None,
                             Some(_) => end,
                             None if possible_targets.len() >= 2 => {
                                 self.find_join_point_of_targets(possible_targets)
@@ -2389,18 +2443,23 @@ impl<'a> Structurer<'a> {
                                 // and mark it processed before it can be emitted after the
                                 // switch. So only take it when there is no join to respect;
                                 // otherwise structure up to the join.
-                                let body = match switch_end {
-                                    None => {
-                                        if let Some(ret_expr) =
-                                            self.get_return_expr_if_pure_return(target)
-                                        {
-                                            self.mark_pure_return_chain_processed(target);
-                                            vec![StructuredNode::Return(ret_expr)]
-                                        } else {
-                                            self.structure_region(target, None)
+                                let body = if self.coroutine_dispatch_targets.contains(&target) {
+                                    // clang coroutine resume dispatch: goto into the shared body.
+                                    vec![StructuredNode::Goto(target)]
+                                } else {
+                                    match switch_end {
+                                        None => {
+                                            if let Some(ret_expr) =
+                                                self.get_return_expr_if_pure_return(target)
+                                            {
+                                                self.mark_pure_return_chain_processed(target);
+                                                vec![StructuredNode::Return(ret_expr)]
+                                            } else {
+                                                self.structure_region(target, None)
+                                            }
                                         }
+                                        Some(_) => self.structure_region(target, switch_end),
                                     }
-                                    Some(_) => self.structure_region(target, switch_end),
                                 };
                                 (vec![i as i128], body)
                             })
@@ -3165,6 +3224,49 @@ impl<'a> Structurer<'a> {
         (Expr::int(1), info.header)
     }
 
+    /// Whether any coroutine resume-dispatch target lies inside a cycle. Body-extraction hoists
+    /// resume targets out with `goto`, which strands a loop's backedge, so when this holds the
+    /// caller declines extraction and structures normally. Uses raw cycle reachability (does the
+    /// target reach itself over CFG edges?) rather than `find_loops`: the synthetic dispatch edge
+    /// jumps INTO a loop, making it irreducible, which natural-loop detection can miss — but a
+    /// reachability check still sees the backedge.
+    fn coroutine_targets_touch_loop(&self) -> bool {
+        self.coroutine_dispatch_targets
+            .iter()
+            .any(|&t| self.block_reaches_itself(t))
+    }
+
+    /// Whether `start` lies on a cycle: a DFS over CFG successors that returns to `start`.
+    fn block_reaches_itself(&self, start: BasicBlockId) -> bool {
+        let mut stack: Vec<BasicBlockId> = self.cfg.successors(start).to_vec();
+        let mut seen: HashSet<BasicBlockId> = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if b == start {
+                return true;
+            }
+            if seen.insert(b) {
+                stack.extend(self.cfg.successors(b).iter().copied());
+            }
+        }
+        false
+    }
+
+    /// Structure `entry`'s region, unless `entry` is a coroutine resume-dispatch target: those
+    /// are the per-state body segment starts, which are otherwise inlined into the enclosing
+    /// (state-0) body via a merge branch. Emitting a `goto` instead breaks the segment out so it
+    /// is rendered once as its own labeled region — giving the `switch`/`goto` per-state dispatch
+    /// its landing points. See [[project_coroutine_body_extraction]].
+    fn structure_region_or_dispatch_goto(
+        &mut self,
+        entry: BasicBlockId,
+        end: Option<BasicBlockId>,
+    ) -> Vec<StructuredNode> {
+        if self.coroutine_dispatch_targets.contains(&entry) && !self.processed.contains(&entry) {
+            return vec![StructuredNode::Goto(entry)];
+        }
+        self.structure_region(entry, end)
+    }
+
     fn structure_if_else(
         &mut self,
         condition: Condition,
@@ -3185,21 +3287,27 @@ impl<'a> Structurer<'a> {
 
         let shared_return = join.and_then(|join_id| self.get_return_expr_if_pure_return(join_id));
 
-        let mut then_body = if join == Some(true_target) {
+        // A coroutine resume target that is also this if's join must NOT be folded into a direct
+        // return (nor have its chain marked processed): it has to survive as a labeled region so
+        // the `case i: goto L_join` dispatch edge lands. Emit the dispatch goto instead.
+        let join_is_coro =
+            join.is_some_and(|j| self.coroutine_dispatch_targets.contains(&j));
+
+        let mut then_body = if join == Some(true_target) && !join_is_coro {
             shared_return
                 .clone()
                 .map(|ret_expr| vec![StructuredNode::Return(ret_expr)])
                 .unwrap_or_default()
         } else {
-            self.structure_region(true_target, join)
+            self.structure_region_or_dispatch_goto(true_target, join)
         };
 
-        let mut else_body = if join == Some(false_target) {
+        let mut else_body = if join == Some(false_target) && !join_is_coro {
             shared_return
                 .clone()
                 .map(|ret_expr| vec![StructuredNode::Return(ret_expr)])
         } else {
-            let body = self.structure_region(false_target, join);
+            let body = self.structure_region_or_dispatch_goto(false_target, join);
             if body.is_empty() {
                 None
             } else {
@@ -3207,13 +3315,16 @@ impl<'a> Structurer<'a> {
             }
         };
 
-        if let Some(ret_expr) = shared_return.clone() {
+        // A coroutine-target join must stay a labeled region the dispatch jumps to, so do NOT
+        // splice its (possibly cleanup-bearing) return chain into the branches either.
+        if let Some(ret_expr) = shared_return.clone().filter(|_| !join_is_coro) {
             then_body = self.attach_shared_return_to_branch(then_body, ret_expr.clone());
             else_body =
                 else_body.map(|body| self.attach_shared_return_to_branch(body, ret_expr.clone()));
         }
 
         let consumes_join = shared_return.is_some()
+            && !join_is_coro
             && self.body_terminates(&then_body)
             && else_body
                 .as_ref()
@@ -3296,7 +3407,12 @@ impl<'a> Structurer<'a> {
             .cases
             .into_iter()
             .map(|(values, target)| {
-                let body = if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
+                let body = if self.coroutine_dispatch_targets.contains(&target) {
+                    // A clang coroutine resume dispatch: the states jump into a SHARED
+                    // linearized body, so render `case i: goto L_si;` and let the target be
+                    // emitted once as a labeled region (see `structure_region`).
+                    vec![StructuredNode::Goto(target)]
+                } else if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
                     self.mark_pure_return_chain_processed(target);
                     vec![StructuredNode::Return(ret_expr)]
                 } else {
@@ -3315,6 +3431,10 @@ impl<'a> Structurer<'a> {
             if self.processed.contains(&target) {
                 // Default was already structured by bounds check, skip it
                 None
+            } else if self.coroutine_dispatch_targets.contains(&target) {
+                // A coroutine resume dispatch whose default arm shares a resume target: emit
+                // `goto` so the target keeps its own labeled region, exactly as the cases do.
+                Some(vec![StructuredNode::Goto(target)])
             } else {
                 Some(
                     if let Some(ret_expr) = self.get_return_expr_if_pure_return(target) {
@@ -6855,6 +6975,7 @@ mod tests {
                 &HashMap::new(),
                 &HashMap::new(),
                 &throw_targets,
+                &[],
             );
         let output = PseudoCodeEmitter::new("    ", false).emit(&structured, "may_throw");
 
