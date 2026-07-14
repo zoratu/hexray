@@ -277,6 +277,11 @@ fn visit_expr(
         // too, recognised the same way (qualified-method name pattern +
         // stack `this`), but with template-arg-derived layout sizes.
         try_bind_optional_variant_method_call(target, args, db, binary_data, out);
+        // A `std::variant` local touched ONLY through the free-function accessors
+        // `std::holds_alternative<T, Pack...>(v)` / `std::get_if<T, Pack...>(&v)`
+        // has no member call to bind it — recover it from the accessor's own
+        // template pack.
+        try_bind_variant_free_function(target, args, db, binary_data, out);
     }
     walk_children(expr, db, binary_data, out);
 }
@@ -723,6 +728,113 @@ fn try_bind_optional_variant_method_call(
             // not aggregate zero-init padding.
             class_object: true,
         });
+}
+
+/// Bind a `std::variant` local reached ONLY through a variant-only free-function accessor:
+/// `std::holds_alternative<T, Alts...>(v)` or `std::get_if<T, Alts...>(&v)`. Both fully name the
+/// variant in their template pack (`Alts...`), and neither has a `std::tuple`/`std::pair`
+/// counterpart, so — unlike `std::get<T, ...>` — recovering the type from them is unambiguous.
+/// `args[0]` is the variant reference/pointer; bind its stack slot as `std::variant<Alts...>`.
+fn try_bind_variant_free_function(
+    target: &CallTarget,
+    args: &[Expr],
+    db: &TypeDatabase,
+    binary_data: Option<&BinaryDataContext>,
+    out: &mut StackStructBindings,
+) {
+    let Some(raw_name) = resolve_call_name(target, binary_data) else {
+        return;
+    };
+    let demangled = hexray_demangle::demangle(&raw_name);
+    let name: &str = demangled.as_deref().unwrap_or(&raw_name);
+    let Some(alternatives) = parse_variant_free_function(name) else {
+        return;
+    };
+    let Some(this_arg) = args.first() else {
+        return;
+    };
+    let Some(stack_offset) = stack_offset_of_address(this_arg) else {
+        return;
+    };
+    let Some(size) = variant_layout_size(db, &alternatives) else {
+        return;
+    };
+    let type_name = format!("std::variant<{}>", alternatives.join(", "));
+    let slug_inner = alternatives.join("_");
+    let local_name = synthesize_smart_pointer_local_name("variant", &slug_inner, stack_offset);
+    out.by_offset
+        .entry(stack_offset)
+        .or_insert(StackStructBinding {
+            stack_offset,
+            size,
+            type_name,
+            local_name,
+            class_object: true,
+        });
+}
+
+/// If `name` is a variant-only free-function accessor whose template pack fully names the variant
+/// — `std::holds_alternative<T, Alts...>` or `std::get_if<T, Alts...>` — return the alternative
+/// types `Alts...`. (`std::get<T, ...>` is deliberately excluded: its shape is identical to
+/// `std::get<T>(std::tuple/pair)`, so it can't be told apart from tuple access by name alone.)
+fn parse_variant_free_function(name: &str) -> Option<Vec<String>> {
+    let args = variant_free_function_template_args(name, "std::holds_alternative")
+        .or_else(|| variant_free_function_template_args(name, "std::get_if"))?;
+    let segments: Vec<String> = split_top_level_comma(&args)
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // `<QueriedT, Alt1, Alt2, ...>`: drop the queried type, keep the alternatives (>= 1).
+    if segments.len() < 2 {
+        return None;
+    }
+    Some(segments[1..].to_vec())
+}
+
+/// The `<...>` template arguments of a free-function CALL `prefix<...>(…)` — like
+/// [`template_args_of_qualified_method`] but the balanced template close is followed directly by
+/// the argument list `(`, not a `::method` receiver qualifier. Same anchoring guards (identifier
+/// boundary, paren-depth 0) so a nested type mention isn't mistaken for the call.
+fn variant_free_function_template_args(name: &str, prefix: &str) -> Option<String> {
+    let is_identifier_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = name.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = name.get(search_from..)?.find(prefix) {
+        let i = search_from + rel;
+        search_from = i + prefix.len();
+        let prev_ok = i == 0 || bytes.get(i - 1).is_none_or(|b| !is_identifier_byte(*b));
+        if !prev_ok {
+            continue;
+        }
+        if paren_depth_before(name, i) != 0 {
+            continue;
+        }
+        let Some(after_lt) = name[i + prefix.len()..].strip_prefix('<') else {
+            continue;
+        };
+        let mut depth = 1usize;
+        let mut end = None;
+        for (j, c) in after_lt.char_indices() {
+            match c {
+                '<' => depth = depth.saturating_add(1),
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let after_args = after_lt.get(end + 1..)?;
+        if after_args.trim_start().starts_with('(') {
+            return Some(after_lt[..end].to_string());
+        }
+    }
+    None
 }
 
 /// Whether the called member returns a non-trivial *object* by value, so the
@@ -3257,5 +3369,73 @@ mod tests {
         let b = bindings.get(-24).expect("binding at -24");
         assert_eq!(b.type_name, "std::optional<int>");
         assert_eq!(b.size, 8);
+    }
+
+    #[test]
+    fn parses_variant_holds_alternative_free_fn() {
+        // `<QueriedT, Alt...>` — drop the queried type, keep the variant alternatives.
+        assert_eq!(
+            parse_variant_free_function(
+                "std::holds_alternative<int, int, double>(std::variant<int, double> const&)"
+            ),
+            Some(vec!["int".to_string(), "double".to_string()])
+        );
+    }
+
+    #[test]
+    fn parses_variant_get_if_free_fn() {
+        assert_eq!(
+            parse_variant_free_function(
+                "std::get_if<int, int, double, char>(std::variant<int, double, char>*)"
+            ),
+            Some(vec![
+                "int".to_string(),
+                "double".to_string(),
+                "char".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn declines_ambiguous_std_get_free_fn() {
+        // `std::get<T, ...>` is shape-identical to `std::get<T>(std::tuple<...>)`, so decline.
+        assert_eq!(
+            parse_variant_free_function("std::get<int, int, double>(std::variant<int, double>&)"),
+            None
+        );
+    }
+
+    #[test]
+    fn declines_single_arg_holds_alternative() {
+        // No alternative pack after the queried type — nothing to bind.
+        assert_eq!(
+            parse_variant_free_function("std::holds_alternative<int>(x)"),
+            None
+        );
+    }
+
+    #[test]
+    fn declines_holds_alternative_only_as_return_type_mention() {
+        // A free function whose name merely SPELLS the template as a nested type must not match:
+        // the template close is followed by `::`, not the call's `(`.
+        assert_eq!(
+            parse_variant_free_function("std::holds_alternative<int, int, double>::type f(int*)"),
+            None
+        );
+    }
+
+    #[test]
+    fn binds_variant_from_free_function_accessor() {
+        let call = Expr::call(
+            CallTarget::Named(
+                "std::holds_alternative<int, int, double>(std::variant<int, double> const&)"
+                    .to_string(),
+            ),
+            vec![rbp_plus(-32)],
+        );
+        let mut bindings = StackStructBindings::new();
+        bindings.analyze(&[block(vec![call])], &full_db(), None);
+        let b = bindings.get(-32).expect("binding at -32");
+        assert_eq!(b.type_name, "std::variant<int, double>");
     }
 }
