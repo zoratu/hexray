@@ -1251,8 +1251,12 @@ impl Decompiler {
         let clang_resume_offset = coro_rewritten
             .as_ref()
             .map(|r| (r.index_offset, r.two_way_default));
+        let coroutine_targets: Vec<hexray_core::BasicBlockId> = coro_rewritten
+            .as_ref()
+            .map(|r| r.resume_targets.clone())
+            .unwrap_or_default();
         let cfg = coro_rewritten.as_ref().map(|r| &r.cfg).unwrap_or(cfg);
-        let structured = self.structure(cfg);
+        let structured = self.structure_with_coroutine_targets(cfg, &coroutine_targets);
 
         // Step 2: Apply struct inference if enabled
         let structured = if self.enable_struct_inference {
@@ -2443,6 +2447,17 @@ impl Decompiler {
 
     /// Decompiles a CFG and returns the structured representation.
     pub fn structure(&self, cfg: &ControlFlowGraph) -> StructuredCfg {
+        self.structure_with_coroutine_targets(cfg, &[])
+    }
+
+    /// Like [`Self::structure`] but marks `coroutine_targets` (a clang coroutine resume
+    /// dispatch's resume-state blocks) as irreducible goto-dispatch entries, so the switch
+    /// renders `case i: goto L_si;` with the shared body emitted once under labels.
+    pub fn structure_with_coroutine_targets(
+        &self,
+        cfg: &ControlFlowGraph,
+        coroutine_targets: &[hexray_core::BasicBlockId],
+    ) -> StructuredCfg {
         let noreturn_targets = collect_known_noreturn_targets(
             self.symbol_table.as_ref(),
             self.relocation_table.as_ref(),
@@ -2458,6 +2473,7 @@ impl Decompiler {
                 &noreturn_targets,
                 &ubsan_targets,
                 &self.throw_thunks,
+                coroutine_targets,
             )
         } else {
             StructuredCfg::from_cfg_with_config_and_binary_data_and_exception_info_and_known_targets(
@@ -2468,6 +2484,7 @@ impl Decompiler {
                 &noreturn_targets,
                 &ubsan_targets,
                 &self.throw_thunks,
+                coroutine_targets,
             )
         }
     }

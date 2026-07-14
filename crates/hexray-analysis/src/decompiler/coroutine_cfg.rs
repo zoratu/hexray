@@ -14,8 +14,8 @@
 
 use super::{BinaryDataContext, SwitchRecovery};
 use hexray_core::{
-    BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, MemoryRef, Operand,
-    Operation, Register,
+    BasicBlock, BasicBlockId, BlockTerminator, Condition, ControlFlowGraph, Instruction, MemoryRef,
+    Operand, Operation, Register,
 };
 
 /// A stack home holding the frame pointer, keyed by (canonical base register name,
@@ -121,6 +121,521 @@ pub struct ClangResumeRewrite {
     /// EVERY nonzero value to the false edge); false for a jump table, whose cases
     /// are already explicit `0..N-1` and must be left as-is.
     pub two_way_default: bool,
+    /// Blocks the resume dispatch jumps to (its `IndirectJump` targets), plus the shared
+    /// flag-check merges and per-state body-segment starts they route through. The structurer
+    /// treats these as irreducible goto-dispatch entries — rendering `case i: goto L_si;` and
+    /// emitting each once as a labeled region — so the shared coroutine body separates into
+    /// per-state segments instead of collapsing into state 0. See [[project_coroutine_body_extraction]].
+    pub resume_targets: Vec<BasicBlockId>,
+}
+
+/// The resume-state target blocks of `dispatch` (its `IndirectJump` successors), rendered by
+/// the structurer as `case i: goto L_si` labels.
+fn dispatch_resume_targets(cfg: &ControlFlowGraph, dispatch: BasicBlockId) -> Vec<BasicBlockId> {
+    let stubs = match cfg.block(dispatch).map(|b| &b.terminator) {
+        Some(BlockTerminator::IndirectJump {
+            possible_targets, ..
+        }) => possible_targets.clone(),
+        _ => return Vec::new(),
+    };
+    // Each resume stub (`flag=0; jmp merge`) routes through a shared flag-check merge whose
+    // `flag==0` (resume) branch is the real start of that state's body segment. Those segment
+    // starts are otherwise INLINED into state 0's linear body via the merge's resume branch, so
+    // mark them too: the structurer then force-`goto`s each segment out into its own labeled
+    // region, giving per-state separation instead of one linear body. See
+    // [[project_coroutine_body_extraction]].
+    let mut targets = stubs.clone();
+    for &stub in &stubs {
+        if let Some((merge_id, seg)) = resume_segment_start(cfg, stub) {
+            // The shared flag-check merge is reached from BOTH state 0's suspend path and this
+            // resume stub; break it out too, or state 0's body pulls the resume (`je`) branch in.
+            let mut breakouts = vec![merge_id, seg];
+            // Just past the resume (`await_resume`) the body reaches a value-discriminated join
+            // (`if(k==0)`) that is ALSO reached from the suspend-return path with a different
+            // constant. Whichever region is structured first claims that join and its body, so
+            // break it out too — then both paths `goto` it and the segment body renders once
+            // under the join, reached by the resume path.
+            if let Some(join) = resume_body_join(cfg, seg) {
+                breakouts.push(join);
+            }
+            for b in breakouts {
+                if !targets.contains(&b) {
+                    targets.push(b);
+                }
+            }
+        }
+    }
+    targets
+}
+
+/// Walk the single-successor chain out of a resume segment start until the first block that has
+/// more than one predecessor: the value-discriminated join shared with the suspend-return path.
+/// Walks the whole chain (bounded only by a visited set so a self-loop can't spin) rather than a
+/// fixed depth, since a segment's straight-line prologue can be arbitrarily long.
+fn resume_body_join(cfg: &ControlFlowGraph, seg: BasicBlockId) -> Option<BasicBlockId> {
+    let mut cur = seg;
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(cur) {
+        let succs = cfg.block(cur)?.terminator.successors();
+        let [next] = succs[..] else { return None };
+        if cfg.predecessors(next).len() > 1 {
+            return Some(next);
+        }
+        cur = next;
+    }
+    None
+}
+
+/// Given a resume dispatch stub (`flag=0; jmp merge`), return the shared flag-check merge it jumps
+/// to and the block where that state's body actually resumes (the merge's `flag==0` branch).
+fn resume_segment_start(
+    cfg: &ControlFlowGraph,
+    stub: BasicBlockId,
+) -> Option<(BasicBlockId, BasicBlockId)> {
+    let first = *cfg.block(stub)?.terminator.successors().first()?;
+    let (merge_id, merge, chain) = find_flag_check_merge(cfg, first)?;
+    // The stub sets the flag; on aarch64 -O0 a pure spill-copy block can carry it into the
+    // merge's input slot before the check. Trace the constant across the stub AND those copy
+    // blocks so the resume edge (flag == 0) resolves to its segment either way.
+    let mut insts = cfg.block(stub)?.instructions.clone();
+    for id in &chain {
+        insts.extend(cfg.block(*id)?.instructions.iter().cloned());
+    }
+    let flag = pred_slot_constant(&insts, &merge.slot)?;
+    // Only a genuine resume stub sets the flag to the RESUME value (0). `dispatch_resume_targets`
+    // probes EVERY indirect-jump target, including real body blocks (state 0); one of those may
+    // reach this same merge having stored the SUSPEND flag (e.g. 0xff), whose `resolve` is the
+    // return edge — that must NOT be marked a resume segment. Require the proven zero flag.
+    if mask_flag(flag, merge.test_bits) != 0 {
+        return None;
+    }
+    let resolved = merge.resolve(flag);
+    (resolved != merge_id && resolved != stub).then_some((merge_id, resolved))
+}
+
+/// From `start`, follow the single-successor chain (skipping pure spill-copy/forwarder blocks that
+/// clang -O0 can emit before the real flag test) until a block that parses as a flag-check merge.
+/// Returns that merge's id, its parse, and the copy blocks walked before it (bounded by a visited
+/// set so a cycle can't spin).
+#[allow(clippy::type_complexity)]
+fn find_flag_check_merge(
+    cfg: &ControlFlowGraph,
+    start: BasicBlockId,
+) -> Option<(BasicBlockId, FlagCheckMerge, Vec<BasicBlockId>)> {
+    let mut cur = start;
+    let mut chain = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    while visited.insert(cur) {
+        let block = cfg.block(cur)?;
+        if let Some(merge) = analyze_flag_check_merge(block) {
+            return Some((cur, merge, chain));
+        }
+        // Only walk THROUGH a proven pure copy/forwarder. A call or unmodeled effect could clobber
+        // the flag slot that `pred_slot_constant` is tracking, so refuse to treat it as a copy.
+        if !is_pure_flag_copy_block(block) {
+            return None;
+        }
+        let succs = block.terminator.successors();
+        let [next] = succs[..] else { return None };
+        chain.push(cur);
+        cur = next;
+    }
+    None
+}
+
+/// A block safe to trace the flag constant through: it only shuffles registers/stack slots (no
+/// calls or unmodeled effects) and hands off via a single unconditional edge. It must match what
+/// `pred_slot_constant` models exactly: (1) only the data-movement opcodes below; (2) no indexed
+/// memory operand (only simple `[base - disp]` slots are modeled); (3) a memory DESTINATION only
+/// for `Move`/`Store` — the modeled spill-to-slot forms — so an unmodeled memory-writing bit op
+/// (e.g. `andb $0, [slot]`) can't clobber the flag slot while a stale constant survives.
+fn is_pure_flag_copy_block(block: &BasicBlock) -> bool {
+    matches!(
+        block.terminator,
+        BlockTerminator::Jump { .. } | BlockTerminator::Fallthrough { .. }
+    ) && block.instructions.iter().all(|i| {
+        matches!(
+            i.operation,
+            Operation::Move
+                | Operation::Load
+                | Operation::Store
+                | Operation::Xor
+                | Operation::And
+                | Operation::Compare
+                | Operation::Test
+                // The block's own unconditional branch appears in the instruction list too; it
+                // moves no data, so accept it (mirrors `analyze_flag_check_merge`).
+                | Operation::Jump
+        ) && !i
+            .operands
+            .iter()
+            .any(|op| matches!(op, Operand::Memory(m) if m.index.is_some()))
+            && (!matches!(i.operands.first(), Some(Operand::Memory(_)))
+                || matches!(i.operation, Operation::Move | Operation::Store))
+    })
+}
+
+/// How a pure flag-check merge decides its branch from the flag value.
+#[derive(Debug, Clone, Copy)]
+enum FlagTest {
+    /// `test reg, reg` — ZF set iff the (masked) flag is zero.
+    Zero,
+    /// `cmp reg, imm` — ZF set iff the (masked) flag equals `imm`.
+    Eq(i64),
+}
+
+/// A clang coroutine suspend/resume flag-check merge: a PURE block that loads a byte flag from
+/// a stack slot, shuffles it, tests it, and conditionally branches. The suspend edge reaches
+/// it with the flag = one constant and the resume edge with another; the branch routes apart.
+struct FlagCheckMerge {
+    slot: SpillSlot,
+    test: FlagTest,
+    test_bits: u16,
+    condition: Condition,
+    true_target: BasicBlockId,
+    false_target: BasicBlockId,
+}
+
+impl FlagCheckMerge {
+    fn resolve(&self, flag: i64) -> BasicBlockId {
+        let masked = mask_flag(flag, self.test_bits);
+        let zf = match self.test {
+            FlagTest::Zero => masked == 0,
+            FlagTest::Eq(imm) => masked == mask_flag(imm, self.test_bits),
+        };
+        let taken = match self.condition {
+            Condition::Equal => zf,
+            Condition::NotEqual => !zf,
+            _ => return self.false_target,
+        };
+        if taken {
+            self.true_target
+        } else {
+            self.false_target
+        }
+    }
+}
+
+fn mask_flag(value: i64, bits: u16) -> i64 {
+    if bits >= 64 {
+        value
+    } else {
+        value & ((1i64 << bits) - 1)
+    }
+}
+
+/// Recognize a PURE flag-check merge block: only moves a byte flag among registers/slots and
+/// ends in `test`/`cmp` on that flag + a conditional branch. Any call/arithmetic/non-flag
+/// memory access disqualifies it. Returns the input flag slot + branch dependence.
+/// The flag's DEFINED width bounds the test (a wider test would read undefined bits).
+fn analyze_flag_check_merge(block: &BasicBlock) -> Option<FlagCheckMerge> {
+    let (condition, true_target, false_target) = match block.terminator {
+        BlockTerminator::ConditionalBranch {
+            condition,
+            true_target,
+            false_target,
+        } if matches!(condition, Condition::Equal | Condition::NotEqual) => {
+            (condition, true_target, false_target)
+        }
+        _ => return None,
+    };
+    let mut flag_regs: Vec<String> = Vec::new();
+    let mut flag_slots: Vec<SpillSlot> = Vec::new();
+    let mut input_slot: Option<SpillSlot> = None;
+    let mut flag_bits: Option<u16> = None;
+    let mut test: Option<(FlagTest, u16)> = None;
+
+    for inst in &block.instructions {
+        match inst.operation {
+            Operation::Move | Operation::Load => {
+                match (inst.operands.first(), inst.operands.get(1)) {
+                    (Some(Operand::Register(d)), Some(Operand::Memory(m))) if m.index.is_none() => {
+                        let dc = canon_reg(d.name());
+                        let Some(b) = &m.base else { return None };
+                        let slot = (canon_reg(b.name()), m.displacement);
+                        flag_regs.retain(|r| r != &dc);
+                        if flag_slots.contains(&slot) {
+                            flag_regs.push(dc);
+                        } else if input_slot.is_none() && flag_slots.is_empty() {
+                            input_slot = Some(slot.clone());
+                            flag_slots.push(slot);
+                            flag_regs.push(dc);
+                            flag_bits = Some(d.size);
+                        } else {
+                            return None;
+                        }
+                    }
+                    (Some(Operand::Memory(m)), Some(Operand::Register(s))) if m.index.is_none() => {
+                        let Some(b) = &m.base else { return None };
+                        if flag_regs.contains(&canon_reg(s.name())) {
+                            let slot = (canon_reg(b.name()), m.displacement);
+                            flag_slots.push(slot);
+                        } else {
+                            return None;
+                        }
+                    }
+                    (Some(Operand::Register(d)), Some(Operand::Register(s))) => {
+                        let dc = canon_reg(d.name());
+                        let holds = flag_regs.contains(&canon_reg(s.name()));
+                        flag_regs.retain(|r| r != &dc);
+                        if holds {
+                            flag_regs.push(dc);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            // aarch64 `strb <src>, [x29 - K]` spills the flag as a Store with the operands in
+            // the opposite order from the x86 `mov [rbp - K], <src>` (a Move handled above).
+            Operation::Store => match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(Operand::Register(s)), Some(Operand::Memory(m))) if m.index.is_none() => {
+                    let Some(b) = &m.base else { return None };
+                    if flag_regs.contains(&canon_reg(s.name())) {
+                        flag_slots.push((canon_reg(b.name()), m.displacement));
+                    } else {
+                        return None;
+                    }
+                }
+                _ => return None,
+            },
+            Operation::Test => match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(Operand::Register(a)), Some(Operand::Register(b)))
+                    if canon_reg(a.name()) == canon_reg(b.name())
+                        && flag_regs.contains(&canon_reg(a.name()))
+                        && a.size <= flag_bits.unwrap_or(0) =>
+                {
+                    test = Some((FlagTest::Zero, a.size));
+                }
+                _ => return None,
+            },
+            Operation::Compare => match (inst.operands.first(), inst.operands.get(1)) {
+                (Some(Operand::Register(a)), Some(Operand::Immediate(i)))
+                    if flag_regs.contains(&canon_reg(a.name()))
+                        && a.size <= flag_bits.unwrap_or(0) =>
+                {
+                    test = Some((FlagTest::Eq(i.value as i64), a.size));
+                }
+                _ => return None,
+            },
+            // aarch64 masks the flag before the branch: `and w8, w8, #0xff`. The masked value
+            // is still the flag (zero iff the flag byte is zero), so track it as a flag reg and
+            // let the mask width bound the test. Operands: [dst, src, imm].
+            Operation::And => match (
+                inst.operands.first(),
+                inst.operands.get(1),
+                inst.operands.get(2),
+            ) {
+                (
+                    Some(Operand::Register(d)),
+                    Some(Operand::Register(s)),
+                    Some(Operand::Immediate(_)),
+                ) if flag_regs.contains(&canon_reg(s.name())) => {
+                    let dc = canon_reg(d.name());
+                    flag_regs.retain(|r| r != &dc);
+                    flag_regs.push(dc);
+                }
+                _ => return None,
+            },
+            // The block's own branch appears in the list. For x86 `je`/`jne` it carries no
+            // operand and is ignored. aarch64 folds the test INTO the branch: `cbz`/`cbnz w8`
+            // is a `ConditionalJump` whose first operand is the flag register — that IS the
+            // zero test, so record it (the terminator condition Equal/NotEqual is captured above).
+            Operation::ConditionalJump => match inst.operands.first() {
+                Some(Operand::Register(a))
+                    if flag_regs.contains(&canon_reg(a.name()))
+                        && a.size <= flag_bits.unwrap_or(0) =>
+                {
+                    test = Some((FlagTest::Zero, a.size));
+                }
+                Some(Operand::Register(_)) => return None,
+                _ => {}
+            },
+            Operation::Jump => {}
+            _ => return None,
+        }
+    }
+
+    let slot = input_slot?;
+    let (test, test_bits) = test?;
+    Some(FlagCheckMerge {
+        slot,
+        test,
+        test_bits,
+        condition,
+        true_target,
+        false_target,
+    })
+}
+
+/// The constant value that ends up in `slot` after running the instruction stream `insts`, or
+/// `None`. Tracks both register constants AND stack-slot constants across moves/copies, so a flag
+/// spilled to one slot, reloaded, and re-spilled to `slot` (a spill-copy block clang -O0 may emit
+/// between the resume stub and the flag check) still resolves. Accepts a flat slice so a stub plus
+/// its copy blocks can be traced as one stream.
+fn pred_slot_constant(insts: &[Instruction], slot: &SpillSlot) -> Option<i64> {
+    use std::collections::HashMap;
+    let mut regs: HashMap<String, i64> = HashMap::new();
+    let mut slots: HashMap<SpillSlot, i64> = HashMap::new();
+    let mem_slot = |m: &MemoryRef| -> Option<SpillSlot> {
+        if m.index.is_none() {
+            m.base
+                .as_ref()
+                .map(|b| (canon_reg(b.name()), m.displacement))
+        } else {
+            None
+        }
+    };
+    // Record `dst_slot = value` (value = Some(constant) or None to invalidate).
+    let set_slot = |slots: &mut HashMap<SpillSlot, i64>, k: SpillSlot, v: Option<i64>| match v {
+        Some(v) => {
+            slots.insert(k, v);
+        }
+        None => {
+            slots.remove(&k);
+        }
+    };
+    for inst in insts {
+        match inst.operation {
+            Operation::Move | Operation::Load => {
+                match (inst.operands.first(), inst.operands.get(1)) {
+                    (Some(Operand::Register(d)), Some(Operand::Immediate(i))) => {
+                        regs.insert(canon_reg(d.name()), i.value as i64);
+                    }
+                    (Some(Operand::Register(d)), Some(Operand::Register(s))) => {
+                        let dc = canon_reg(d.name());
+                        // `mov w8, wzr` (aarch64) materializes zero from the zero register.
+                        let v = if is_zero_register(s.name()) {
+                            Some(0)
+                        } else {
+                            regs.get(&canon_reg(s.name())).copied()
+                        };
+                        match v {
+                            Some(v) => {
+                                regs.insert(dc, v);
+                            }
+                            None => {
+                                regs.remove(&dc);
+                            }
+                        }
+                    }
+                    // Load from a stack slot: pick up its tracked constant if any.
+                    (Some(Operand::Register(d)), Some(Operand::Memory(m))) => {
+                        let dc = canon_reg(d.name());
+                        match mem_slot(m).and_then(|k| slots.get(&k).copied()) {
+                            Some(v) => {
+                                regs.insert(dc, v);
+                            }
+                            None => {
+                                regs.remove(&dc);
+                            }
+                        }
+                    }
+                    (Some(Operand::Register(d)), _) => {
+                        regs.remove(&canon_reg(d.name()));
+                    }
+                    // Store to a stack slot.
+                    (Some(Operand::Memory(m)), src) => {
+                        if let Some(k) = mem_slot(m) {
+                            let v = match src {
+                                Some(Operand::Immediate(i)) => Some(i.value as i64),
+                                Some(Operand::Register(s)) if is_zero_register(s.name()) => Some(0),
+                                Some(Operand::Register(s)) => {
+                                    regs.get(&canon_reg(s.name())).copied()
+                                }
+                                _ => None,
+                            };
+                            // A narrow store keeps only its low bytes (`strb`/`mov [..],al`).
+                            let bits = u16::from(m.size).saturating_mul(8);
+                            set_slot(&mut slots, k, v.map(|x| mask_flag(x, bits)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // aarch64 `strb <src>, [x29 - K]` — the flag spill in the opposite operand order
+            // from the x86 Move store above. `<src>` may be the zero register (`strb wzr`).
+            Operation::Store => {
+                if let (Some(Operand::Register(s)), Some(Operand::Memory(m))) =
+                    (inst.operands.first(), inst.operands.get(1))
+                {
+                    if let Some(k) = mem_slot(m) {
+                        let v = if is_zero_register(s.name()) {
+                            Some(0)
+                        } else {
+                            regs.get(&canon_reg(s.name())).copied()
+                        };
+                        let bits = u16::from(m.size).saturating_mul(8);
+                        set_slot(&mut slots, k, v.map(|x| mask_flag(x, bits)));
+                    }
+                }
+            }
+            // `xor r, r` (x86, 2-operand) and `eor d, s, s` (aarch64, 3-operand) both zero the
+            // destination ONLY when the two SOURCE operands are the same register. `eor d, s1, s2`
+            // with distinct sources depends on s2, so it must invalidate the destination instead.
+            Operation::Xor => {
+                let dst = match inst.operands.first() {
+                    Some(Operand::Register(d)) => Some(canon_reg(d.name())),
+                    _ => None,
+                };
+                let (src_a, src_b) = if inst.operands.len() >= 3 {
+                    (inst.operands.get(1), inst.operands.get(2))
+                } else {
+                    (inst.operands.first(), inst.operands.get(1))
+                };
+                let zeroed = matches!(
+                    (src_a, src_b),
+                    (Some(Operand::Register(a)), Some(Operand::Register(b)))
+                        if canon_reg(a.name()) == canon_reg(b.name())
+                );
+                if let Some(dc) = dst {
+                    if zeroed {
+                        regs.insert(dc, 0);
+                    } else {
+                        regs.remove(&dc);
+                    }
+                }
+            }
+            // `and w8, w8, #0xff` (aarch64, 3-operand) / `and eax, #imm` (x86, 2-operand) masks
+            // the flag before it is re-spilled. `is_pure_flag_copy_block` walks through it, so it
+            // must be modeled: propagate `src & imm` when both are known, else invalidate the dst.
+            Operation::And => {
+                let dst = match inst.operands.first() {
+                    Some(Operand::Register(d)) => Some(canon_reg(d.name())),
+                    _ => None,
+                };
+                let (src, imm) = if inst.operands.len() >= 3 {
+                    (inst.operands.get(1), inst.operands.get(2))
+                } else {
+                    (inst.operands.first(), inst.operands.get(1))
+                };
+                let sval = match src {
+                    Some(Operand::Register(s)) => regs.get(&canon_reg(s.name())).copied(),
+                    _ => None,
+                };
+                let ival = match imm {
+                    Some(Operand::Immediate(i)) => Some(i.value as i64),
+                    _ => None,
+                };
+                if let Some(dc) = dst {
+                    match (sval, ival) {
+                        (Some(s), Some(i)) => {
+                            regs.insert(dc, s & i);
+                        }
+                        _ => {
+                            regs.remove(&dc);
+                        }
+                    }
+                }
+            }
+            Operation::Compare | Operation::Test => {}
+            _ => {
+                if let Some(Operand::Register(d)) = inst.operands.first() {
+                    regs.remove(&canon_reg(d.name()));
+                }
+            }
+        }
+    }
+    slots.get(slot).copied()
 }
 
 pub fn rewrite_clang_resume_dispatch(
@@ -200,10 +715,14 @@ pub fn rewrite_clang_resume_dispatch(
             }
         }
         rederive_edges(&mut rewritten);
+        // Record the resume targets (and their shared flag-check merges / segment starts) for
+        // the structurer's goto-based dispatch rendering.
+        let resume_targets = dispatch_resume_targets(&rewritten, disp.dispatch);
         return Some(ClangResumeRewrite {
             cfg: rewritten,
             index_offset: disp.index_offset,
             two_way_default: false,
+            resume_targets,
         });
     }
 
@@ -285,10 +804,12 @@ pub fn rewrite_clang_resume_dispatch(
         };
     }
     rederive_edges(&mut rewritten);
+    let resume_targets = dispatch_resume_targets(&rewritten, disp.dispatch);
     Some(ClangResumeRewrite {
         cfg: rewritten,
         index_offset: disp.index_offset,
         two_way_default: true,
+        resume_targets,
     })
 }
 
@@ -3251,5 +3772,376 @@ mod tests {
 
         repair_nop_jump_returns(&mut cfg, None);
         assert_eq!(cfg.block(a).unwrap().terminator, BlockTerminator::Return);
+    }
+
+    // Build a pure flag-check merge: `mov al,[rbp-0xb5]; mov [rbp-0xb6],al; mov al,[rbp-0xb6];
+    // test al,al; je true_target (else false_target)`. clang routes the SUSPEND edge here with
+    // the flag = 0xff and the RESUME edge with the flag = 0.
+    fn flag_merge_block(
+        id: BasicBlockId,
+        true_target: BasicBlockId,
+        false_target: BasicBlockId,
+    ) -> BasicBlock {
+        let (rbp, al) = (r(5, 64), r(0, 8));
+        let mut b = BasicBlock::new(id, 0x900);
+        b.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb5, 1)),
+        ));
+        b.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb6, 1)),
+            Operand::Register(al),
+        ));
+        b.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb6, 1)),
+        ));
+        b.instructions.push(test_ii(al));
+        b.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target,
+            false_target,
+        };
+        b
+    }
+
+    #[test]
+    fn flag_check_merge_resolves_resume_vs_suspend() {
+        let (seg, ret) = (BasicBlockId::new(1), BasicBlockId::new(2));
+        let merge = flag_merge_block(BasicBlockId::new(0), seg, ret);
+        let fm = analyze_flag_check_merge(&merge).expect("recognized as flag-check merge");
+        // flag == 0 (resume edge) → `je` taken → segment; flag == 0xff (suspend) → return.
+        assert_eq!(fm.resolve(0), seg, "resume edge routes to the segment");
+        assert_eq!(fm.resolve(0xff), ret, "suspend edge routes to return");
+    }
+
+    #[test]
+    fn flag_check_merge_recognizes_aarch64_store_spill() {
+        // aarch64 shape: `ldrb w0,[x29-0xb5]; strb w0,[x29-0xb6]; ldrb w0,[x29-0xb6]; test; b.eq`.
+        // The copy is a `Operation::Store` with operands `[Register, Memory]` (opposite order
+        // from the x86 `mov [mem], reg`), which must still be recognized.
+        let (x29, w0) = (r(29, 64), r(0, 8));
+        let (seg, ret) = (BasicBlockId::new(1), BasicBlockId::new(2));
+        let mut b = BasicBlock::new(BasicBlockId::new(0), 0x900);
+        let load = |disp| {
+            Instruction::new(0, 4, vec![], "ldrb")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(w0),
+                    Operand::Memory(MemoryRef::base_disp(x29, disp, 1)),
+                ])
+        };
+        b.instructions.push(load(-0xb5));
+        b.instructions.push(
+            Instruction::new(0, 4, vec![], "strb")
+                .with_operation(Operation::Store)
+                .with_operands(vec![
+                    Operand::Register(w0),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0xb6, 1)),
+                ]),
+        );
+        b.instructions.push(load(-0xb6));
+        b.instructions.push(test_ii(w0));
+        b.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: seg,
+            false_target: ret,
+        };
+        let fm = analyze_flag_check_merge(&b).expect("aarch64 Store-form merge recognized");
+        assert_eq!(fm.resolve(0), seg);
+        assert_eq!(fm.resolve(0xff), ret);
+    }
+
+    #[test]
+    fn flag_check_merge_recognizes_aarch64_mask_and_cbz() {
+        // aarch64 folds the test into the branch: `ldr w8,[x29-0xb5]; and w8,w8,#0xff; cbz w8,seg`.
+        // There is no separate `test`/`cmp`; the mask must be allowed and the `cbz` (a
+        // `ConditionalJump` whose operand is the flag reg) must be read as the zero test.
+        let (x29, w8) = (r(29, 64), r(8, 8));
+        let (seg, ret) = (BasicBlockId::new(1), BasicBlockId::new(2));
+        let mut b = BasicBlock::new(BasicBlockId::new(0), 0x900);
+        b.instructions.push(
+            Instruction::new(0, 4, vec![], "ldrb")
+                .with_operation(Operation::Load)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0xb5, 1)),
+                ]),
+        );
+        b.instructions.push(
+            Instruction::new(0, 4, vec![], "and")
+                .with_operation(Operation::And)
+                .with_operands(vec![Operand::Register(w8), Operand::Register(w8), imm1(8)]),
+        );
+        b.instructions.push(
+            Instruction::new(0, 4, vec![], "cbz")
+                .with_operation(Operation::ConditionalJump)
+                .with_operands(vec![Operand::Register(w8)]),
+        );
+        // `cbz` branches when the reg is zero, so the taken (Equal) edge is the resume segment.
+        b.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: seg,
+            false_target: ret,
+        };
+        let fm = analyze_flag_check_merge(&b).expect("aarch64 mask+cbz merge recognized");
+        assert_eq!(
+            fm.resolve(0),
+            seg,
+            "flag==0 (resume) -> cbz taken -> segment"
+        );
+        assert_eq!(
+            fm.resolve(0xff),
+            ret,
+            "flag!=0 (suspend) -> cbz not taken -> return"
+        );
+    }
+
+    #[test]
+    fn resume_segment_start_walks_copy_block_before_merge() {
+        // clang -O0 can spill the flag through a pure copy block before the check:
+        //   stub: xor eax,eax; mov [rbp-0xb0],al; jmp copy   (flag = 0 into slot A)
+        //   copy: mov al,[rbp-0xb0]; mov [rbp-0xb5],al; jmp merge   (A -> B, the merge's input)
+        //   merge: <flag-check on B> je seg else ret
+        // The merge is NOT the stub's immediate successor, and the flag reaches it via slot B.
+        let (rbp, rax, al) = (r(5, 64), r(0, 64), r(0, 8));
+        let (stub, copy, merge, seg, ret) = (
+            BasicBlockId::new(0),
+            BasicBlockId::new(1),
+            BasicBlockId::new(2),
+            BasicBlockId::new(3),
+            BasicBlockId::new(4),
+        );
+        let mut cfg = ControlFlowGraph::new(stub);
+
+        let mut s = BasicBlock::new(stub, 0x800);
+        s.instructions.push(
+            Instruction::new(0, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(rax), Operand::Register(rax)]),
+        );
+        s.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb0, 1)),
+            Operand::Register(al),
+        ));
+        s.terminator = BlockTerminator::Jump { target: copy };
+        cfg.add_block(s);
+
+        let mut c = BasicBlock::new(copy, 0x820);
+        c.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb0, 1)),
+        ));
+        c.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb5, 1)),
+            Operand::Register(al),
+        ));
+        // The CFG builder keeps the block's own `jmp` in the instruction list; `is_pure_flag_copy_block`
+        // must still accept the block (a real clang -O0 copy block looks like this).
+        c.instructions.push(
+            Instruction::new(0, 5, vec![], "jmp")
+                .with_operation(Operation::Jump)
+                .with_operands(vec![Operand::pc_rel(0, 0x900)]),
+        );
+        c.terminator = BlockTerminator::Jump { target: merge };
+        cfg.add_block(c);
+
+        cfg.add_block(flag_merge_block(merge, seg, ret));
+        cfg.add_block(BasicBlock::new(seg, 0x960));
+        cfg.add_block(BasicBlock::new(ret, 0x980));
+        rederive_edges(&mut cfg);
+
+        assert_eq!(
+            resume_segment_start(&cfg, stub),
+            Some((merge, seg)),
+            "must walk the copy block to the merge and resolve the flag through slot B"
+        );
+    }
+
+    #[test]
+    fn resume_segment_start_rejects_suspend_flag_target() {
+        // `dispatch_resume_targets` probes every indirect-jump target, including body blocks that
+        // reach the merge with the SUSPEND flag (0xff). Such a target resolves to the return edge
+        // and must NOT be marked a resume segment.
+        let (rbp, al) = (r(5, 64), r(0, 8));
+        let (stub, merge, seg, ret) = (
+            BasicBlockId::new(0),
+            BasicBlockId::new(1),
+            BasicBlockId::new(2),
+            BasicBlockId::new(3),
+        );
+        let mut cfg = ControlFlowGraph::new(stub);
+
+        let mut s = BasicBlock::new(stub, 0x800);
+        s.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Immediate(hexray_core::Immediate {
+                value: 0xff,
+                size: 8,
+                signed: false,
+            }),
+        ));
+        s.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb5, 1)),
+            Operand::Register(al),
+        ));
+        s.terminator = BlockTerminator::Jump { target: merge };
+        cfg.add_block(s);
+
+        cfg.add_block(flag_merge_block(merge, seg, ret));
+        cfg.add_block(BasicBlock::new(seg, 0x960));
+        cfg.add_block(BasicBlock::new(ret, 0x980));
+        rederive_edges(&mut cfg);
+
+        assert_eq!(
+            resume_segment_start(&cfg, stub),
+            None,
+            "a suspend-flag (0xff) target must not be marked a resume segment"
+        );
+    }
+
+    #[test]
+    fn pred_slot_constant_handles_aarch64_zero_idioms() {
+        let x29 = r(29, 64);
+        let (w8, w9) = (r(8, 64), r(9, 64));
+        let wzr = Register::new(Architecture::Arm64, RegisterClass::General, 32, 32);
+        assert_eq!(wzr.name(), "wzr");
+        let slot = (canon_reg(x29.name()), -0xb5i64);
+        let store_w8 = || {
+            Instruction::new(0, 4, vec![], "strb")
+                .with_operation(Operation::Store)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Memory(MemoryRef::base_disp(x29, -0xb5, 1)),
+                ])
+        };
+        let eor = |a: Register, b: Register| {
+            Instruction::new(0, 4, vec![], "eor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![
+                    Operand::Register(w8),
+                    Operand::Register(a),
+                    Operand::Register(b),
+                ])
+        };
+
+        // `mov w8, wzr; strb w8, [x29-0xb5]` materializes zero from the zero register.
+        let mov_wzr = Instruction::new(0, 4, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(w8), Operand::Register(wzr)]);
+        assert_eq!(pred_slot_constant(&[mov_wzr, store_w8()], &slot), Some(0));
+
+        // `eor w8, w8, w9` depends on w9 — NOT a proven zero.
+        assert_eq!(pred_slot_constant(&[eor(w8, w9), store_w8()], &slot), None);
+        // `eor w8, w9, w9` zeroes (identical sources).
+        assert_eq!(
+            pred_slot_constant(&[eor(w9, w9), store_w8()], &slot),
+            Some(0)
+        );
+
+        // `mov w8, wzr; and w8, w8, #0xff; strb w8, [slot]` — the mask must preserve zero.
+        let mov0 = Instruction::new(0, 4, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(w8), Operand::Register(wzr)]);
+        let mask = Instruction::new(0, 4, vec![], "and")
+            .with_operation(Operation::And)
+            .with_operands(vec![Operand::Register(w8), Operand::Register(w8), imm1(8)]);
+        assert_eq!(
+            pred_slot_constant(&[mov0, mask, store_w8()], &slot),
+            Some(0)
+        );
+
+        // A narrow store keeps only its low byte: `mov w8, #-1; strb w8, [slot]` records 0xff.
+        let mov_neg1 = Instruction::new(0, 4, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![
+                Operand::Register(w8),
+                Operand::Immediate(hexray_core::Immediate {
+                    value: -1,
+                    size: 64,
+                    signed: true,
+                }),
+            ]);
+        assert_eq!(
+            pred_slot_constant(&[mov_neg1, store_w8()], &slot),
+            Some(0xff)
+        );
+    }
+
+    #[test]
+    fn dispatch_resume_targets_breaks_out_merge_segment_and_join() {
+        // dispatch --(indirect)--> {state0, stub}
+        // stub:  xor eax,eax; mov [rbp-0xb5],al; jmp merge       (flag = 0)
+        // merge: <flag-check>  je seg (resume) else ret          (resolve(0) == seg)
+        // seg:   ... jmp mid                                     (single successor)
+        // mid:   ... jmp join                                    (single successor)
+        // join:  <shared with `other`>                           (two predecessors)
+        let (rbp, rax, al) = (r(5, 64), r(0, 64), r(0, 8));
+        let dispatch = BasicBlockId::new(0);
+        let state0 = BasicBlockId::new(1);
+        let stub = BasicBlockId::new(2);
+        let merge = BasicBlockId::new(3);
+        let seg = BasicBlockId::new(4);
+        let ret = BasicBlockId::new(5);
+        let mid = BasicBlockId::new(6);
+        let join = BasicBlockId::new(7);
+        let other = BasicBlockId::new(8);
+
+        let mut cfg = ControlFlowGraph::new(dispatch);
+
+        let mut d = BasicBlock::new(dispatch, 0x800);
+        d.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![state0, stub],
+        };
+        cfg.add_block(d);
+        cfg.add_block(BasicBlock::new(state0, 0x810));
+
+        let mut s = BasicBlock::new(stub, 0x820);
+        s.instructions.push(
+            Instruction::new(0, 2, vec![], "xor")
+                .with_operation(Operation::Xor)
+                .with_operands(vec![Operand::Register(rax), Operand::Register(rax)]),
+        );
+        s.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0xb5, 1)),
+            Operand::Register(al),
+        ));
+        s.terminator = BlockTerminator::Jump { target: merge };
+        cfg.add_block(s);
+
+        cfg.add_block(flag_merge_block(merge, seg, ret));
+        cfg.add_block(BasicBlock::new(ret, 0x950));
+
+        let mut seg_b = BasicBlock::new(seg, 0x960);
+        seg_b.terminator = BlockTerminator::Jump { target: mid };
+        cfg.add_block(seg_b);
+
+        let mut mid_b = BasicBlock::new(mid, 0x970);
+        mid_b.terminator = BlockTerminator::Jump { target: join };
+        cfg.add_block(mid_b);
+
+        cfg.add_block(BasicBlock::new(join, 0x980));
+
+        // `other` also flows into `join`, making it a shared (multi-pred) join.
+        let mut other_b = BasicBlock::new(other, 0x990);
+        other_b.terminator = BlockTerminator::Jump { target: join };
+        cfg.add_block(other_b);
+
+        rederive_edges(&mut cfg);
+
+        let targets = dispatch_resume_targets(&cfg, dispatch);
+        // The raw indirect-jump targets, PLUS the shared merge, the resume segment start, and
+        // the value-discriminated body join — all broken out so the segment renders once.
+        for expected in [state0, stub, merge, seg, join] {
+            assert!(
+                targets.contains(&expected),
+                "missing {expected:?} in {targets:?}"
+            );
+        }
+        assert!(
+            !targets.contains(&ret),
+            "the suspend/return target must NOT be a resume target"
+        );
     }
 }

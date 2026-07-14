@@ -344,7 +344,10 @@ fn convert_global_goto_in_node(
 /// Converts gotos in switch cases to break statements when they target
 /// a block that comes after the switch.
 /// This handles patterns where switch cases use goto to exit to a common point.
-pub(super) fn convert_switch_gotos_to_break(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+pub(super) fn convert_switch_gotos_to_break(
+    nodes: Vec<StructuredNode>,
+    coroutine_targets: &HashSet<BasicBlockId>,
+) -> Vec<StructuredNode> {
     // First pass: identify switches followed by labels
     // Those labels are switch exit points and gotos to them should be breaks
     let mut switch_exits = HashSet::new();
@@ -354,7 +357,12 @@ pub(super) fn convert_switch_gotos_to_break(nodes: Vec<StructuredNode>) -> Vec<S
             // Check if there's a label after the switch
             if i + 1 < nodes.len() {
                 if let StructuredNode::Label(label_id) = &nodes[i + 1] {
-                    switch_exits.insert(*label_id);
+                    // A coroutine resume-state label after the dispatch switch is NOT a
+                    // switch exit — it is the head of the shared body, and `case i: goto L_si`
+                    // must jump INTO it, not `break`. Never treat it as an exit.
+                    if !coroutine_targets.contains(label_id) {
+                        switch_exits.insert(*label_id);
+                    }
                 }
             }
         }
@@ -366,7 +374,12 @@ pub(super) fn convert_switch_gotos_to_break(nodes: Vec<StructuredNode>) -> Vec<S
         if let StructuredNode::Switch { cases, default, .. } = node {
             let common_target = find_common_goto_target(cases, default);
             if let Some(target) = common_target {
-                switch_exits.insert(target);
+                // A coroutine resume-state label is a required `case i: goto L_si` dispatch
+                // edge into the shared body, never a switch exit — even when several arms (or
+                // an arm plus default) target it. Keep it out of the exit set.
+                if !coroutine_targets.contains(&target) {
+                    switch_exits.insert(target);
+                }
             }
         }
     }
@@ -374,7 +387,7 @@ pub(super) fn convert_switch_gotos_to_break(nodes: Vec<StructuredNode>) -> Vec<S
     // Second pass: convert gotos in switches
     nodes
         .into_iter()
-        .map(|node| convert_switch_gotos_in_node(node, &switch_exits))
+        .map(|node| convert_switch_gotos_in_node(node, &switch_exits, coroutine_targets))
         .collect()
 }
 
@@ -434,6 +447,7 @@ fn get_trailing_goto(nodes: &[StructuredNode]) -> Option<BasicBlockId> {
 fn convert_switch_gotos_in_node(
     node: StructuredNode,
     switch_exits: &HashSet<BasicBlockId>,
+    coroutine_targets: &HashSet<BasicBlockId>,
 ) -> StructuredNode {
     match node {
         StructuredNode::Switch {
@@ -466,8 +480,8 @@ fn convert_switch_gotos_in_node(
             else_body,
         } => StructuredNode::If {
             condition,
-            then_body: convert_switch_gotos_to_break(then_body),
-            else_body: else_body.map(convert_switch_gotos_to_break),
+            then_body: convert_switch_gotos_to_break(then_body, coroutine_targets),
+            else_body: else_body.map(|b| convert_switch_gotos_to_break(b, coroutine_targets)),
         },
         StructuredNode::While {
             condition,
@@ -476,7 +490,7 @@ fn convert_switch_gotos_in_node(
             exit_block,
         } => StructuredNode::While {
             condition,
-            body: convert_switch_gotos_to_break(body),
+            body: convert_switch_gotos_to_break(body, coroutine_targets),
             header,
             exit_block,
         },
@@ -486,7 +500,7 @@ fn convert_switch_gotos_in_node(
             header,
             exit_block,
         } => StructuredNode::DoWhile {
-            body: convert_switch_gotos_to_break(body),
+            body: convert_switch_gotos_to_break(body, coroutine_targets),
             condition,
             header,
             exit_block,
@@ -496,7 +510,7 @@ fn convert_switch_gotos_in_node(
             header,
             exit_block,
         } => StructuredNode::Loop {
-            body: convert_switch_gotos_to_break(body),
+            body: convert_switch_gotos_to_break(body, coroutine_targets),
             header,
             exit_block,
         },
@@ -511,22 +525,22 @@ fn convert_switch_gotos_in_node(
             init,
             condition,
             update,
-            body: convert_switch_gotos_to_break(body),
+            body: convert_switch_gotos_to_break(body, coroutine_targets),
             header,
             exit_block,
         },
         StructuredNode::Sequence(nodes) => {
-            StructuredNode::Sequence(convert_switch_gotos_to_break(nodes))
+            StructuredNode::Sequence(convert_switch_gotos_to_break(nodes, coroutine_targets))
         }
         StructuredNode::TryCatch {
             try_body,
             catch_handlers,
         } => StructuredNode::TryCatch {
-            try_body: convert_switch_gotos_to_break(try_body),
+            try_body: convert_switch_gotos_to_break(try_body, coroutine_targets),
             catch_handlers: catch_handlers
                 .into_iter()
                 .map(|h| CatchHandler {
-                    body: convert_switch_gotos_to_break(h.body),
+                    body: convert_switch_gotos_to_break(h.body, coroutine_targets),
                     ..h
                 })
                 .collect(),
