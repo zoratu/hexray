@@ -735,6 +735,83 @@ pub fn rewrite_clang_resume_dispatch(
     // slice can walk the chain). A true two-state dispatch tests the index in-register
     // and never spills it.
     if dispatch_spills_index(dispatch_block, disp.index_offset, disp.index_size, &frame_slots) {
+        // A spilled index is clang's >2-state compare CHAIN: read the index, spill it, then a
+        // chain of blocks each reload+test it (`sub/test/cmp; je`) peeling one state per
+        // compare. Flatten it by CONCRETELY evaluating the chain for each resume index
+        // `0..=max` (bounded by the resume-index stores) to map value->state, then rewrite to
+        // an N-way IndirectJump — the same switch/naming pipeline the jump-table shape uses.
+        // Require a 1-byte resume index (clang's form). `max_resume_index_store` only counts
+        // stored values `0..256`, so a wider index with states above 255 could be
+        // under-bounded — lower stores would make `max_state` look complete while higher
+        // states are dropped. (The `sub al,K`/`test al,K` chain idioms are byte-width too.)
+        if disp.index_size != 1 {
+            return None;
+        }
+        if let Some(max_state) =
+            max_resume_index_store(cfg, disp.index_offset, disp.index_size, &frame_slots)
+        {
+            if max_state >= 2 {
+                // Walk on the REPAIRED CFG: clang's `e9 00000000` no-op jumps are mislabeled
+                // `Return` by the CFG builder, and `repair_nop_jump_returns` turns them into
+                // `Fallthrough` connectors — so flattening on the repaired graph lets the
+                // walker skip them uniformly (and the same graph becomes the rewrite output).
+                let mut rewritten = repaired_cfg(cfg, relocations);
+                if let Some((states, consumed)) = flatten_compare_chain(
+                    &rewritten,
+                    disp.dispatch,
+                    disp.index_offset,
+                    disp.index_size,
+                    &frame_slots,
+                    max_state,
+                ) {
+                    let index_operand = resume_index_operand(
+                        dispatch_block,
+                        disp.index_offset,
+                        disp.index_size,
+                    )?;
+                    if matches!(index_operand, Operand::Register(_)) {
+                        {
+                            let d = rewritten.block_mut(disp.dispatch)?;
+                            d.terminator = BlockTerminator::IndirectJump {
+                                target: index_operand,
+                                possible_targets: states,
+                            };
+                            // The compare-chain arithmetic that drove the old branch (`sub al,K`,
+                            // `cmp`/`test`/`and`) is dead now that this block is the switch header,
+                            // and it MUTATES the resume-index register the IndirectJump reads.
+                            // Drop it so the switch reads the raw index and no bogus `al -= K`
+                            // statement precedes `switch(frame->__resume_index)`. The index
+                            // materialization (Move/Load) is kept.
+                            d.instructions.retain(|i| {
+                                !matches!(
+                                    i.operation,
+                                    Operation::Sub
+                                        | Operation::Compare
+                                        | Operation::Test
+                                        | Operation::And
+                                )
+                            });
+                        }
+                        rederive_edges(&mut rewritten);
+                        // The IndirectJump now bypasses the comparator chain, so the original
+                        // `sub al,K; je …` comparator blocks are unreachable dead code that would
+                        // otherwise decompile as orphan labeled comparisons. Drop ONLY those
+                        // consumed comparators that are now unreachable (never an unrelated block).
+                        rewritten = prune_dead_chain_blocks(&rewritten, &consumed);
+                        // Same per-state body extraction as the jump-table path: record the
+                        // resume targets (+ their merges / segment starts) for the structurer.
+                        let resume_targets =
+                            dispatch_resume_targets(&rewritten, disp.dispatch);
+                        return Some(ClangResumeRewrite {
+                            cfg: rewritten,
+                            index_offset: disp.index_offset,
+                            two_way_default: false,
+                            resume_targets,
+                        });
+                    }
+                }
+            }
+        }
         return None;
     }
 
@@ -1133,6 +1210,551 @@ fn resolved_jump_table_targets(
     Some(targets)
 }
 
+/// Flatten a multi-state clang compare-CHAIN dispatch into an ordered list of resume-state
+/// target blocks `[state 0, state 1, .., state max_state]`.
+///
+/// clang -O0 lowers a >2-state resume dispatch as a chain: read the resume index, spill it,
+/// then a sequence of blocks each RELOADING the index and testing it with a `sub`/`test`/`cmp`
+/// idiom + `je`/`jne`, peeling one state per compare. The idioms are not uniform (`sub al,2;
+/// je` means `==2`; `test al,3; je` means `(idx&3)==0`, i.e. `idx==0` for a small index), so
+/// rather than decode each we CONCRETELY EXECUTE the chain for every candidate resume index
+/// `0..=max_state` (bounded by the resume-index stores the function makes) and record which
+/// block each value lands in. Returns `None` if any value can't be resolved (an unrecognized
+/// instruction, an index-independent branch, or an over-long walk) so an unexpected shape
+/// declines rather than mis-maps states.
+fn flatten_compare_chain(
+    cfg: &ControlFlowGraph,
+    dispatch: BasicBlockId,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+    max_state: i64,
+) -> Option<(Vec<BasicBlockId>, Vec<BasicBlockId>)> {
+    let index_slots = chain_index_spill_slots(cfg.block(dispatch)?, index_offset, index_size, frame_slots);
+    // Without a recovered spill slot the walker can't tell a continuation comparator from a
+    // resume state (it recognizes chain blocks by their index reload), so an unrecognized
+    // spill shape (e.g. the index masked/copied before the store) must decline rather than
+    // mistake the next comparator for a state.
+    if index_slots.is_empty() {
+        return None;
+    }
+    let mut states: Vec<BasicBlockId> = Vec::new();
+    // Union of dispatch/comparator blocks the walks execute — the only blocks the caller may
+    // drop (and only those the IndirectJump orphans), so an unrelated switch is never touched.
+    let mut consumed: Vec<BasicBlockId> = Vec::new();
+    for v in 0..=max_state {
+        states.push(walk_chain_for_value(
+            cfg,
+            dispatch,
+            v,
+            index_offset,
+            index_size,
+            frame_slots,
+            &index_slots,
+            &mut consumed,
+        )?);
+    }
+    // Must be a genuine multi-way dispatch: at least two distinct resume-point blocks.
+    let distinct = {
+        let mut u: Vec<BasicBlockId> = Vec::new();
+        for s in &states {
+            if !u.contains(s) {
+                u.push(*s);
+            }
+        }
+        u.len()
+    };
+    if distinct < 2 {
+        return None;
+    }
+    // A block that is a resume STATE for some value must never be dropped as a comparator.
+    consumed.retain(|b| !states.contains(b));
+    Some((states, consumed))
+}
+
+/// The stack slots the dispatch block spills the freshly-read resume index to (so a later
+/// reload in a chain block re-establishes it). `mov reg, [frame+off]` then `mov [slot], reg`.
+fn chain_index_spill_slots(
+    dispatch: &BasicBlock,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+) -> Vec<SpillSlot> {
+    let mut frame_regs: Vec<String> = Vec::new();
+    let mut idx_regs: Vec<String> = Vec::new();
+    let mut slots: Vec<SpillSlot> = Vec::new();
+    for inst in &dispatch.instructions {
+        match (inst.operands.first(), inst.operands.get(1)) {
+            (Some(Operand::Register(d)), Some(Operand::Memory(m))) => {
+                let dc = canon_reg(d.name());
+                let base = m.base.as_ref();
+                let is_frame_reload = base.is_some_and(|b| {
+                    is_frame_base_register(b.name())
+                        && m.index.is_none()
+                        && frame_slots.contains(&(canon_reg(b.name()), m.displacement))
+                });
+                let is_index_read = base.is_some_and(|b| {
+                    m.index.is_none()
+                        && m.displacement == index_offset
+                        && u16::from(m.size) == u16::from(index_size)
+                        && frame_regs.contains(&canon_reg(b.name()))
+                });
+                idx_regs.retain(|r| r != &dc);
+                frame_regs.retain(|r| r != &dc);
+                if is_frame_reload {
+                    frame_regs.push(dc);
+                } else if is_index_read {
+                    idx_regs.push(dc);
+                }
+            }
+            (Some(Operand::Memory(m)), Some(Operand::Register(s))) => {
+                if m.index.is_none() && idx_regs.contains(&canon_reg(s.name())) {
+                    if let Some(b) = &m.base {
+                        slots.push((canon_reg(b.name()), m.displacement));
+                    }
+                }
+            }
+            (Some(Operand::Register(d)), _) => {
+                let dc = canon_reg(d.name());
+                idx_regs.retain(|r| r != &dc);
+                frame_regs.retain(|r| r != &dc);
+            }
+            _ => {}
+        }
+    }
+    slots
+}
+
+/// Concretely execute the compare chain from `dispatch` assuming the resume index equals `v`,
+/// returning the resume-state block `v` lands in. Follows index-decided branches through
+/// reload/re-read blocks; stops at the first branch target that no longer re-establishes the
+/// index (the state body).
+#[allow(clippy::too_many_arguments)]
+fn walk_chain_for_value(
+    cfg: &ControlFlowGraph,
+    dispatch: BasicBlockId,
+    v: i64,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+    index_slots: &[SpillSlot],
+    consumed: &mut Vec<BasicBlockId>,
+) -> Option<BasicBlockId> {
+    use std::collections::HashMap;
+    let mut regs: HashMap<String, i64> = HashMap::new();
+    // Bits to which each register's tracked constant is actually DEFINED (the resume index is a
+    // 1-byte load canonicalized to the full register, so a wider read must decline, not resolve).
+    let mut reg_widths: HashMap<String, u16> = HashMap::new();
+    let mut slots: HashMap<SpillSlot, i64> = HashMap::new();
+    let mut frame_regs: Vec<String> = Vec::new();
+    let mut zf: Option<bool> = None;
+    let mut cur = dispatch;
+
+    for _ in 0..256 {
+        // Every block executed here is dispatch/comparator logic (a resume state is RETURNED,
+        // never executed) — record it so the caller can drop the ones the IndirectJump orphans.
+        if !consumed.contains(&cur) {
+            consumed.push(cur);
+        }
+        let block = cfg.block(cur)?;
+        for inst in &block.instructions {
+            match inst.operation {
+                Operation::Move | Operation::Load => match (inst.operands.first(), inst.operands.get(1)) {
+                    (Some(Operand::Register(d)), Some(Operand::Memory(m))) => {
+                        let dc = canon_reg(d.name());
+                        let base = m.base.as_ref();
+                        let is_frame_reload = base.is_some_and(|b| {
+                            is_frame_base_register(b.name())
+                                && m.index.is_none()
+                                && frame_slots.contains(&(canon_reg(b.name()), m.displacement))
+                        });
+                        let is_index_read = base.is_some_and(|b| {
+                            m.index.is_none()
+                                && m.displacement == index_offset
+                                && u16::from(m.size) == u16::from(index_size)
+                                && frame_regs.contains(&canon_reg(b.name()))
+                        });
+                        let slot = base.map(|b| (canon_reg(b.name()), m.displacement));
+                        let is_index_reload =
+                            m.index.is_none() && slot.as_ref().is_some_and(|s| index_slots.contains(s));
+                        regs.remove(&dc);
+                        reg_widths.remove(&dc);
+                        frame_regs.retain(|r| r != &dc);
+                        // The frame index read defines the whole destination (`mov al` -> 8 bits;
+                        // `movzx eax, byte` -> 32 zero-extended bits). Register `.size` is already
+                        // in bits (memory `.size` is bytes), so do NOT scale d.size.
+                        let def_bits = d.size;
+                        // A reload from a SCRATCH spill slot is only valid to the width that was
+                        // SPILLED there (the 1-byte index); a wider load pulls in adjacent stack
+                        // bytes, so cap the defined width at index_size (bytes -> bits).
+                        let reload_bits = def_bits.min(u16::from(index_size).saturating_mul(8));
+                        if is_frame_reload {
+                            frame_regs.push(dc);
+                        } else if is_index_read {
+                            regs.insert(dc.clone(), v);
+                            reg_widths.insert(dc, def_bits);
+                        } else if is_index_reload {
+                            if let Some(val) = slot.and_then(|s| slots.get(&s).copied()) {
+                                regs.insert(dc.clone(), val);
+                                reg_widths.insert(dc, reload_bits);
+                            }
+                        }
+                    }
+                    (Some(Operand::Memory(m)), src) => {
+                        if m.index.is_none() {
+                            if let Some(b) = &m.base {
+                                let key = (canon_reg(b.name()), m.displacement);
+                                // Store a known register value; ANY other store (immediate or an
+                                // unknown register) OVERWRITES the slot, so invalidate it — else a
+                                // later reload would read the stale resume index.
+                                match src {
+                                    Some(Operand::Register(s)) => {
+                                        match regs.get(&canon_reg(s.name())).copied() {
+                                            Some(val) => {
+                                                slots.insert(key, val);
+                                            }
+                                            None => {
+                                                slots.remove(&key);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        slots.remove(&key);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (Some(Operand::Register(d)), Some(Operand::Register(s))) => {
+                        let dc = canon_reg(d.name());
+                        let sc = canon_reg(s.name());
+                        let src_frame = frame_regs.contains(&sc);
+                        frame_regs.retain(|r| r != &dc);
+                        reg_widths.remove(&dc);
+                        match regs.get(&sc).copied() {
+                            Some(val) => {
+                                regs.insert(dc.clone(), val);
+                                // The copy is trustworthy only to the source's defined width
+                                // (a wider copy pulls in the source's undefined upper bits).
+                                if let Some(w) = reg_widths.get(&sc).copied() {
+                                    reg_widths.insert(dc.clone(), w);
+                                }
+                            }
+                            None => {
+                                regs.remove(&dc);
+                            }
+                        }
+                        if src_frame {
+                            frame_regs.push(dc);
+                        }
+                    }
+                    (Some(Operand::Register(d)), Some(Operand::Immediate(i))) => {
+                        let dc = canon_reg(d.name());
+                        frame_regs.retain(|r| r != &dc);
+                        regs.insert(dc.clone(), i.value as i64);
+                        reg_widths.insert(dc, d.size);
+                    }
+                    _ => {}
+                },
+                Operation::Sub => {
+                    if let (Some(Operand::Register(d)), Some(Operand::Immediate(i))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    {
+                        let dc = canon_reg(d.name());
+                        match known_reg_value(&regs, &reg_widths, d) {
+                            Some(val) => {
+                                let masked = mask_to(val.wrapping_sub(i.value as i64), d.size);
+                                regs.insert(dc.clone(), masked);
+                                reg_widths.insert(dc, d.size);
+                                zf = Some(masked == 0);
+                            }
+                            None => {
+                                regs.remove(&dc);
+                                reg_widths.remove(&dc);
+                                zf = None;
+                            }
+                        }
+                    } else {
+                        invalidate_arith_dest(&mut regs, &mut reg_widths, inst);
+                        zf = None;
+                    }
+                }
+                Operation::And => {
+                    if let (Some(Operand::Register(d)), Some(Operand::Immediate(i))) =
+                        (inst.operands.first(), inst.operands.get(1))
+                    {
+                        let dc = canon_reg(d.name());
+                        match known_reg_value(&regs, &reg_widths, d) {
+                            Some(val) => {
+                                let masked = mask_to(val & i.value as i64, d.size);
+                                regs.insert(dc.clone(), masked);
+                                reg_widths.insert(dc, d.size);
+                                zf = Some(masked == 0);
+                            }
+                            None => {
+                                regs.remove(&dc);
+                                reg_widths.remove(&dc);
+                                zf = None;
+                            }
+                        }
+                    } else {
+                        invalidate_arith_dest(&mut regs, &mut reg_widths, inst);
+                        zf = None;
+                    }
+                }
+                Operation::Test => {
+                    zf = flag_from_and(&regs, &reg_widths, inst);
+                }
+                Operation::Compare => {
+                    zf = flag_from_cmp(&regs, &reg_widths, inst);
+                }
+                Operation::Jump | Operation::ConditionalJump => {}
+                _ => {
+                    // An unmodeled write clears its destination and any flags it might set.
+                    if let Some(Operand::Register(d)) = inst.operands.first() {
+                        let dc = canon_reg(d.name());
+                        regs.remove(&dc);
+                        reg_widths.remove(&dc);
+                        frame_regs.retain(|r| r != &dc);
+                    }
+                    if instruction_sets_flags(inst.operation) {
+                        zf = None;
+                    }
+                }
+            }
+        }
+
+        let chosen = match &block.terminator {
+            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target } => *target,
+            BlockTerminator::ConditionalBranch {
+                condition,
+                true_target,
+                false_target,
+            } => {
+                let taken = eval_zf_condition(*condition, zf?)?;
+                if taken {
+                    *true_target
+                } else {
+                    *false_target
+                }
+            }
+            _ => return None,
+        };
+        match classify_chain_target(
+            cfg,
+            chosen,
+            index_offset,
+            index_size,
+            frame_slots,
+            index_slots,
+            consumed,
+        ) {
+            Some(next) => cur = next,
+            // Not a continuation comparator: it's the resume state. Return the RESOLVED target
+            // (past any pure jump/fallthrough trampoline clang emits for `je state; jmp …`) so the
+            // switch case points at the actual body block, not an empty connector.
+            None => return Some(skip_noop_connectors(cfg, chosen, consumed)),
+        }
+        zf = None;
+    }
+    None
+}
+
+/// If `target` (after skipping empty no-op-jump connectors) RE-ESTABLISHES the resume index —
+/// either reloads it from a scratch spill slot (`mov reg, [index_slot]`) OR re-reads the frame
+/// field (`mov fp, [frameslot]; mov reg, [fp + index_offset]`) — it continues the dispatch
+/// chain; return that comparator block. Otherwise it's a resume-state body; return `None`.
+///
+/// Recognizing BOTH continuation forms matters: the `walk_chain_for_value` executor models the
+/// frame re-read too, so a re-read comparator must be followed (not mistaken for a state, which
+/// would point cases at the compare block). A block that reads no index (e.g. a state body's
+/// constant-folded await guard `mov al,1; test al,al`) is correctly a state.
+fn classify_chain_target(
+    cfg: &ControlFlowGraph,
+    target: BasicBlockId,
+    index_offset: i64,
+    index_size: u8,
+    frame_slots: &[SpillSlot],
+    index_slots: &[SpillSlot],
+    consumed: &mut Vec<BasicBlockId>,
+) -> Option<BasicBlockId> {
+    let resolved = skip_noop_connectors(cfg, target, consumed);
+    let block = cfg.block(resolved)?;
+    let mut frame_regs: Vec<String> = Vec::new();
+    for inst in &block.instructions {
+        if let (Some(Operand::Register(d)), Some(Operand::Memory(m))) =
+            (inst.operands.first(), inst.operands.get(1))
+        {
+            if matches!(inst.operation, Operation::Move | Operation::Load) {
+                let dc = canon_reg(d.name());
+                let base = m.base.as_ref();
+                let reloads_spill = m.index.is_none()
+                    && base.is_some_and(|b| index_slots.contains(&(canon_reg(b.name()), m.displacement)));
+                let rereads_frame = m.index.is_none()
+                    && m.displacement == index_offset
+                    && u16::from(m.size) == u16::from(index_size)
+                    && base.is_some_and(|b| frame_regs.contains(&canon_reg(b.name())));
+                if reloads_spill || rereads_frame {
+                    return Some(resolved);
+                }
+                let is_frame_reload = base.is_some_and(|b| {
+                    is_frame_base_register(b.name())
+                        && m.index.is_none()
+                        // A frame-pointer reload must be pointer-width: a narrow load
+                        // (`mov eax, [rbp-K]`) truncates the pointer and is NOT one.
+                        && d.size >= b.size
+                        && frame_slots.contains(&(canon_reg(b.name()), m.displacement))
+                });
+                frame_regs.retain(|r| r != &dc);
+                if is_frame_reload {
+                    frame_regs.push(dc);
+                }
+                continue;
+            }
+        }
+        // Any other write to a register clears its frame-pointer status.
+        if let Some(Operand::Register(d)) = inst.operands.first() {
+            frame_regs.retain(|r| r != &canon_reg(d.name()));
+        }
+    }
+    None
+}
+
+/// Follow PURE no-op-jump connectors — blocks that do no real work (empty, or only clang's
+/// `e9 00000000` jump-to-next) and transfer to a single successor — to the first block with
+/// real content. Handles both `Jump` and `Fallthrough` terminators: on the repaired CFG the
+/// mislabeled-`Return` no-op jumps become `Fallthrough` (see `repair_nop_jump_returns`).
+fn skip_noop_connectors(
+    cfg: &ControlFlowGraph,
+    mut id: BasicBlockId,
+    consumed: &mut Vec<BasicBlockId>,
+) -> BasicBlockId {
+    for _ in 0..64 {
+        let Some(b) = cfg.block(id) else {
+            return id;
+        };
+        // Only a block that does NO real work is a connector: every instruction (if any) must be
+        // an unconditional jump — a zero-displacement no-op jump OR a real `jmp next_compare`
+        // trampoline (`cfg_builder` splits `je state; jmp next` so the `jmp` is its own block).
+        // A block with a `mov`/`sub`/etc. is a comparator or a state and must NOT be skipped.
+        let is_pure = b
+            .instructions
+            .iter()
+            .all(|i| is_nop_jump(i) || matches!(i.operation, Operation::Jump));
+        let next = match &b.terminator {
+            BlockTerminator::Jump { target } | BlockTerminator::Fallthrough { target } => {
+                Some(*target)
+            }
+            _ => None,
+        };
+        match (is_pure, next) {
+            (true, Some(t)) => {
+                // This connector is part of the dispatch chain and dies with it — record it so
+                // the caller's prune drops it too (else it dangles, pointing at a removed block).
+                if !consumed.contains(&id) {
+                    consumed.push(id);
+                }
+                id = t;
+            }
+            _ => return id,
+        }
+    }
+    id
+}
+
+/// Evaluate a ZF-based branch condition (`je`/`jne`). Returns `None` for conditions that need
+/// flags this concrete evaluation does not model (the chain uses only equality tests).
+fn eval_zf_condition(cond: Condition, zf: bool) -> Option<bool> {
+    match cond {
+        Condition::Equal => Some(zf),
+        Condition::NotEqual => Some(!zf),
+        _ => None,
+    }
+}
+
+/// ZF from a `test`: `test r, imm` -> `(r & imm) == 0`; `test r, r` -> `r == 0`.
+fn flag_from_and(
+    regs: &std::collections::HashMap<String, i64>,
+    reg_widths: &std::collections::HashMap<String, u16>,
+    inst: &hexray_core::Instruction,
+) -> Option<bool> {
+    match (inst.operands.first(), inst.operands.get(1)) {
+        (Some(Operand::Register(d)), Some(Operand::Immediate(i))) => {
+            let v = known_reg_value(regs, reg_widths, d)?;
+            // `test al, 0xff` decodes the immediate sign-extended (`i.value == -1`); the AND runs
+            // at the register width, so mask the result to it.
+            Some(mask_to(v & i.value as i64, d.size) == 0)
+        }
+        (Some(Operand::Register(d)), Some(Operand::Register(s)))
+            if canon_reg(d.name()) == canon_reg(s.name()) =>
+        {
+            let v = known_reg_value(regs, reg_widths, d)?;
+            Some(mask_to(v, d.size) == 0)
+        }
+        _ => None,
+    }
+}
+
+/// ZF from a `cmp`: `cmp r, imm` -> `r == imm`.
+fn flag_from_cmp(
+    regs: &std::collections::HashMap<String, i64>,
+    reg_widths: &std::collections::HashMap<String, u16>,
+    inst: &hexray_core::Instruction,
+) -> Option<bool> {
+    match (inst.operands.first(), inst.operands.get(1)) {
+        (Some(Operand::Register(d)), Some(Operand::Immediate(i))) => {
+            let v = known_reg_value(regs, reg_widths, d)?;
+            // A byte `cmp al, 0xff` decodes the immediate sign-extended (`i.value == -1`) while
+            // the walked index is `0..=255`; compare at the register width so they match.
+            Some(mask_to(v, d.size) == mask_to(i.value as i64, d.size))
+        }
+        _ => None,
+    }
+}
+
+/// A register's tracked constant, but ONLY if it was DEFINED to at least the width this operand
+/// reads. The resume index is a 1-byte load canonicalized to the full register (`al` -> `rax`);
+/// a later wider consumer (`cmp eax, K`) would read stale upper bits, so decline rather than
+/// resolve a branch that isn't determined solely by the index.
+fn known_reg_value(
+    regs: &std::collections::HashMap<String, i64>,
+    reg_widths: &std::collections::HashMap<String, u16>,
+    reg: &Register,
+) -> Option<i64> {
+    let name = canon_reg(reg.name());
+    // Register `.size` is already in bits (memory `.size` is bytes); do NOT scale it.
+    let read_bits = reg.size;
+    if reg_widths.get(&name).copied().unwrap_or(0) < read_bits {
+        return None;
+    }
+    regs.get(&name).copied()
+}
+
+/// An unsupported arithmetic form (e.g. `sub al, cl`) clobbers its destination with an untracked
+/// operand — drop the tracked value + width so a later compare declines instead of resolving with
+/// a stale resume index.
+fn invalidate_arith_dest(
+    regs: &mut std::collections::HashMap<String, i64>,
+    reg_widths: &mut std::collections::HashMap<String, u16>,
+    inst: &hexray_core::Instruction,
+) {
+    if let Some(Operand::Register(d)) = inst.operands.first() {
+        let dc = canon_reg(d.name());
+        regs.remove(&dc);
+        reg_widths.remove(&dc);
+    }
+}
+
+/// Mask a value to a register's byte width (bits), so flag computations match hardware (a
+/// `sub al, 2` on `al == 0` yields `0xFE`, not `-2`).
+fn mask_to(value: i64, reg_bits: u16) -> i64 {
+    if reg_bits >= 64 {
+        value
+    } else {
+        value & ((1i64 << reg_bits) - 1)
+    }
+}
+
 /// The largest resume-index value the function stores into the FRAME field
 /// `frame->__resume_index` (`mov byte [framereg + index_offset], N`), i.e. the highest state
 /// the coroutine ever arms for a later resume. Used to bound an unbounded resume jump table.
@@ -1244,6 +1866,37 @@ fn rederive_edges(cfg: &mut ControlFlowGraph) {
             cfg.add_edge(id, succ);
         }
     }
+}
+
+/// Rebuild the CFG dropping the dead comparator chain a compare-chain dispatch leaves behind once
+/// it is rewritten to an IndirectJump. Only removes blocks that are BOTH in `consumed` (the walk's
+/// dispatch/comparator blocks) AND transitively unreachable from the entry — so an unrelated
+/// (possibly not-yet-resolved) indirect jump's case blocks are never dropped. Surviving blocks keep
+/// their ids.
+fn prune_dead_chain_blocks(cfg: &ControlFlowGraph, consumed: &[BasicBlockId]) -> ControlFlowGraph {
+    use std::collections::HashSet;
+    let mut reachable: HashSet<BasicBlockId> = HashSet::new();
+    let mut stack = vec![cfg.entry];
+    while let Some(b) = stack.pop() {
+        if reachable.insert(b) {
+            if let Some(block) = cfg.block(b) {
+                stack.extend(block.terminator.successors());
+            }
+        }
+    }
+    let dead: HashSet<BasicBlockId> = consumed
+        .iter()
+        .copied()
+        .filter(|b| *b != cfg.entry && !reachable.contains(b))
+        .collect();
+    let mut fresh = ControlFlowGraph::new(cfg.entry);
+    for block in cfg.blocks() {
+        if !dead.contains(&block.id) {
+            fresh.add_block(block.clone());
+        }
+    }
+    rederive_edges(&mut fresh);
+    fresh
 }
 
 /// Undo the CFG builder's `__x86_return_thunk` heuristic within a coroutine resume
@@ -2738,6 +3391,286 @@ mod tests {
         let mut ctx = BinaryDataContext::new();
         ctx.add_section(JT_BASE, data);
         ctx
+    }
+
+    fn imm(value: i128, size: u8) -> Operand {
+        Operand::Immediate(hexray_core::Immediate { value, size, signed: false })
+    }
+
+    /// A clang -O0 THREE-state compare-chain resume dispatch (states 0, 1, 2):
+    ///   entry:  mov [rbp-0x70], rdi ; jmp D0
+    ///   D0:     mov rax, [rbp-0x70] ; mov al, [rax+0x11] ; mov [rbp-0x50], al
+    ///           sub al, 2 ; je state2 else D1
+    ///   D1:     mov al, [rbp-0x50] ; test al, 3 ; je state0 else state1
+    ///   state0: mov rax, [rbp-0x70] ; movb 1, [rax+0x11] ; ret   (arms state 1)
+    ///   state1: mov rax, [rbp-0x70] ; movb 2, [rax+0x11] ; ret   (arms state 2)
+    ///   state2: ret
+    /// So `sub al,2;je`==2, `test al,3;je`==0, fallthrough==1, and the resume-index stores
+    /// bound the states to `0..=2`.
+    fn shape_compare_chain_cfg() -> ControlFlowGraph {
+        let (rbp, rdi, rax, al) = (r(5, 64), r(7, 64), r(0, 64), r(0, 8));
+        let (d0, d1) = (BasicBlockId::new(1), BasicBlockId::new(5));
+        let (s0, s1, s2) = (BasicBlockId::new(2), BasicBlockId::new(3), BasicBlockId::new(4));
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        let mut entry = BasicBlock::new(BasicBlockId::new(0), 0x400);
+        entry.instructions.push(
+            mov(
+                Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+                Operand::Register(rdi),
+            ),
+        );
+        entry.terminator = BlockTerminator::Jump { target: d0 };
+        cfg.add_block(entry);
+
+        let mut b0 = BasicBlock::new(d0, 0xd12);
+        b0.instructions.push(
+            mov(Operand::Register(rax), Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8))),
+        );
+        b0.instructions.push(
+            mov(Operand::Register(al), Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1))),
+        );
+        b0.instructions.push(
+            mov(Operand::Memory(MemoryRef::base_disp(rbp, -0x50, 1)), Operand::Register(al)),
+        );
+        b0.instructions.push(op("sub", Operation::Sub, vec![Operand::Register(al), imm(2, 8)]));
+        b0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: s2,
+            false_target: d1,
+        };
+        cfg.add_block(b0);
+
+        let mut b1 = BasicBlock::new(d1, 0xd40);
+        b1.instructions.push(
+            mov(Operand::Register(al), Operand::Memory(MemoryRef::base_disp(rbp, -0x50, 1))),
+        );
+        b1.instructions.push(op("test", Operation::Test, vec![Operand::Register(al), imm(3, 8)]));
+        b1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: s0,
+            false_target: s1,
+        };
+        cfg.add_block(b1);
+
+        // Resume-state bodies. state0 arms index 1, state1 arms index 2 (the max store).
+        for (id, start, arm) in [(s0, 0x50e_u64, Some(1i128)), (s1, 0x608, Some(2)), (s2, 0x700, None)] {
+            let mut b = BasicBlock::new(id, start);
+            b.end = start + 0x10;
+            if let Some(v) = arm {
+                b.instructions.push(
+                    mov(Operand::Register(rax), Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8))),
+                );
+                b.instructions.push(
+                    mov(Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)), imm(v, 8)),
+                );
+            }
+            b.terminator = BlockTerminator::Return;
+            cfg.add_block(b);
+        }
+        cfg
+    }
+
+    #[test]
+    fn rewrite_flattens_three_state_compare_chain() {
+        // A spilled-index compare chain (>2 states) is flattened by concrete evaluation into
+        // an N-way IndirectJump over [state0, state1, state2] — ordered by resume-index value.
+        let cfg = shape_compare_chain_cfg();
+        let out = rewrite_clang_resume_dispatch(&cfg, None, None).expect("chain flattened");
+        match &out.cfg.block(BasicBlockId::new(1)).unwrap().terminator {
+            BlockTerminator::IndirectJump { possible_targets, .. } => {
+                assert_eq!(
+                    possible_targets,
+                    &vec![BasicBlockId::new(2), BasicBlockId::new(3), BasicBlockId::new(4)],
+                    "states must be ordered by resume-index value (0->s0, 1->s1, 2->s2)"
+                );
+            }
+            other => panic!("expected IndirectJump, got {other:?}"),
+        }
+        assert!(!out.two_way_default, "multi-state chain keeps explicit cases");
+    }
+
+    #[test]
+    fn compare_chain_walk_maps_each_value_to_its_state() {
+        // Directly exercise the concrete evaluator: value v must land in state v.
+        let cfg = shape_compare_chain_cfg();
+        let d0 = BasicBlockId::new(1);
+        let frame_slots = vec![(canon_reg(r(5, 64).name()), -0x70)];
+        let index_slots = chain_index_spill_slots(cfg.block(d0).unwrap(), 0x11, 1, &frame_slots);
+        for (v, expect) in [(0i64, 2u32), (1, 3), (2, 4)] {
+            let got = walk_chain_for_value(&cfg, d0, v, 0x11, 1, &frame_slots, &index_slots, &mut Vec::new());
+            assert_eq!(got, Some(BasicBlockId::new(expect)), "value {v} -> wrong state");
+        }
+    }
+
+    #[test]
+    fn compare_chain_declines_when_max_store_missing() {
+        // Without resume-index stores there is no state bound, so the multi-state walk is not
+        // attempted and the chain declines (rather than guessing a range).
+        let mut cfg = shape_compare_chain_cfg();
+        // Strip the arming stores from the state bodies.
+        for id in [2u32, 3] {
+            cfg.block_mut(BasicBlockId::new(id)).unwrap().instructions.clear();
+        }
+        assert!(rewrite_clang_resume_dispatch(&cfg, None, None).is_none());
+    }
+
+    #[test]
+    fn compare_chain_skips_mislabeled_nop_jump_connector() {
+        // clang's `e9 00000000` no-op jump between comparators is mislabeled `Return` by the
+        // CFG builder. After `repair_nop_jump_returns` it becomes `Fallthrough`; the chain
+        // walker must skip it (not treat the connector as a resume state) and reach the
+        // comparator that reloads the index.
+        let (rbp, al) = (r(5, 64), r(0, 8));
+        let (conn, comp, state) = (BasicBlockId::new(0), BasicBlockId::new(1), BasicBlockId::new(2));
+        let mut cfg = ControlFlowGraph::new(conn);
+
+        // connector: `e9 00000000 jmp <next>` at 0x100, mislabeled Return.
+        let mut c = BasicBlock::new(conn, 0x100);
+        c.instructions.push(
+            Instruction::new(0x100, 5, vec![0xe9, 0, 0, 0, 0], "jmp").with_operation(Operation::Jump),
+        );
+        c.terminator = BlockTerminator::Return;
+        cfg.add_block(c);
+
+        // comparator at 0x105 (the connector's fallthrough): reloads the spilled index.
+        let mut m = BasicBlock::new(comp, 0x105);
+        m.instructions.push(mov(
+            Operand::Register(al),
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x50, 1)),
+        ));
+        m.terminator = BlockTerminator::Jump { target: state };
+        cfg.add_block(m);
+        cfg.add_block(BasicBlock::new(state, 0x200));
+
+        repair_nop_jump_returns(&mut cfg, None);
+        assert_eq!(
+            skip_noop_connectors(&cfg, conn, &mut Vec::new()),
+            comp,
+            "must skip the nop-jump connector"
+        );
+        let index_slots = vec![(canon_reg(rbp.name()), -0x50)];
+        assert_eq!(
+            classify_chain_target(&cfg, conn, 0x11, 1, &[], &index_slots, &mut Vec::new()),
+            Some(comp),
+            "connector must resolve to the index-reloading comparator, not be taken as a state"
+        );
+    }
+
+    #[test]
+    fn compare_chain_follows_frame_reread_continuation() {
+        // A continuation comparator that RE-READS `frame[0x11]` (instead of reloading the
+        // scratch spill) must be recognized as a chain block and walked — not mistaken for a
+        // resume state (which would point cases 0/1 at the compare block). `D0` spills + tests
+        // ==2; `D1` re-reads the frame field and tests ==0; fallthrough == 1.
+        let (rbp, rax, al) = (r(5, 64), r(0, 64), r(0, 8));
+        let (d0, d1) = (BasicBlockId::new(1), BasicBlockId::new(5));
+        let (s0, s1, s2) = (BasicBlockId::new(2), BasicBlockId::new(3), BasicBlockId::new(4));
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut entry = BasicBlock::new(BasicBlockId::new(0), 0x400);
+        entry.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+            Operand::Register(r(7, 64)),
+        ));
+        entry.terminator = BlockTerminator::Jump { target: d0 };
+        cfg.add_block(entry);
+
+        let reload_frame = || mov(Operand::Register(rax), Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)));
+        let read_index = || mov(Operand::Register(al), Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1)));
+
+        let mut b0 = BasicBlock::new(d0, 0xd12);
+        b0.instructions.push(reload_frame());
+        b0.instructions.push(read_index());
+        b0.instructions.push(mov(Operand::Memory(MemoryRef::base_disp(rbp, -0x50, 1)), Operand::Register(al)));
+        b0.instructions.push(op("sub", Operation::Sub, vec![Operand::Register(al), imm(2, 8)]));
+        b0.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: s2,
+            false_target: d1,
+        };
+        cfg.add_block(b0);
+
+        // D1 RE-READS the frame field (no spill reload).
+        let mut b1 = BasicBlock::new(d1, 0xd40);
+        b1.instructions.push(reload_frame());
+        b1.instructions.push(read_index());
+        b1.instructions.push(op("test", Operation::Test, vec![Operand::Register(al), imm(3, 8)]));
+        b1.terminator = BlockTerminator::ConditionalBranch {
+            condition: Condition::Equal,
+            true_target: s0,
+            false_target: s1,
+        };
+        cfg.add_block(b1);
+
+        for (id, start) in [(s0, 0x50e_u64), (s1, 0x608), (s2, 0x700)] {
+            let mut b = BasicBlock::new(id, start);
+            b.end = start + 1;
+            b.terminator = BlockTerminator::Return;
+            cfg.add_block(b);
+        }
+
+        let frame_slots = vec![(canon_reg(rbp.name()), -0x70)];
+        let index_slots = chain_index_spill_slots(cfg.block(d0).unwrap(), 0x11, 1, &frame_slots);
+        for (v, expect) in [(0i64, s0), (1, s1), (2, s2)] {
+            assert_eq!(
+                walk_chain_for_value(&cfg, d0, v, 0x11, 1, &frame_slots, &index_slots, &mut Vec::new()),
+                Some(expect),
+                "value {v} must reach its state through the frame-re-read continuation"
+            );
+        }
+    }
+
+    #[test]
+    fn compare_chain_declines_when_no_spill_slot_recovered() {
+        // The index is MASKED before the stack store, so `chain_index_spill_slots` records no
+        // slot. Without it the walker can't recognize continuation comparators, so flattening
+        // must decline rather than mistake a comparator for a resume state.
+        let (rbp, rax, al) = (r(5, 64), r(0, 64), r(0, 8));
+        let d0 = BasicBlockId::new(1);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut entry = BasicBlock::new(BasicBlockId::new(0), 0x400);
+        entry.instructions.push(mov(
+            Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8)),
+            Operand::Register(r(7, 64)),
+        ));
+        entry.terminator = BlockTerminator::Jump { target: d0 };
+        cfg.add_block(entry);
+        let mut b = BasicBlock::new(d0, 0xd12);
+        b.instructions.push(mov(Operand::Register(rax), Operand::Memory(MemoryRef::base_disp(rbp, -0x70, 8))));
+        b.instructions.push(mov(Operand::Register(al), Operand::Memory(MemoryRef::base_disp(rax, 0x11, 1))));
+        b.instructions.push(op("and", Operation::And, vec![Operand::Register(al), imm(0xf, 8)])); // masks the index
+        b.instructions.push(mov(Operand::Memory(MemoryRef::base_disp(rbp, -0x50, 1)), Operand::Register(al)));
+        b.terminator = BlockTerminator::Return;
+        cfg.add_block(b);
+        let frame_slots = vec![(canon_reg(rbp.name()), -0x70)];
+        assert!(
+            flatten_compare_chain(&cfg, d0, 0x11, 1, &frame_slots, 2).is_none(),
+            "a masked-before-spill index yields no slot -> decline"
+        );
+    }
+
+    #[test]
+    fn compare_chain_declines_two_byte_index() {
+        // A 2-byte resume index isn't safely bounded by `max_resume_index_store` (states above
+        // 255 would be dropped), so the compare-chain path must decline for it.
+        let mut cfg = shape_compare_chain_cfg();
+        // Widen the dispatch's index read to 2 bytes so `detect` reports index_size == 2.
+        let d0 = cfg.block_mut(BasicBlockId::new(1)).unwrap();
+        d0.instructions[1] = mov(
+            Operand::Register(r(0, 32)),
+            Operand::Memory(MemoryRef::base_disp(r(0, 64), 0x11, 2)),
+        );
+        assert!(rewrite_clang_resume_dispatch(&cfg, None, None).is_none());
+    }
+
+    #[test]
+    fn compare_chain_mask_and_condition_helpers() {
+        // `sub al, 2` on al==0 wraps to 0xFE (not -2), so ZF is false.
+        assert_eq!(mask_to(0i64.wrapping_sub(2), 8), 0xFE);
+        assert_eq!(mask_to(0i64.wrapping_sub(2), 64), -2);
+        assert_eq!(eval_zf_condition(Condition::Equal, true), Some(true));
+        assert_eq!(eval_zf_condition(Condition::NotEqual, true), Some(false));
+        assert_eq!(eval_zf_condition(Condition::Above, true), None);
     }
 
     #[test]
