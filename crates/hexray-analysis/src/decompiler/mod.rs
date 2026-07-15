@@ -493,7 +493,21 @@ fn is_optional_variant_reference(param: &str) -> bool {
     // Itanium spells cv-qualifiers after the type: `std::optional<int> const`.
     base = base.strip_suffix("const").map(str::trim_end).unwrap_or(base);
     base = base.strip_suffix("volatile").map(str::trim_end).unwrap_or(base);
-    base.starts_with("std::optional<") || base.starts_with("std::variant<")
+    is_optional_variant_type(base)
+}
+
+/// Whether `ty` names `std::optional<…>` / `std::variant<…>`, tolerating a libc++ inline-namespace
+/// component (`std::__1::optional<…>`) as emitted for clang/libc++ binaries.
+fn is_optional_variant_type(ty: &str) -> bool {
+    let Some(rest) = ty.strip_prefix("std::") else {
+        return false;
+    };
+    // Skip a leading inline-namespace segment such as `__1::`.
+    let rest = match rest.split_once("::") {
+        Some((ns, tail)) if ns.starts_with("__") => tail,
+        _ => rest,
+    };
+    rest.starts_with("optional<") || rest.starts_with("variant<")
 }
 
 fn collect_known_noreturn_targets(
@@ -3678,6 +3692,9 @@ mod tests {
         assert!(is_optional_variant_reference("std::variant<int, double>&"));
         assert!(is_optional_variant_reference("std::optional<int>&&"));
         assert!(is_optional_variant_reference("std::optional<int> const&"));
+        // libc++ inline-namespace spelling (clang/libc++ binaries).
+        assert!(is_optional_variant_reference("std::__1::optional<int>&"));
+        assert!(is_optional_variant_reference("std::__1::variant<int, double>&"));
         // Not references, or not optional/variant.
         assert!(!is_optional_variant_reference("std::optional<int>"));
         assert!(!is_optional_variant_reference("int&"));
