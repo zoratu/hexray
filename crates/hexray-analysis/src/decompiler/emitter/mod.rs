@@ -6144,7 +6144,10 @@ impl PseudoCodeEmitter {
         }
         let lhs = self.optional_variant_comparison_operand(&args[0], table)?;
         let rhs = self.optional_variant_comparison_operand(&args[1], table)?;
-        Some(format!("{lhs} {op} {rhs}"))
+        // Parenthesize: the caller substitutes this string where it still treats the node as a
+        // call, so a surrounding higher-precedence context (`!`, another comparison, `&&`) would
+        // otherwise mis-bind the bare infix expression (`!a == b` instead of `!(a == b)`).
+        Some(format!("({lhs} {op} {rhs})"))
     }
 
     /// Resolve a comparison operand to its rendered form if it is an optional/variant value:
@@ -7198,6 +7201,10 @@ impl PseudoCodeEmitter {
             .collect();
 
         self.clear_param_name_overrides();
+        // The `emit()` path never populates optional/variant reference-parameter types (only
+        // `emit_with_signature` does), but clear the map here too so a reused emitter cannot carry
+        // stale entries from a prior function into this one's comparison-operator sugar.
+        self.optional_variant_param_types.borrow_mut().clear();
         for (idx, source_name) in param_override_sources.iter().enumerate() {
             let rendered_name = &rendered_param_names[idx];
             self.set_param_name_override(source_name, rendered_name);
@@ -7470,12 +7477,18 @@ impl PseudoCodeEmitter {
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
             // Record `std::optional`/`std::variant` reference-parameter types for the operator
-            // sugar, keyed by both the source name and the `argN` slot alias.
+            // sugar, keyed by the source name, the `argN` slot alias, and — for a not-yet-renamed
+            // operand — the ABI argument register (`rdi`/`x0`/…).
             let type_str = signature.parameters[idx].param_type.to_c_string();
             if super::is_optional_variant_reference(&type_str) {
                 let mut map = self.optional_variant_param_types.borrow_mut();
                 map.insert(source_name.clone(), type_str.clone());
-                map.insert(format!("arg{}", idx), type_str);
+                map.insert(format!("arg{}", idx), type_str.clone());
+                if let super::signature::ParameterLocation::IntegerRegister { name, .. } =
+                    &signature.parameters[idx].location
+                {
+                    map.insert(name.clone(), type_str);
+                }
             }
         }
 
@@ -15791,7 +15804,7 @@ int sum(int n, ...)
                 &t
             )
             .as_deref(),
-            Some("arg0 == arg1")
+            Some("(arg0 == arg1)")
         );
         assert_eq!(
             e.try_format_optional_variant_comparison_operator_sugar(
@@ -15800,7 +15813,23 @@ int sum(int n, ...)
                 &t
             )
             .as_deref(),
-            Some("arg0 != arg1")
+            Some("(arg0 != arg1)")
+        );
+        // Operands still carrying their ABI argument register (not yet renamed to `argN`) resolve
+        // via the register-alias key that `emit_with_signature` records; the emitter's default
+        // argument-register naming then renders `rdi`/`rsi` as `arg0`/`arg1`.
+        let ereg = cmp_emitter(&[
+            ("rdi", "std::optional<int>&"),
+            ("rsi", "std::optional<int>&"),
+        ]);
+        assert_eq!(
+            ereg.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator==<int, int>",
+                &[var_arg("rdi"), var_arg("rsi")],
+                &t
+            )
+            .as_deref(),
+            Some("(arg0 == arg1)")
         );
     }
 
