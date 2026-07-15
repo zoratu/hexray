@@ -429,37 +429,28 @@ fn is_printable_ascii(b: u8) -> bool {
 /// The top-level parameter types of a demangled C++ signature `name(p0, p1, …)`, or `None` if no
 /// parameter list is present. `(void)` / `()` yield an empty list.
 fn demangled_param_types(demangled: &str) -> Option<Vec<String>> {
-    // Locate the parameter-list `(` at top level (angle depth 0), then its matching `)`.
-    let mut angle = 0i32;
+    // The parameter list is the last balanced `(...)` group (trailing cv/ref qualifiers carry no
+    // parens). Matching backwards from the final `)` avoids mistaking an operator spelling — e.g.
+    // `Functor::operator()(std::optional<int>&)` or `operator<(...)` — for the parameter list.
+    let bytes = demangled.as_bytes();
+    let close = demangled.rfind(')')?;
+    let mut depth = 0usize;
     let mut open = None;
-    for (i, c) in demangled.char_indices() {
-        match c {
-            '<' => angle += 1,
-            '>' => angle -= 1,
-            '(' if angle == 0 => {
-                open = Some(i);
-                break;
-            }
-            _ => {}
-        }
-    }
-    let open = open?;
-    let mut depth = 0i32;
-    let mut close = None;
-    for (j, c) in demangled[open..].char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
+    for idx in (0..=close).rev() {
+        match bytes[idx] {
+            b')' => depth += 1,
+            b'(' => {
+                depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    close = Some(open + j);
+                    open = Some(idx);
                     break;
                 }
             }
             _ => {}
         }
     }
-    let inner = demangled[open + 1..close?].trim();
+    let open = open?;
+    let inner = demangled[open + 1..close].trim();
     if inner.is_empty() || inner == "void" {
         return Some(Vec::new());
     }
@@ -3655,6 +3646,30 @@ mod tests {
         assert_eq!(demangled_param_types("plain_symbol"), None);
         assert_eq!(demangled_param_types("f()"), Some(Vec::new()));
         assert_eq!(demangled_param_types("f(void)"), Some(Vec::new()));
+
+        // Operator spellings embed `()`/`<` in the name; the parameter list is still the final
+        // balanced parens.
+        assert_eq!(
+            demangled_param_types("Functor::operator()(std::optional<int>&)"),
+            Some(vec!["std::optional<int>&".to_string()])
+        );
+        assert_eq!(
+            demangled_param_types("operator<(std::optional<int>&, std::optional<int>&)"),
+            Some(vec![
+                "std::optional<int>&".to_string(),
+                "std::optional<int>&".to_string(),
+            ])
+        );
+        // A function-pointer parameter carries balanced inner parens.
+        assert_eq!(
+            demangled_param_types("foo(std::function<int (int)>&)"),
+            Some(vec!["std::function<int (int)>&".to_string()])
+        );
+        // Trailing cv-qualifier after the parameter list.
+        assert_eq!(
+            demangled_param_types("Foo::bar(std::optional<int>&) const"),
+            Some(vec!["std::optional<int>&".to_string()])
+        );
     }
 
     #[test]

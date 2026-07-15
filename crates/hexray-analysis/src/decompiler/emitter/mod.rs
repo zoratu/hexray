@@ -480,6 +480,14 @@ impl PseudoCodeEmitter {
         ) {
             return false;
         }
+        // A demangled `std::optional<T>&`/`std::variant<T...>&` reference recovered for this
+        // parameter is higher-fidelity than a generic pointer hint from expression-type
+        // propagation; don't let the hint pass demote it back to a raw pointer.
+        if let super::signature::ParamType::Named(name) = param_type {
+            if super::is_optional_variant_reference(name) {
+                return false;
+            }
+        }
         // Preserve a more-specific TypedPointer when the type hint
         // would only swap a Float element type for a generic scalar
         // int (e.g. signature says `double*`, expr-type propagation
