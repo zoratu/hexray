@@ -6135,7 +6135,7 @@ impl PseudoCodeEmitter {
         table: &StringTable,
     ) -> Option<String> {
         let (qualifier, method) = split_qualified_method(target_name)?;
-        if qualifier.trim() != "std" {
+        if !is_std_namespace_qualifier(qualifier) {
             return None;
         }
         let op = parse_comparison_operator(method)?;
@@ -10904,6 +10904,17 @@ fn split_qualified_method(name: &str) -> Option<(&str, &str)> {
 /// template-argument list (`operator==<int, int>`, `operator<<int, int>` for `operator<`, …); the
 /// longest-prefix-first scan and the balanced-`<…>` tail check keep `operator<` from being confused
 /// with `operator<<` (stream insertion), which is not a comparison.
+/// Whether `qualifier` is the `std` namespace, tolerating a libc++ inline-namespace component
+/// (`std::__1`) as clang/libc++ emits for its free functions. Mirrors the type-side tolerance so
+/// `std::__1::operator==` sugars just like `std::operator==`.
+fn is_std_namespace_qualifier(qualifier: &str) -> bool {
+    let q = qualifier.trim();
+    if q == "std" {
+        return true;
+    }
+    matches!(q.strip_prefix("std::"), Some(ns) if ns.starts_with("__") && !ns.contains("::"))
+}
+
 fn parse_comparison_operator(method: &str) -> Option<&'static str> {
     let rest = method.trim().strip_prefix("operator")?;
     for op in ["<=>", "==", "!=", "<=", ">=", "<", ">"] {
@@ -15829,6 +15840,21 @@ int sum(int n, ...)
                 &t
             )
             .as_deref(),
+            Some("(arg0 == arg1)")
+        );
+        // libc++ spells the free operator under the `std::__1` inline namespace.
+        let elibcxx = cmp_emitter(&[
+            ("arg0", "std::__1::optional<int>&"),
+            ("arg1", "std::__1::optional<int>&"),
+        ]);
+        assert_eq!(
+            elibcxx
+                .try_format_optional_variant_comparison_operator_sugar(
+                    "std::__1::operator==<int, int>",
+                    &args,
+                    &t
+                )
+                .as_deref(),
             Some("(arg0 == arg1)")
         );
     }
