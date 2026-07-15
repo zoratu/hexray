@@ -6199,17 +6199,15 @@ impl PseudoCodeEmitter {
         expr: &Expr,
         table: &StringTable,
     ) -> Option<String> {
+        // Match only an operand already named after the parameter (its source name or `argN`).
+        // A raw ABI argument register (`rdi`/`x0`) is deliberately NOT resolved to `argN` here:
+        // that mapping is index-vs-count only, so a register the compiler later reused for an
+        // unrelated value would spuriously satisfy the gate. The decompiler's variable-naming pass
+        // is the liveness-aware authority on whether a slot still holds the parameter, so trusting
+        // the already-resolved name keeps the sugar sound (an unresolved register is a safe miss).
         let is_ref_param = {
             let map = self.optional_variant_param_types.borrow();
-            map.contains_key(name)
-                || map.contains_key(&name.to_lowercase())
-                // An operand still carrying its raw ABI argument register resolves to its `argN`
-                // alias only through the gated `arg_register_display_name`, which returns `None`
-                // for a register reused as a non-parameter temp — so a reused register cannot
-                // spuriously satisfy the optional/variant gate.
-                || self
-                    .arg_register_display_name(name)
-                    .is_some_and(|argn| map.contains_key(&argn))
+            map.contains_key(name) || map.contains_key(&name.to_lowercase())
         };
         is_ref_param.then(|| self.format_expr_with_strings(expr, table))
     }
@@ -15899,17 +15897,6 @@ int sum(int n, ...)
             .as_deref(),
             Some("(arg0 == arg1)")
         );
-        // Operands still carrying their raw ABI argument register resolve to their `argN` alias via
-        // the gated `arg_register_display_name` (param count defaults to unbounded here).
-        assert_eq!(
-            e.try_format_optional_variant_comparison_operator_sugar(
-                "std::operator==<int, int>",
-                &[var_arg("rdi"), var_arg("rsi")],
-                &t
-            )
-            .as_deref(),
-            Some("(arg0 == arg1)")
-        );
         // `operator>`/`operator>=` whose template arguments are namespace-qualified: the operator's
         // own `>` must not corrupt the qualifier split.
         let ens = cmp_emitter(&[
@@ -15985,15 +15972,13 @@ int sum(int n, ...)
             ),
             None
         );
-        // Register-reuse soundness: with only one integer parameter, `rdi` (index 0) resolves but
-        // `rdx` (index 2) is beyond the parameter count, so `arg_register_display_name` returns
-        // `None` and the operand is left qualified — a reused register cannot satisfy the gate.
-        let egated = cmp_emitter(&[("arg0", "std::optional<int>&")]);
-        egated.integer_arg_param_count.set(1);
+        // Soundness: raw ABI argument registers are NOT resolved to `argN` (that mapping is
+        // index-vs-count only and cannot tell whether the register was reused), so an operand
+        // still carrying its register is left qualified rather than risking a false rewrite.
         assert_eq!(
-            egated.try_format_optional_variant_comparison_operator_sugar(
+            e.try_format_optional_variant_comparison_operator_sugar(
                 "std::operator==<int, int>",
-                &[var_arg("rdi"), var_arg("rdx")],
+                &[var_arg("rdi"), var_arg("rsi")],
                 &t
             ),
             None
