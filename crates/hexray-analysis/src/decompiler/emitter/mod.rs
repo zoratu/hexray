@@ -6206,26 +6206,29 @@ impl PseudoCodeEmitter {
     }
 
     /// Record a `std::optional`/`std::variant` reference parameter's type for the comparison-operator
-    /// sugar, keyed by its source `name` and its `argN` display alias. The alias is keyed by the
-    /// integer-register index — which differs from the source parameter position when earlier
-    /// parameters occupy float registers (`double d, std::optional<int>& opt` → `opt` renders as
-    /// `arg0`, not `arg1`). The raw ABI register is deliberately NOT keyed: registers are reused
-    /// within a function, so a later unrelated `std::operator==(rdi, rsi)` on reused registers would
-    /// falsely sugar; `argN` denotes the parameter value under the naming pass's liveness analysis.
+    /// sugar, keyed by its source `name` and its `argN` display alias. The alias uses the SOURCE
+    /// position, matching the emitter's own `set_param_name_override("arg{idx}", …)` so the gate
+    /// keys agree with what the formatter actually displays for an `argN` operand. (The map is only
+    /// populated for signatures whose parameters are all optional/variant references — mixed
+    /// float/integer signatures are declined upstream by the reference-type recovery — so the source
+    /// position and the integer-register index coincide in every reachable case; source position is
+    /// chosen to stay consistent with the formatter.) The raw ABI register is deliberately NOT
+    /// keyed: registers are reused within a function, so a later unrelated `std::operator==(rdi,
+    /// rsi)` on reused registers would falsely sugar; `argN` denotes the parameter value under the
+    /// naming pass's liveness analysis.
     fn record_optional_variant_reference_param(
         &self,
         name: &str,
-        param: &super::signature::Parameter,
+        source_index: usize,
+        param_type: &super::signature::ParamType,
     ) {
-        let type_str = param.param_type.to_c_string();
+        let type_str = param_type.to_c_string();
         if !super::is_optional_variant_reference(&type_str) {
             return;
         }
         let mut map = self.optional_variant_param_types.borrow_mut();
         map.insert(name.to_string(), type_str.clone());
-        if let super::signature::ParameterLocation::IntegerRegister { index, .. } = &param.location {
-            map.insert(format!("arg{}", index), type_str);
-        }
+        map.insert(format!("arg{}", source_index), type_str);
     }
 
     /// If `name` is a recorded optional/variant reference parameter, render `expr`; else `None`.
@@ -7527,7 +7530,11 @@ impl PseudoCodeEmitter {
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
-            self.record_optional_variant_reference_param(source_name, &signature.parameters[idx]);
+            self.record_optional_variant_reference_param(
+                source_name,
+                idx,
+                &signature.parameters[idx].param_type,
+            );
         }
 
         // Record how many argument registers are actual parameters, so a higher
@@ -15966,25 +15973,23 @@ int sum(int n, ...)
     }
 
     #[test]
-    fn record_optional_variant_reference_param_keys_argn_by_register_index() {
-        use super::super::signature::{ParamType, Parameter, ParameterLocation};
+    fn record_optional_variant_reference_param_keys_source_name_and_argn() {
+        use super::super::signature::ParamType;
         let e = PseudoCodeEmitter::new("    ", false);
-        // Source position 1, but the first (float) parameter took a float register, so this
-        // optional reference is integer-register index 0 and renders as `arg0`, not `arg1`.
-        let opt = Parameter::new(
+        // Keyed by the source name and the source-position `argN` alias (matching the emitter's own
+        // `arg{idx}` param-name override), plus a non-reference type is ignored.
+        e.record_optional_variant_reference_param(
             "opt",
-            ParamType::Named("std::optional<int>&".to_string()),
-            ParameterLocation::IntegerRegister {
-                name: "rdi".to_string(),
-                index: 0,
-            },
+            1,
+            &ParamType::Named("std::optional<int>&".to_string()),
         );
-        e.record_optional_variant_reference_param("opt", &opt);
+        e.record_optional_variant_reference_param("d", 0, &ParamType::Float(64));
         let map = e.optional_variant_param_types.borrow();
-        assert_eq!(map.get("arg0").map(String::as_str), Some("std::optional<int>&"));
+        assert_eq!(map.get("arg1").map(String::as_str), Some("std::optional<int>&"));
         assert_eq!(map.get("opt").map(String::as_str), Some("std::optional<int>&"));
-        // The source position (1) must not leak in as `arg1`.
-        assert!(!map.contains_key("arg1"));
+        // The non-reference `double` parameter records nothing.
+        assert!(!map.contains_key("arg0"));
+        assert!(!map.contains_key("d"));
     }
 
     #[test]
