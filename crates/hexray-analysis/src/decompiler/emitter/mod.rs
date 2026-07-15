@@ -425,6 +425,12 @@ pub struct PseudoCodeEmitter {
     /// Per-function parameter display-name overrides (e.g., arg0 -> argc).
     /// Uses RefCell for interior mutability during emission.
     param_name_overrides: RefCell<HashMap<String, String>>,
+    /// Per-function `std::optional`/`std::variant` reference-parameter types, keyed by both the
+    /// signature source name and the `argN` slot alias (value is the full type c-string, e.g.
+    /// `std::optional<int>&`). Reference parameters do not appear in `type_info` (which tracks
+    /// registers/locals), so this lets the operator sugar recognize an optional/variant operand
+    /// that arrives as a bare reference parameter. Populated in `emit_with_signature`.
+    optional_variant_param_types: RefCell<HashMap<String, String>>,
     /// Fallback expression for bare returns when signature is non-void.
     /// Uses RefCell for interior mutability during emission.
     return_fallback_expr: RefCell<Option<String>>,
@@ -761,6 +767,7 @@ impl PseudoCodeEmitter {
             summary_database: None,
             global_tracker: RefCell::new(GlobalAccessTracker::new()),
             param_name_overrides: RefCell::new(HashMap::new()),
+            optional_variant_param_types: RefCell::new(HashMap::new()),
             integer_arg_param_count: Cell::new(usize::MAX),
             float_arg_param_count: Cell::new(usize::MAX),
             return_fallback_expr: RefCell::new(None),
@@ -6113,6 +6120,80 @@ impl PseudoCodeEmitter {
         Some(format!("std::{short}<{queried}>({})", all.join(", ")))
     }
 
+    /// Sugar free-function comparison operators on `std::optional`/`std::variant` operands:
+    ///   `std::operator==<int, int>(a, b)` → `a == b`   (also `!=`, `<`, `>`, `<=`, `>=`, `<=>`).
+    ///
+    /// Gated on BOTH operands resolving to an optional/variant value — either a bare reference
+    /// parameter (looked up in `optional_variant_param_types`, which reference parameters populate
+    /// since they are absent from `type_info`) or `&local` whose recovered `type_info` type is
+    /// optional/variant. `std::operator==` is heavily overloaded (strings, iterators, …), so the
+    /// operand-type gate is what keeps unrelated overloads qualified.
+    fn try_format_optional_variant_comparison_operator_sugar(
+        &self,
+        target_name: &str,
+        args: &[Expr],
+        table: &StringTable,
+    ) -> Option<String> {
+        let (qualifier, method) = split_qualified_method(target_name)?;
+        if qualifier.trim() != "std" {
+            return None;
+        }
+        let op = parse_comparison_operator(method)?;
+        if args.len() != 2 {
+            return None;
+        }
+        let lhs = self.optional_variant_comparison_operand(&args[0], table)?;
+        let rhs = self.optional_variant_comparison_operand(&args[1], table)?;
+        Some(format!("{lhs} {op} {rhs}"))
+    }
+
+    /// Resolve a comparison operand to its rendered form if it is an optional/variant value:
+    /// a bare reference parameter (in `optional_variant_param_types`) or `&local` whose recovered
+    /// type is optional/variant. Returns `None` otherwise so the caller declines the sugar.
+    fn optional_variant_comparison_operand(
+        &self,
+        expr: &Expr,
+        table: &StringTable,
+    ) -> Option<String> {
+        match &expr.kind {
+            ExprKind::AddressOf(inner) => {
+                let ExprKind::Var(v) = &inner.kind else {
+                    return None;
+                };
+                let ty = self
+                    .type_info
+                    .get(&v.name)
+                    .or_else(|| self.type_info.get(&v.name.to_lowercase()))?;
+                if !super::is_optional_variant_type(ty) {
+                    return None;
+                }
+                Some(self.format_expr_with_strings(inner, table))
+            }
+            // A bare reference parameter renders as `Var`/`Unknown` carrying the parameter name;
+            // consult the recorded optional/variant reference-parameter types.
+            ExprKind::Var(v) => self.optional_variant_reference_param_operand(&v.name, expr, table),
+            ExprKind::Unknown(name) => {
+                self.optional_variant_reference_param_operand(name, expr, table)
+            }
+            _ => None,
+        }
+    }
+
+    /// If `name` is a recorded optional/variant reference parameter, render `expr`; else `None`.
+    fn optional_variant_reference_param_operand(
+        &self,
+        name: &str,
+        expr: &Expr,
+        table: &StringTable,
+    ) -> Option<String> {
+        let map = self.optional_variant_param_types.borrow();
+        if map.contains_key(name) || map.contains_key(&name.to_lowercase()) {
+            Some(self.format_expr_with_strings(expr, table))
+        } else {
+            None
+        }
+    }
+
     fn try_format_virtual_dispatch(
         &self,
         target: &CallTarget,
@@ -6646,6 +6727,13 @@ impl PseudoCodeEmitter {
                 // `std::holds_alternative<int, int, double>(&v)` → `std::holds_alternative<int>(v)`.
                 if let Some(sugar) =
                     self.try_format_variant_free_function_sugar(&target_str, args, table)
+                {
+                    return sugar;
+                }
+                // Free-function comparison operators on optional/variant operands:
+                // `std::operator==<int, int>(a, b)` → `a == b`.
+                if let Some(sugar) = self
+                    .try_format_optional_variant_comparison_operator_sugar(&target_str, args, table)
                 {
                     return sugar;
                 }
@@ -7375,11 +7463,20 @@ impl PseudoCodeEmitter {
             .collect();
 
         self.clear_param_name_overrides();
+        self.optional_variant_param_types.borrow_mut().clear();
         for (idx, source_name) in signature_param_names.iter().enumerate() {
             let rendered_name = &rendered_param_names[idx];
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
+            // Record `std::optional`/`std::variant` reference-parameter types for the operator
+            // sugar, keyed by both the source name and the `argN` slot alias.
+            let type_str = signature.parameters[idx].param_type.to_c_string();
+            if super::is_optional_variant_reference(&type_str) {
+                let mut map = self.optional_variant_param_types.borrow_mut();
+                map.insert(source_name.clone(), type_str.clone());
+                map.insert(format!("arg{}", idx), type_str);
+            }
         }
 
         // Record how many argument registers are actual parameters, so a higher
@@ -10787,6 +10884,23 @@ fn split_qualified_method(name: &str) -> Option<(&str, &str)> {
     }
     let idx = last?;
     Some((&name[..idx], &name[idx + 2..]))
+}
+
+/// Parse a demangled comparison-operator method into its C operator spelling, or `None` if it is
+/// not one of `== != < > <= >= <=>`. The operator symbol may be trailed by a balanced `<…>`
+/// template-argument list (`operator==<int, int>`, `operator<<int, int>` for `operator<`, …); the
+/// longest-prefix-first scan and the balanced-`<…>` tail check keep `operator<` from being confused
+/// with `operator<<` (stream insertion), which is not a comparison.
+fn parse_comparison_operator(method: &str) -> Option<&'static str> {
+    let rest = method.trim().strip_prefix("operator")?;
+    for op in ["<=>", "==", "!=", "<=", ">=", "<", ">"] {
+        if let Some(after) = rest.strip_prefix(op) {
+            if after.is_empty() || (after.starts_with('<') && after.ends_with('>')) {
+                return Some(op);
+            }
+        }
+    }
+    None
 }
 
 /// The class's base identifier from a qualifier like `std::optional<int>` →
@@ -15625,6 +15739,114 @@ int sum(int n, ...)
         vec![Expr::address_of(Expr::var(
             super::super::expression::Variable::reg(var, 8),
         ))]
+    }
+
+    /// An emitter whose optional/variant reference-parameter map is pre-populated (as
+    /// `emit_with_signature` would), for exercising the free-function comparison-operator sugar.
+    fn cmp_emitter(params: &[(&str, &str)]) -> PseudoCodeEmitter {
+        let e = PseudoCodeEmitter::new("    ", false);
+        {
+            let mut m = e.optional_variant_param_types.borrow_mut();
+            for (name, ty) in params {
+                m.insert(name.to_string(), ty.to_string());
+            }
+        }
+        e
+    }
+
+    fn var_arg(name: &str) -> Expr {
+        Expr::var(super::super::expression::Variable::reg(name, 8))
+    }
+
+    #[test]
+    fn parse_comparison_operator_recognizes_ops_and_rejects_others() {
+        assert_eq!(parse_comparison_operator("operator==<int, int>"), Some("=="));
+        assert_eq!(parse_comparison_operator("operator!=<int, int>"), Some("!="));
+        // `operator<` with a template pack — must not be read as `operator<<`.
+        assert_eq!(parse_comparison_operator("operator<<int, int>"), Some("<"));
+        assert_eq!(parse_comparison_operator("operator><int, int>"), Some(">"));
+        assert_eq!(parse_comparison_operator("operator<=<int>"), Some("<="));
+        assert_eq!(parse_comparison_operator("operator>=<int>"), Some(">="));
+        assert_eq!(parse_comparison_operator("operator<=><int>"), Some("<=>"));
+        assert_eq!(parse_comparison_operator("operator=="), Some("=="));
+        // Not comparisons.
+        assert_eq!(parse_comparison_operator("operator<<"), None); // stream insertion
+        assert_eq!(parse_comparison_operator("operator+"), None);
+        assert_eq!(parse_comparison_operator("operator="), None);
+        assert_eq!(parse_comparison_operator("has_value"), None);
+    }
+
+    #[test]
+    fn sugars_optional_variant_free_comparison_operators() {
+        let e = cmp_emitter(&[
+            ("arg0", "std::optional<int>&"),
+            ("arg1", "std::optional<int>&"),
+        ]);
+        let t = StringTable::new();
+        let args = vec![var_arg("arg0"), var_arg("arg1")];
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator==<int, int>",
+                &args,
+                &t
+            )
+            .as_deref(),
+            Some("arg0 == arg1")
+        );
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator!=<int, int>",
+                &args,
+                &t
+            )
+            .as_deref(),
+            Some("arg0 != arg1")
+        );
+    }
+
+    #[test]
+    fn free_comparison_operator_sugar_declines_off_target() {
+        let t = StringTable::new();
+        let args = vec![var_arg("arg0"), var_arg("arg1")];
+        // Operands are not known optional/variant references (empty map) — the operand-type gate
+        // keeps unrelated `std::operator==` overloads (strings, iterators) qualified.
+        let empty = cmp_emitter(&[]);
+        assert_eq!(
+            empty.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator==<int, int>",
+                &args,
+                &t
+            ),
+            None
+        );
+        let e = cmp_emitter(&[
+            ("arg0", "std::optional<int>&"),
+            ("arg1", "std::optional<int>&"),
+        ]);
+        // Non-`std` qualifier.
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "foo::operator==<int>",
+                &args,
+                &t
+            ),
+            None
+        );
+        // Non-comparison operator.
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar("std::operator+<int>", &args, &t),
+            None
+        );
+        // Wrong arity.
+        let one = vec![var_arg("arg0")];
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator==<int>",
+                &one,
+                &t
+            ),
+            None
+        );
     }
 
     #[test]
