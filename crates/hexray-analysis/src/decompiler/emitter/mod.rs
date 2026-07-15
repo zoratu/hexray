@@ -6134,21 +6134,34 @@ impl PseudoCodeEmitter {
         args: &[Expr],
         table: &StringTable,
     ) -> Option<String> {
-        // Split at the `operator` token directly rather than via `split_qualified_method`: the
-        // operator symbol itself may contain `<`/`>` (`operator>`, `operator<=`), which corrupts
-        // that helper's angle-depth scan when the template arguments are namespace-qualified
-        // (`std::operator><ns::X, ns::X>`). The namespace prefix carries no `<`, so the first
-        // `operator` token — required to follow `::` — is unambiguously the operator name.
-        let idx = target_name.find("operator")?;
-        let before = target_name[..idx].strip_suffix("::")?;
-        // A demangled template operator may carry a leading return type (`bool std::operator==<…>`,
-        // `std::enable_if<…>::type std::operator==<…>`); the namespace is the whitespace-delimited
-        // trailing segment before `::operator`.
-        let qualifier = before.rsplit(char::is_whitespace).next().unwrap_or(before);
-        if !is_std_namespace_qualifier(qualifier) {
-            return None;
-        }
-        let op = parse_comparison_operator(&target_name[idx..])?;
+        // Find the operator function name: the `operator` token that (a) follows a `std`-namespace
+        // qualifier and (b) whose tail parses as a comparison operator. Parsing at the `operator`
+        // token — rather than via `split_qualified_method` — avoids the operator symbol's own
+        // `<`/`>` corrupting an angle-depth scan (`std::operator><ns::X, ns::X>`). Iterating over
+        // candidates skips an `operator`-named identifier that appears in a leading return type or a
+        // template argument (`std::optional<my::operator_tag>::type std::operator==<int, int>`).
+        let op = {
+            let mut search = 0;
+            loop {
+                let Some(rel) = target_name[search..].find("operator") else {
+                    return None;
+                };
+                let idx = search + rel;
+                search = idx + "operator".len();
+                let Some(before) = target_name[..idx].strip_suffix("::") else {
+                    continue;
+                };
+                // The namespace is the whitespace-delimited trailing segment before `::operator`,
+                // so a leading return type (`bool std::operator==<…>`) is ignored.
+                let qualifier = before.rsplit(char::is_whitespace).next().unwrap_or(before);
+                if !is_std_namespace_qualifier(qualifier) {
+                    continue;
+                }
+                if let Some(op) = parse_comparison_operator(&target_name[idx..]) {
+                    break op;
+                }
+            }
+        };
         if args.len() != 2 {
             return None;
         }
@@ -15903,6 +15916,17 @@ int sum(int n, ...)
         assert_eq!(
             e.try_format_optional_variant_comparison_operator_sugar(
                 "std::enable_if<int, double>::type std::operator==<int, int>",
+                &args,
+                &t
+            )
+            .as_deref(),
+            Some("(arg0 == arg1)")
+        );
+        // An `operator`-named identifier in the return type must not be mistaken for the operator
+        // function name.
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "my::operator_tag std::operator==<int, int>",
                 &args,
                 &t
             )
