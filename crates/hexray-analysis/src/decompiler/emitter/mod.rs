@@ -10925,12 +10925,43 @@ fn parse_comparison_operator(method: &str) -> Option<&'static str> {
     let rest = method.trim().strip_prefix("operator")?;
     for op in ["<=>", "==", "!=", "<=", ">=", "<", ">"] {
         if let Some(after) = rest.strip_prefix(op) {
-            if after.is_empty() || (after.starts_with('<') && after.ends_with('>')) {
+            // The operator symbol is followed by nothing, or a single balanced `<…>` template
+            // list. Demanglers insert a disambiguating space before the list for `operator<`
+            // (`operator< <int>`), so trim it. Requiring a *balanced* single list is what keeps
+            // `operator<<` (rest `<`, not balanced) and `operator<< <int>` (rest `< <int>`, depth
+            // never returns to zero until past the end) from being read as `operator<`.
+            let tail = after.trim_start();
+            if tail.is_empty() || is_balanced_template_arg_list(tail) {
                 return Some(op);
             }
         }
     }
     None
+}
+
+/// Whether `s` is exactly one balanced `<…>` template-argument list (its top-level `<` closes only
+/// at the final character).
+fn is_balanced_template_arg_list(s: &str) -> bool {
+    if !s.starts_with('<') {
+        return false;
+    }
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+                if depth == 0 && i != s.len() - 1 {
+                    return false; // a second top-level list follows — not a single list
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
 }
 
 /// The class's base identifier from a qualifier like `std::optional<int>` →
@@ -15799,8 +15830,15 @@ int sum(int n, ...)
         assert_eq!(parse_comparison_operator("operator>=<int>"), Some(">="));
         assert_eq!(parse_comparison_operator("operator<=><int>"), Some("<=>"));
         assert_eq!(parse_comparison_operator("operator=="), Some("=="));
+        // libc++ prints the disambiguating space before `operator<`'s template list.
+        assert_eq!(parse_comparison_operator("operator< <int>"), Some("<"));
+        assert_eq!(
+            parse_comparison_operator("operator< <ns::X, ns::X>"),
+            Some("<")
+        );
         // Not comparisons.
         assert_eq!(parse_comparison_operator("operator<<"), None); // stream insertion
+        assert_eq!(parse_comparison_operator("operator<< <int>"), None); // spaced shift template
         assert_eq!(parse_comparison_operator("operator+"), None);
         assert_eq!(parse_comparison_operator("operator="), None);
         assert_eq!(parse_comparison_operator("has_value"), None);
