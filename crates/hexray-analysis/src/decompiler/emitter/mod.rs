@@ -7483,18 +7483,16 @@ impl PseudoCodeEmitter {
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
             // Record `std::optional`/`std::variant` reference-parameter types for the operator
-            // sugar, keyed by the source name, the `argN` slot alias, and — for a not-yet-renamed
-            // operand — the ABI argument register (`rdi`/`x0`/…).
+            // sugar, keyed by the source name and the `argN` slot alias only. The raw ABI argument
+            // register is deliberately NOT used as a key: registers are reused within a function, so
+            // a later unrelated `std::operator==(rdi, rsi)` on reused registers would falsely sugar.
+            // `argN` is gated to actual parameters (see `integer_arg_param_count`), so it denotes the
+            // parameter value rather than whatever a register happens to hold later.
             let type_str = signature.parameters[idx].param_type.to_c_string();
             if super::is_optional_variant_reference(&type_str) {
                 let mut map = self.optional_variant_param_types.borrow_mut();
                 map.insert(source_name.clone(), type_str.clone());
-                map.insert(format!("arg{}", idx), type_str.clone());
-                if let super::signature::ParameterLocation::IntegerRegister { name, .. } =
-                    &signature.parameters[idx].location
-                {
-                    map.insert(name.clone(), type_str);
-                }
+                map.insert(format!("arg{}", idx), type_str);
             }
         }
 
@@ -15869,22 +15867,6 @@ int sum(int n, ...)
             )
             .as_deref(),
             Some("(arg0 != arg1)")
-        );
-        // Operands still carrying their ABI argument register (not yet renamed to `argN`) resolve
-        // via the register-alias key that `emit_with_signature` records; the emitter's default
-        // argument-register naming then renders `rdi`/`rsi` as `arg0`/`arg1`.
-        let ereg = cmp_emitter(&[
-            ("rdi", "std::optional<int>&"),
-            ("rsi", "std::optional<int>&"),
-        ]);
-        assert_eq!(
-            ereg.try_format_optional_variant_comparison_operator_sugar(
-                "std::operator==<int, int>",
-                &[var_arg("rdi"), var_arg("rsi")],
-                &t
-            )
-            .as_deref(),
-            Some("(arg0 == arg1)")
         );
         // `operator>`/`operator>=` whose template arguments are namespace-qualified: the operator's
         // own `>` must not corrupt the qualifier split.
