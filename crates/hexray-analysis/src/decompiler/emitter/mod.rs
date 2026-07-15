@@ -6143,9 +6143,7 @@ impl PseudoCodeEmitter {
         let op = {
             let mut search = 0;
             loop {
-                let Some(rel) = target_name[search..].find("operator") else {
-                    return None;
-                };
+                let rel = target_name[search..].find("operator")?;
                 let idx = search + rel;
                 search = idx + "operator".len();
                 let Some(before) = target_name[..idx].strip_suffix("::") else {
