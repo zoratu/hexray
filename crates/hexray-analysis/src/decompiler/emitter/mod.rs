@@ -6134,11 +6134,17 @@ impl PseudoCodeEmitter {
         args: &[Expr],
         table: &StringTable,
     ) -> Option<String> {
-        let (qualifier, method) = split_qualified_method(target_name)?;
+        // Split at the `::operator` boundary directly rather than via `split_qualified_method`: the
+        // operator symbol itself may contain `<`/`>` (`operator>`, `operator<=`), which corrupts
+        // that helper's angle-depth scan when the template arguments are namespace-qualified
+        // (`std::operator><ns::X, ns::X>`). The namespace prefix carries no `<`, so the first
+        // `operator` token — required to follow `::` — is unambiguously the operator name.
+        let idx = target_name.find("operator")?;
+        let qualifier = target_name[..idx].strip_suffix("::")?;
         if !is_std_namespace_qualifier(qualifier) {
             return None;
         }
-        let op = parse_comparison_operator(method)?;
+        let op = parse_comparison_operator(&target_name[idx..])?;
         if args.len() != 2 {
             return None;
         }
@@ -15841,6 +15847,21 @@ int sum(int n, ...)
             )
             .as_deref(),
             Some("(arg0 == arg1)")
+        );
+        // `operator>`/`operator>=` whose template arguments are namespace-qualified: the operator's
+        // own `>` must not corrupt the qualifier split.
+        let ens = cmp_emitter(&[
+            ("arg0", "std::optional<ns::X>&"),
+            ("arg1", "std::optional<ns::X>&"),
+        ]);
+        assert_eq!(
+            ens.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator><ns::X, ns::X>",
+                &args,
+                &t
+            )
+            .as_deref(),
+            Some("(arg0 > arg1)")
         );
         // libc++ spells the free operator under the `std::__1` inline namespace.
         let elibcxx = cmp_emitter(&[
