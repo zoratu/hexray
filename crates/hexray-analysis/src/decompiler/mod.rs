@@ -426,35 +426,60 @@ fn is_printable_ascii(b: u8) -> bool {
     (0x20..=0x7e).contains(&b) || b == b'\t' || b == b'\n' || b == b'\r'
 }
 
-/// The top-level parameter types of a demangled C++ signature `name(p0, p1, …)`, or `None` if no
-/// parameter list is present. `(void)` / `()` yield an empty list.
-fn demangled_param_types(demangled: &str) -> Option<Vec<String>> {
-    // The parameter list is the last balanced `(...)` group (trailing cv/ref qualifiers carry no
-    // parens). Matching backwards from the final `)` avoids mistaking an operator spelling — e.g.
-    // `Functor::operator()(std::optional<int>&)` or `operator<(...)` — for the parameter list.
+/// The byte span `(open, close)` of a demangled signature's parameter list — the last balanced
+/// `(...)` group (trailing cv/ref qualifiers carry no parens). Matching backwards from the final
+/// `)` avoids mistaking an operator spelling — e.g. `Functor::operator()(std::optional<int>&)` or
+/// `operator<(...)` — for the parameter list.
+fn demangled_param_list_span(demangled: &str) -> Option<(usize, usize)> {
     let bytes = demangled.as_bytes();
     let close = demangled.rfind(')')?;
     let mut depth = 0usize;
-    let mut open = None;
     for idx in (0..=close).rev() {
         match bytes[idx] {
             b')' => depth += 1,
             b'(' => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
-                    open = Some(idx);
-                    break;
+                    return Some((idx, close));
                 }
             }
             _ => {}
         }
     }
-    let open = open?;
+    None
+}
+
+/// The top-level parameter types of a demangled C++ signature `name(p0, p1, …)`, or `None` if no
+/// parameter list is present. `(void)` / `()` yield an empty list.
+fn demangled_param_types(demangled: &str) -> Option<Vec<String>> {
+    let (open, close) = demangled_param_list_span(demangled)?;
     let inner = demangled[open + 1..close].trim();
     if inner.is_empty() || inner == "void" {
         return Some(Vec::new());
     }
     Some(split_top_level_commas(inner))
+}
+
+/// Whether the name portion of a demangled signature (everything before the parameter list) is
+/// qualified with a top-level `::` — a nested-namespace or member function such as `ns::foo(…)` or
+/// `Foo::m(…)`. Such names may carry an implicit `this` pointer that the demangled parameter list
+/// omits, so reference-parameter recovery declines them to avoid mistyping the object pointer.
+fn demangled_name_is_qualified(demangled: &str) -> bool {
+    let Some((open, _)) = demangled_param_list_span(demangled) else {
+        return false;
+    };
+    let name = &demangled[..open];
+    let mut angle = 0i32;
+    let bytes = name.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'<' => angle += 1,
+            b'>' => angle -= 1,
+            b':' if angle <= 0 && i + 1 < bytes.len() && bytes[i + 1] == b':' => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Split at top-level commas, ignoring those nested in `<>`/`()` (template args, function-pointer
@@ -2384,6 +2409,13 @@ impl Decompiler {
         // `func_name` is usually already the demangled signature (`assign_opt(std::optional<int>&)`);
         // fall back to demangling in case a raw mangled symbol reaches here.
         let demangled = hexray_demangle::demangle(func_name).unwrap_or_else(|| func_name.to_string());
+        // A qualified name (`ns::foo`, `Foo::m`) may be a non-static member whose implicit `this`
+        // occupies the first integer slot but is absent from the demangled parameter list. Positional
+        // mapping would then mistype `this`, so decline qualified names entirely (free functions,
+        // which the recovery targets, are unqualified).
+        if demangled_name_is_qualified(&demangled) {
+            return signature;
+        }
         let Some(params) = demangled_param_types(&demangled) else {
             return signature;
         };
@@ -3699,5 +3731,20 @@ mod tests {
         assert!(!is_optional_variant_reference("std::optional<int>"));
         assert!(!is_optional_variant_reference("int&"));
         assert!(!is_optional_variant_reference("std::vector<int>&"));
+    }
+
+    #[test]
+    fn demangled_name_is_qualified_detects_members_and_namespaces() {
+        // Unqualified free functions — the recovery target.
+        assert!(!demangled_name_is_qualified("assign_opt(std::optional<int>&)"));
+        assert!(!demangled_name_is_qualified("operator<(std::optional<int>&)"));
+        // A free-function template's `::` lives inside the angle-bracketed name, not at top level.
+        assert!(!demangled_name_is_qualified("foo<std::string>(std::optional<int>&)"));
+        // Namespaced or member functions carry a top-level `::` (implicit-`this` hazard).
+        assert!(demangled_name_is_qualified("ns::foo(std::optional<int>&)"));
+        assert!(demangled_name_is_qualified("Foo::m(std::optional<int>&)"));
+        assert!(demangled_name_is_qualified(
+            "Foo::operator<(std::optional<int>&)"
+        ));
     }
 }
