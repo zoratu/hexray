@@ -6134,13 +6134,17 @@ impl PseudoCodeEmitter {
         args: &[Expr],
         table: &StringTable,
     ) -> Option<String> {
-        // Split at the `::operator` boundary directly rather than via `split_qualified_method`: the
+        // Split at the `operator` token directly rather than via `split_qualified_method`: the
         // operator symbol itself may contain `<`/`>` (`operator>`, `operator<=`), which corrupts
         // that helper's angle-depth scan when the template arguments are namespace-qualified
         // (`std::operator><ns::X, ns::X>`). The namespace prefix carries no `<`, so the first
         // `operator` token — required to follow `::` — is unambiguously the operator name.
         let idx = target_name.find("operator")?;
-        let qualifier = target_name[..idx].strip_suffix("::")?;
+        let before = target_name[..idx].strip_suffix("::")?;
+        // A demangled template operator may carry a leading return type (`bool std::operator==<…>`,
+        // `std::enable_if<…>::type std::operator==<…>`); the namespace is the whitespace-delimited
+        // trailing segment before `::operator`.
+        let qualifier = before.rsplit(char::is_whitespace).next().unwrap_or(before);
         if !is_std_namespace_qualifier(qualifier) {
             return None;
         }
@@ -6195,12 +6199,19 @@ impl PseudoCodeEmitter {
         expr: &Expr,
         table: &StringTable,
     ) -> Option<String> {
-        let map = self.optional_variant_param_types.borrow();
-        if map.contains_key(name) || map.contains_key(&name.to_lowercase()) {
-            Some(self.format_expr_with_strings(expr, table))
-        } else {
-            None
-        }
+        let is_ref_param = {
+            let map = self.optional_variant_param_types.borrow();
+            map.contains_key(name)
+                || map.contains_key(&name.to_lowercase())
+                // An operand still carrying its raw ABI argument register resolves to its `argN`
+                // alias only through the gated `arg_register_display_name`, which returns `None`
+                // for a register reused as a non-parameter temp — so a reused register cannot
+                // spuriously satisfy the optional/variant gate.
+                || self
+                    .arg_register_display_name(name)
+                    .is_some_and(|argn| map.contains_key(&argn))
+        };
+        is_ref_param.then(|| self.format_expr_with_strings(expr, table))
     }
 
     fn try_format_virtual_dispatch(
@@ -15868,6 +15879,37 @@ int sum(int n, ...)
             .as_deref(),
             Some("(arg0 != arg1)")
         );
+        // A demangled template operator may carry a leading return type; the qualifier check must
+        // look past it.
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "bool std::operator==<int, int>",
+                &args,
+                &t
+            )
+            .as_deref(),
+            Some("(arg0 == arg1)")
+        );
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "std::enable_if<int, double>::type std::operator==<int, int>",
+                &args,
+                &t
+            )
+            .as_deref(),
+            Some("(arg0 == arg1)")
+        );
+        // Operands still carrying their raw ABI argument register resolve to their `argN` alias via
+        // the gated `arg_register_display_name` (param count defaults to unbounded here).
+        assert_eq!(
+            e.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator==<int, int>",
+                &[var_arg("rdi"), var_arg("rsi")],
+                &t
+            )
+            .as_deref(),
+            Some("(arg0 == arg1)")
+        );
         // `operator>`/`operator>=` whose template arguments are namespace-qualified: the operator's
         // own `>` must not corrupt the qualifier split.
         let ens = cmp_emitter(&[
@@ -15939,6 +15981,19 @@ int sum(int n, ...)
             e.try_format_optional_variant_comparison_operator_sugar(
                 "std::operator==<int>",
                 &one,
+                &t
+            ),
+            None
+        );
+        // Register-reuse soundness: with only one integer parameter, `rdi` (index 0) resolves but
+        // `rdx` (index 2) is beyond the parameter count, so `arg_register_display_name` returns
+        // `None` and the operand is left qualified — a reused register cannot satisfy the gate.
+        let egated = cmp_emitter(&[("arg0", "std::optional<int>&")]);
+        egated.integer_arg_param_count.set(1);
+        assert_eq!(
+            egated.try_format_optional_variant_comparison_operator_sugar(
+                "std::operator==<int, int>",
+                &[var_arg("rdi"), var_arg("rdx")],
                 &t
             ),
             None
