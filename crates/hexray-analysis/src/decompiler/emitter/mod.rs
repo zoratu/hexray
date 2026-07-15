@@ -6018,6 +6018,93 @@ impl PseudoCodeEmitter {
         Some(format!("{recv_str}.{method}({})", rest.join(", ")))
     }
 
+    /// Sugar the variant free-function accessors: the demangled name carries the deduced template
+    /// pack (`std::holds_alternative<int, int, double>`), and the receiver arrives as `&v`. Render
+    /// the idiomatic C++: drop the variant-alternatives pack (keep only the queried type) and show
+    /// the receiver by value:
+    ///   `std::holds_alternative<int, int, double>(&v)` → `std::holds_alternative<int>(v)`
+    ///   `std::get<int, int, double>(&v)`               → `std::get<int>(v)`
+    ///   `std::get_if<int, int, double>(&v)`            → `std::get_if<int>(&v)`   (pointer param)
+    ///
+    /// Gated on `v` being a local whose recovered type is EXACTLY `std::variant<Alts...>` (the
+    /// pack). That gate is also what makes the otherwise-tuple-ambiguous `std::get` safe: on a
+    /// `std::tuple`/`std::pair` receiver the type won't match `std::variant<…>`, so it stays
+    /// qualified.
+    fn try_format_variant_free_function_sugar(
+        &self,
+        target_name: &str,
+        args: &[Expr],
+        table: &StringTable,
+    ) -> Option<String> {
+        let lt = target_name.find('<')?;
+        let fn_name = &target_name[..lt];
+        // (short name to re-render, whether the accessor takes a pointer receiver).
+        let (short, keeps_pointer) = match fn_name {
+            "std::holds_alternative" => ("holds_alternative", false),
+            "std::get" => ("get", false),
+            "std::get_if" => ("get_if", true),
+            _ => return None,
+        };
+        // Balanced `<...>` template arguments.
+        let after = &target_name[lt + 1..];
+        let mut depth = 1usize;
+        let mut end = None;
+        for (j, c) in after.char_indices() {
+            match c {
+                '<' => depth += 1,
+                '>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let targs = split_top_level_template_args(&after[..end?]);
+        // `<QueriedT, Alt1, Alt2, …>`: need the queried type + a non-empty alternatives pack.
+        if targs.len() < 2 {
+            return None;
+        }
+        let queried = targs[0].trim();
+        let variant_type = format!(
+            "std::variant<{}>",
+            targs[1..]
+                .iter()
+                .map(|s| s.trim())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        // `args[0]` must be `&v` with `v` a local typed exactly as that variant.
+        let ExprKind::AddressOf(recv) = &args.first()?.kind else {
+            return None;
+        };
+        let ExprKind::Var(v) = &recv.kind else {
+            return None;
+        };
+        let recv_type = self
+            .type_info
+            .get(&v.name)
+            .or_else(|| self.type_info.get(&v.name.to_lowercase()))?;
+        if !whitespace_insensitive_eq(recv_type, &variant_type) {
+            return None;
+        }
+        let recv_str = self.format_expr_with_strings(recv, table);
+        let recv_arg = if keeps_pointer {
+            format!("&{recv_str}")
+        } else {
+            recv_str
+        };
+        let mut all = vec![recv_arg];
+        all.extend(
+            args.iter()
+                .skip(1)
+                .map(|a| self.format_expr_with_strings(a, table)),
+        );
+        Some(format!("std::{short}<{queried}>({})", all.join(", ")))
+    }
+
     fn try_format_virtual_dispatch(
         &self,
         target: &CallTarget,
@@ -6544,6 +6631,13 @@ impl PseudoCodeEmitter {
                 // already-`Named` ones.
                 if let Some(sugar) =
                     self.try_format_optional_variant_method_sugar(&target_str, args, table)
+                {
+                    return sugar;
+                }
+                // Free-function accessor sugar on a bound variant local:
+                // `std::holds_alternative<int, int, double>(&v)` → `std::holds_alternative<int>(v)`.
+                if let Some(sugar) =
+                    self.try_format_variant_free_function_sugar(&target_str, args, table)
                 {
                     return sugar;
                 }
@@ -10644,6 +10738,28 @@ impl PseudoCodeEmitter {
 /// at the last `::` that sits at angle-bracket depth 0, so a `::` *inside*
 /// template arguments (e.g. `std::optional<std::pair<int, int>>::value`) is not
 /// chosen as the split point. Returns `None` when there is no top-level `::`.
+/// Split a template-argument string at top-level commas, ignoring those nested inside `<>`/`()`.
+fn split_top_level_template_args(args: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in args.char_indices() {
+        match c {
+            '<' | '(' => depth += 1,
+            '>' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(args[start..i].to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    if !args[start..].trim().is_empty() {
+        out.push(args[start..].to_string());
+    }
+    out
+}
+
 fn split_qualified_method(name: &str) -> Option<(&str, &str)> {
     let bytes = name.as_bytes();
     let mut depth = 0i32;
@@ -15537,6 +15653,65 @@ int sum(int n, ...)
             )
             .as_deref(),
             Some("v.index()")
+        );
+    }
+
+    #[test]
+    fn sugars_variant_free_function_accessors() {
+        let e = sugar_emitter("v", "std::variant<int, double>");
+        let t = StringTable::new();
+        // holds_alternative / get take the variant by reference: drop the deduced pack,
+        // deref the receiver.
+        assert_eq!(
+            e.try_format_variant_free_function_sugar(
+                "std::holds_alternative<int, int, double>",
+                &this_arg("v"),
+                &t
+            )
+            .as_deref(),
+            Some("std::holds_alternative<int>(v)")
+        );
+        assert_eq!(
+            e.try_format_variant_free_function_sugar("std::get<int, int, double>", &this_arg("v"), &t)
+                .as_deref(),
+            Some("std::get<int>(v)")
+        );
+        // get_if takes a POINTER — keep the `&`.
+        assert_eq!(
+            e.try_format_variant_free_function_sugar(
+                "std::get_if<int, int, double>",
+                &this_arg("v"),
+                &t
+            )
+            .as_deref(),
+            Some("std::get_if<int>(&v)")
+        );
+    }
+
+    #[test]
+    fn variant_free_function_sugar_declines_off_target() {
+        let t = StringTable::new();
+        // Receiver typed as a tuple, not the variant — `std::get` stays qualified (this is what
+        // keeps tuple access from being mis-sugared).
+        let etuple = sugar_emitter("v", "std::tuple<int, double>");
+        assert_eq!(
+            etuple.try_format_variant_free_function_sugar(
+                "std::get<int, int, double>",
+                &this_arg("v"),
+                &t
+            ),
+            None
+        );
+        // Unrelated free function.
+        let ev = sugar_emitter("v", "std::variant<int, double>");
+        assert_eq!(
+            ev.try_format_variant_free_function_sugar("std::make_tuple<int>", &this_arg("v"), &t),
+            None
+        );
+        // No alternatives pack (just the queried type) — nothing recovered.
+        assert_eq!(
+            ev.try_format_variant_free_function_sugar("std::holds_alternative<int>", &this_arg("v"), &t),
+            None
         );
     }
 
