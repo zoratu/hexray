@@ -426,6 +426,115 @@ fn is_printable_ascii(b: u8) -> bool {
     (0x20..=0x7e).contains(&b) || b == b'\t' || b == b'\n' || b == b'\r'
 }
 
+/// The byte span `(open, close)` of a demangled signature's parameter list — the last balanced
+/// `(...)` group (trailing cv/ref qualifiers carry no parens). Matching backwards from the final
+/// `)` avoids mistaking an operator spelling — e.g. `Functor::operator()(std::optional<int>&)` or
+/// `operator<(...)` — for the parameter list.
+fn demangled_param_list_span(demangled: &str) -> Option<(usize, usize)> {
+    let bytes = demangled.as_bytes();
+    let close = demangled.rfind(')')?;
+    let mut depth = 0usize;
+    for idx in (0..=close).rev() {
+        match bytes[idx] {
+            b')' => depth += 1,
+            b'(' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some((idx, close));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The top-level parameter types of a demangled C++ signature `name(p0, p1, …)`, or `None` if no
+/// parameter list is present. `(void)` / `()` yield an empty list.
+fn demangled_param_types(demangled: &str) -> Option<Vec<String>> {
+    let (open, close) = demangled_param_list_span(demangled)?;
+    let inner = demangled[open + 1..close].trim();
+    if inner.is_empty() || inner == "void" {
+        return Some(Vec::new());
+    }
+    Some(split_top_level_commas(inner))
+}
+
+/// Whether the name portion of a demangled signature (everything before the parameter list) is
+/// qualified with a top-level `::` — a nested-namespace or member function such as `ns::foo(…)` or
+/// `Foo::m(…)`. Such names may carry an implicit `this` pointer that the demangled parameter list
+/// omits, so reference-parameter recovery declines them to avoid mistyping the object pointer.
+fn demangled_name_is_qualified(demangled: &str) -> bool {
+    let Some((open, _)) = demangled_param_list_span(demangled) else {
+        return false;
+    };
+    let name = &demangled[..open];
+    let mut angle = 0i32;
+    let bytes = name.as_bytes();
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'<' => angle += 1,
+            b'>' => angle -= 1,
+            b':' if angle <= 0 && i + 1 < bytes.len() && bytes[i + 1] == b':' => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Split at top-level commas, ignoring those nested in `<>`/`()` (template args, function-pointer
+/// parameter lists).
+fn split_top_level_commas(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim().to_string());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    let last = s[start..].trim();
+    if !last.is_empty() {
+        out.push(last.to_string());
+    }
+    out
+}
+
+/// Whether a demangled parameter type is a reference to `std::optional`/`std::variant`
+/// (`std::optional<int>&`, `std::variant<int, double> const&`, `std::optional<int>&&`, …).
+fn is_optional_variant_reference(param: &str) -> bool {
+    let mut base = param.trim();
+    // Strip one or two trailing `&` (lvalue / rvalue reference).
+    let Some(stripped) = base.strip_suffix('&') else {
+        return false;
+    };
+    base = stripped.trim_end().strip_suffix('&').unwrap_or(stripped).trim();
+    // Itanium spells cv-qualifiers after the type: `std::optional<int> const`.
+    base = base.strip_suffix("const").map(str::trim_end).unwrap_or(base);
+    base = base.strip_suffix("volatile").map(str::trim_end).unwrap_or(base);
+    is_optional_variant_type(base)
+}
+
+/// Whether `ty` names `std::optional<…>` / `std::variant<…>`, tolerating a libc++ inline-namespace
+/// component (`std::__1::optional<…>`) as emitted for clang/libc++ binaries.
+fn is_optional_variant_type(ty: &str) -> bool {
+    let Some(rest) = ty.strip_prefix("std::") else {
+        return false;
+    };
+    // Skip a leading inline-namespace segment such as `__1::`.
+    let rest = match rest.split_once("::") {
+        Some((ns, tail)) if ns.starts_with("__") => tail,
+        _ => rest,
+    };
+    rest.starts_with("optional<") || rest.starts_with("variant<")
+}
+
 fn collect_known_noreturn_targets(
     symbol_table: Option<&SymbolTable>,
     relocation_table: Option<&RelocationTable>,
@@ -1473,6 +1582,7 @@ impl Decompiler {
                 ))
                 .with_aapcs_va_list_counts(self.scan_aapcs_va_list_if_aarch64(cfg))
                 .analyze(&structured);
+            let signature = self.adjust_cpp_reference_param_types(signature, func_name);
             emitter.emit_with_signature(&structured, &display_name, &signature)
         } else {
             emitter.emit(&structured, &display_name)
@@ -2282,6 +2392,64 @@ impl Decompiler {
         }
 
         Some(count)
+    }
+
+    /// Refine `std::optional<T>&` / `std::variant<T...>&` PARAMETER types from the demangled C++
+    /// signature. The register-based recovery only sees a reference as a bare pointer (`arg0` typed
+    /// `int32_t`/pointer); the demangled name carries the real type. Positional mapping is only
+    /// sound when the demangled parameter count equals the recovered one — which excludes hidden
+    /// sret pointers, variadics, and (implicit-`this`) member functions — and each override is
+    /// applied only over a param already classified as a pointer, so a count-matched but
+    /// position-shifted mapping (e.g. an interleaved float param) never mis-types.
+    fn adjust_cpp_reference_param_types(
+        &self,
+        mut signature: FunctionSignature,
+        func_name: &str,
+    ) -> FunctionSignature {
+        // `func_name` is usually already the demangled signature (`assign_opt(std::optional<int>&)`);
+        // fall back to demangling in case a raw mangled symbol reaches here.
+        let demangled = hexray_demangle::demangle(func_name).unwrap_or_else(|| func_name.to_string());
+        // A qualified name (`ns::foo`, `Foo::m`) may be a non-static member whose implicit `this`
+        // occupies the first integer slot but is absent from the demangled parameter list. Positional
+        // mapping would then mistype `this`, so decline qualified names entirely (free functions,
+        // which the recovery targets, are unqualified).
+        if demangled_name_is_qualified(&demangled) {
+            return signature;
+        }
+        let Some(params) = demangled_param_types(&demangled) else {
+            return signature;
+        };
+        // Only act when every source parameter is an `std::optional`/`std::variant` reference. Such
+        // references are passed as pointers in integer registers, so each maps to one integer-class
+        // recovered parameter — this avoids ambiguous interleaving with by-value float parameters.
+        if params.is_empty() || !params.iter().all(|p| is_optional_variant_reference(p)) {
+            return signature;
+        }
+        // Integer-register recovered slots, in order. A reference arrives here as a pointer, but the
+        // decompiler often mistypes it as a pointer-sized integer, so accept any non-float slot.
+        let int_slots: Vec<usize> = signature
+            .parameters
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !matches!(p.param_type, ParamType::Float(_) | ParamType::SimdFloat(_)))
+            .map(|(i, _)| i)
+            .collect();
+        if int_slots.len() != params.len() {
+            return signature;
+        }
+        // Rebuild the parameter list from the integer-register slots only: the source has no float
+        // parameters (every one is a reference), so any recovered float slot is a spurious phantom.
+        let recovered = std::mem::take(&mut signature.parameters);
+        let mut kept = Vec::with_capacity(params.len());
+        for (i, mut p) in recovered.into_iter().enumerate() {
+            let Some(pos) = int_slots.iter().position(|&s| s == i) else {
+                continue; // phantom float slot — drop it
+            };
+            p.param_type = ParamType::Named(params[pos].trim().to_string());
+            kept.push(p);
+        }
+        signature.parameters = kept;
+        signature
     }
 
     fn adjusted_cpp_special_signature(
@@ -3500,5 +3668,83 @@ mod tests {
             Decompiler::generate_coroutine_header("foo(int) [clone .cold]", false).is_none(),
             "the cold-clone partition is not a coroutine clone"
         );
+    }
+
+    #[test]
+    fn demangled_param_types_splits_top_level() {
+        assert_eq!(
+            demangled_param_types("assign_opt(std::optional<int>&)"),
+            Some(vec!["std::optional<int>&".to_string()])
+        );
+        // Top-level commas inside template args must not be split.
+        assert_eq!(
+            demangled_param_types("assign_var(std::variant<int, double>&)"),
+            Some(vec!["std::variant<int, double>&".to_string()])
+        );
+        assert_eq!(
+            demangled_param_types("cmp_opt(std::optional<int>&, std::optional<int>&)"),
+            Some(vec![
+                "std::optional<int>&".to_string(),
+                "std::optional<int>&".to_string(),
+            ])
+        );
+        // No parameter list, and empty / void lists.
+        assert_eq!(demangled_param_types("plain_symbol"), None);
+        assert_eq!(demangled_param_types("f()"), Some(Vec::new()));
+        assert_eq!(demangled_param_types("f(void)"), Some(Vec::new()));
+
+        // Operator spellings embed `()`/`<` in the name; the parameter list is still the final
+        // balanced parens.
+        assert_eq!(
+            demangled_param_types("Functor::operator()(std::optional<int>&)"),
+            Some(vec!["std::optional<int>&".to_string()])
+        );
+        assert_eq!(
+            demangled_param_types("operator<(std::optional<int>&, std::optional<int>&)"),
+            Some(vec![
+                "std::optional<int>&".to_string(),
+                "std::optional<int>&".to_string(),
+            ])
+        );
+        // A function-pointer parameter carries balanced inner parens.
+        assert_eq!(
+            demangled_param_types("foo(std::function<int (int)>&)"),
+            Some(vec!["std::function<int (int)>&".to_string()])
+        );
+        // Trailing cv-qualifier after the parameter list.
+        assert_eq!(
+            demangled_param_types("Foo::bar(std::optional<int>&) const"),
+            Some(vec!["std::optional<int>&".to_string()])
+        );
+    }
+
+    #[test]
+    fn is_optional_variant_reference_recognises_refs() {
+        assert!(is_optional_variant_reference("std::optional<int>&"));
+        assert!(is_optional_variant_reference("std::variant<int, double>&"));
+        assert!(is_optional_variant_reference("std::optional<int>&&"));
+        assert!(is_optional_variant_reference("std::optional<int> const&"));
+        // libc++ inline-namespace spelling (clang/libc++ binaries).
+        assert!(is_optional_variant_reference("std::__1::optional<int>&"));
+        assert!(is_optional_variant_reference("std::__1::variant<int, double>&"));
+        // Not references, or not optional/variant.
+        assert!(!is_optional_variant_reference("std::optional<int>"));
+        assert!(!is_optional_variant_reference("int&"));
+        assert!(!is_optional_variant_reference("std::vector<int>&"));
+    }
+
+    #[test]
+    fn demangled_name_is_qualified_detects_members_and_namespaces() {
+        // Unqualified free functions — the recovery target.
+        assert!(!demangled_name_is_qualified("assign_opt(std::optional<int>&)"));
+        assert!(!demangled_name_is_qualified("operator<(std::optional<int>&)"));
+        // A free-function template's `::` lives inside the angle-bracketed name, not at top level.
+        assert!(!demangled_name_is_qualified("foo<std::string>(std::optional<int>&)"));
+        // Namespaced or member functions carry a top-level `::` (implicit-`this` hazard).
+        assert!(demangled_name_is_qualified("ns::foo(std::optional<int>&)"));
+        assert!(demangled_name_is_qualified("Foo::m(std::optional<int>&)"));
+        assert!(demangled_name_is_qualified(
+            "Foo::operator<(std::optional<int>&)"
+        ));
     }
 }
