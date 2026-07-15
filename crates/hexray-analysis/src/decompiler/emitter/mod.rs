@@ -6192,6 +6192,29 @@ impl PseudoCodeEmitter {
         }
     }
 
+    /// Record a `std::optional`/`std::variant` reference parameter's type for the comparison-operator
+    /// sugar, keyed by its source `name` and its `argN` display alias. The alias is keyed by the
+    /// integer-register index — which differs from the source parameter position when earlier
+    /// parameters occupy float registers (`double d, std::optional<int>& opt` → `opt` renders as
+    /// `arg0`, not `arg1`). The raw ABI register is deliberately NOT keyed: registers are reused
+    /// within a function, so a later unrelated `std::operator==(rdi, rsi)` on reused registers would
+    /// falsely sugar; `argN` denotes the parameter value under the naming pass's liveness analysis.
+    fn record_optional_variant_reference_param(
+        &self,
+        name: &str,
+        param: &super::signature::Parameter,
+    ) {
+        let type_str = param.param_type.to_c_string();
+        if !super::is_optional_variant_reference(&type_str) {
+            return;
+        }
+        let mut map = self.optional_variant_param_types.borrow_mut();
+        map.insert(name.to_string(), type_str.clone());
+        if let super::signature::ParameterLocation::IntegerRegister { index, .. } = &param.location {
+            map.insert(format!("arg{}", index), type_str);
+        }
+    }
+
     /// If `name` is a recorded optional/variant reference parameter, render `expr`; else `None`.
     fn optional_variant_reference_param_operand(
         &self,
@@ -7491,18 +7514,7 @@ impl PseudoCodeEmitter {
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
-            // Record `std::optional`/`std::variant` reference-parameter types for the operator
-            // sugar, keyed by the source name and the `argN` slot alias only. The raw ABI argument
-            // register is deliberately NOT used as a key: registers are reused within a function, so
-            // a later unrelated `std::operator==(rdi, rsi)` on reused registers would falsely sugar.
-            // `argN` is gated to actual parameters (see `integer_arg_param_count`), so it denotes the
-            // parameter value rather than whatever a register happens to hold later.
-            let type_str = signature.parameters[idx].param_type.to_c_string();
-            if super::is_optional_variant_reference(&type_str) {
-                let mut map = self.optional_variant_param_types.borrow_mut();
-                map.insert(source_name.clone(), type_str.clone());
-                map.insert(format!("arg{}", idx), type_str);
-            }
+            self.record_optional_variant_reference_param(source_name, &signature.parameters[idx]);
         }
 
         // Record how many argument registers are actual parameters, so a higher
@@ -15927,6 +15939,28 @@ int sum(int n, ...)
                 .as_deref(),
             Some("(arg0 == arg1)")
         );
+    }
+
+    #[test]
+    fn record_optional_variant_reference_param_keys_argn_by_register_index() {
+        use super::super::signature::{ParamType, Parameter, ParameterLocation};
+        let e = PseudoCodeEmitter::new("    ", false);
+        // Source position 1, but the first (float) parameter took a float register, so this
+        // optional reference is integer-register index 0 and renders as `arg0`, not `arg1`.
+        let opt = Parameter::new(
+            "opt",
+            ParamType::Named("std::optional<int>&".to_string()),
+            ParameterLocation::IntegerRegister {
+                name: "rdi".to_string(),
+                index: 0,
+            },
+        );
+        e.record_optional_variant_reference_param("opt", &opt);
+        let map = e.optional_variant_param_types.borrow();
+        assert_eq!(map.get("arg0").map(String::as_str), Some("std::optional<int>&"));
+        assert_eq!(map.get("opt").map(String::as_str), Some("std::optional<int>&"));
+        // The source position (1) must not leak in as `arg1`.
+        assert!(!map.contains_key("arg1"));
     }
 
     #[test]
