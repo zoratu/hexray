@@ -5,6 +5,47 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.18] - 2026-07-18
+
+### Decompiler — clang C++20 coroutine `.resume` recovery
+
+- **Jump-table (many-state) dispatch.** Recover the clang `.resume` stepper that
+  dispatches on the 1-byte resume index at `frame+0x11` through a `.rodata` jump
+  table, rendering the `switch (frame->__resume_index)` and extracting each
+  state's body. Complements the existing gcc `.actor` recovery.
+- **Per-state body extraction.** Split the woven suspend/resume control flow into
+  per-state `case` bodies by marking the shared flag-check merge, the segment
+  start, and the value-discriminated body join as dispatch targets; a
+  cycle-reachability guard declines loop-around-`co_await` shapes.
+- **Compare-chain dispatch.** Recover the alternate clang `.resume` shape whose
+  dispatch is an inlined `sub`/`cmp`/`je` compare chain (no jump table) by
+  concretely evaluating the chain per index value, with subregister-width
+  tracking, trampoline following, and dead-chain-block pruning.
+
+### Decompiler — C++ `std::optional` / `std::variant` semantic recovery
+
+- **Bind locals from free-function accessors.** A `std::variant` local is bound
+  from `std::holds_alternative<T, Alts...>(&v)` / `std::get_if<T, Alts...>(&v)`
+  (the deduced alternatives pack gives the full `std::variant<Alts...>` type);
+  `std::get` is excluded as tuple-ambiguous.
+- **Free-function accessor sugar.** Render the idiomatic form, dropping the
+  deduced pack and showing the receiver by value:
+  `std::holds_alternative<int, int, double>(&v)` → `std::holds_alternative<int>(v)`,
+  `std::get<int, int, double>(&v)` → `std::get<int>(v)`, `std::get_if` keeps its
+  pointer argument. Gated on `v` being typed exactly `std::variant<Alts...>`,
+  which also makes the otherwise tuple-ambiguous `std::get` safe.
+- **Reference parameter types.** Recover `std::optional<T>&` / `std::variant<T...>&`
+  free-function parameter types from the demangled signature, so declarations
+  render the C++ reference type instead of a raw `int32_t`/pointer, dropping
+  spurious phantom float slots. Conservatively declines qualified names (implicit
+  `this` hazard) and mixed by-value-float signatures; recognizes the libc++
+  `std::__1` inline namespace.
+- **Comparison-operator sugar.** Render `std::operator==<int, int>(a, b)` as
+  `(a == b)` (also `!=`, `<`, `>`, `<=`, `>=`, `<=>`) when both operands are
+  `std::optional` / `std::variant` values. Gated on the operand types so the many
+  unrelated `std::operator==` overloads (strings, iterators) stay qualified;
+  parenthesized to survive nested contexts (`if (!(a == b))`).
+
 ## [1.3.17] - 2026-07-10
 
 ### Documentation
