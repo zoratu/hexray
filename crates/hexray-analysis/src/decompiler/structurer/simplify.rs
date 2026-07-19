@@ -1253,9 +1253,14 @@ where
 /// source rather than the doubled-segment Itanium-ABI form. Leaves any
 /// non-matching name untouched.
 /// The base identifier of a `::`-segment: the part before any template-argument
-/// list (`vector<int, std::allocator<int> >` → `vector`).
+/// list (`vector<int, std::allocator<int> >` → `vector`) or GNU ABI tag
+/// (`failure[abi:cxx11]` → `failure`).
 fn ctor_segment_base(segment: &str) -> &str {
-    segment.split('<').next().unwrap_or(segment).trim()
+    segment
+        .split(|c| c == '<' || c == '[')
+        .next()
+        .unwrap_or(segment)
+        .trim()
 }
 
 /// The last two `::`-separated segments of a qualified name, split at angle
@@ -15871,6 +15876,10 @@ mod tests {
             "std::vector<int, std::allocator<int> >::vector"
         ));
         assert!(looks_like_constructor("Foo<ns::Bar>::Foo"));
+        // GNU ABI tag on the class segment (libstdc++ cxx11 types).
+        assert!(looks_like_constructor(
+            "std::ios_base::failure[abi:cxx11]::failure"
+        ));
         assert!(!looks_like_constructor("memcpy"));
         assert!(!looks_like_constructor("ns::make_error"));
         assert!(!looks_like_constructor("Foo::~Foo")); // destructor, not ctor
