@@ -952,7 +952,15 @@ where
         ) -> Option<(&'a CallTarget, &'a [Expr])> {
             let call = match &stmt.kind {
                 ExprKind::Call { .. } => stmt,
-                ExprKind::Assign { rhs, .. } => strip_casts(rhs),
+                // Only a captured-return temporary `ret = ctor(buf, …)` (LHS is a
+                // plain `Var`), never a store `*buf = f(buf, …)` (LHS is a
+                // `Deref`/`ArrayAccess`) — the latter stays the scalar-store form
+                // so its argument 0 is preserved.
+                ExprKind::Assign { lhs, rhs }
+                    if matches!(&strip_casts(lhs).kind, ExprKind::Var(_)) =>
+                {
+                    strip_casts(rhs)
+                }
                 _ => return None,
             };
             let ExprKind::Call { target, args } = &call.kind else {
@@ -15756,6 +15764,49 @@ mod tests {
         assert!(
             text.contains("\"boom\""),
             "expected the boom argument preserved, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_preserves_scalar_store_whose_value_is_a_call() {
+        // A scalar store whose value is a call taking the buffer as its first
+        // argument — `*buf = f(buf, x)` — is NOT the captured-ctor shape (its
+        // LHS is a store, not a temporary), so the whole call is preserved as
+        // the thrown value; argument 0 must not be dropped.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(8)],
+                    ),
+                ),
+                Expr::assign(
+                    Expr::deref(local("ret_0", 8), 8),
+                    Expr::call(
+                        CallTarget::Named("compute_exception".to_string()),
+                        vec![local("ret_0", 8), Expr::int(5)],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for int"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        let text = match &statements[0].kind {
+            ExprKind::Unknown(t) => t.as_str(),
+            other => panic!("expected Unknown, got {:?}", other),
+        };
+        assert!(
+            text.starts_with("throw compute_exception(") && text.contains("ret_0"),
+            "expected the store's call preserved with argument 0, got {text:?}"
         );
     }
 
