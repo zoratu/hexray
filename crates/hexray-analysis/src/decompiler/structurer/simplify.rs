@@ -950,17 +950,25 @@ where
             stmt: &'a Expr,
             buf: &str,
         ) -> Option<(&'a CallTarget, &'a [Expr])> {
+            // A disposable call-return holder: the lifter's `ret`/`ret_N`
+            // capture temps or a raw ABI return register. Restricting the ctor
+            // unwrap to these (rather than any `Var`) means a real, observable
+            // assignment `some_var = Foo::Foo(buf, …)` is never truncated away,
+            // and a store `*buf = …` (LHS is a `Deref`) is excluded so its whole
+            // value is preserved as the scalar-store form.
+            fn is_call_return_holder(lhs: &Expr) -> bool {
+                let name = match &strip_casts(lhs).kind {
+                    ExprKind::Var(v) => v.name.as_str(),
+                    ExprKind::Unknown(n) => n.as_str(),
+                    _ => return false,
+                };
+                name == "ret"
+                    || name.starts_with("ret_")
+                    || crate::decompiler::abi::is_return_register(name)
+            }
             let call = match &stmt.kind {
                 ExprKind::Call { .. } => stmt,
-                // Only a captured-return temporary `ret = ctor(buf, …)` (LHS is a
-                // plain `Var`), never a store `*buf = f(buf, …)` (LHS is a
-                // `Deref`/`ArrayAccess`) — the latter stays the scalar-store form
-                // so its argument 0 is preserved.
-                ExprKind::Assign { lhs, rhs }
-                    if matches!(&strip_casts(lhs).kind, ExprKind::Var(_)) =>
-                {
-                    strip_casts(rhs)
-                }
+                ExprKind::Assign { lhs, rhs } if is_call_return_holder(lhs) => strip_casts(rhs),
                 _ => return None,
             };
             let ExprKind::Call { target, args } = &call.kind else {
@@ -15935,6 +15943,46 @@ mod tests {
                 .iter()
                 .any(|s| matches!(&s.kind, ExprKind::Unknown(t) if t.starts_with("throw"))),
             "must not synthesise a throw for a non-ctor helper: {statements:#?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_declines_ctor_captured_into_observable_var() {
+        // `local_18 = Foo::Foo(buf, x)` captures the ctor return into a real,
+        // observable variable (not a `ret`/`ret_N`/return-register holder), so
+        // truncating it would drop that assignment — leave the raw sequence.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(16)],
+                    ),
+                ),
+                Expr::assign(
+                    local("local_18", 8),
+                    Expr::call(
+                        CallTarget::Named("Foo::Foo".to_string()),
+                        vec![local("ret_0", 8), Expr::int(5)],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for Foo"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(
+            !statements
+                .iter()
+                .any(|s| matches!(&s.kind, ExprKind::Unknown(t) if t.starts_with("throw"))),
+            "must not collapse a ctor captured into an observable variable: {statements:#?}"
         );
     }
 
