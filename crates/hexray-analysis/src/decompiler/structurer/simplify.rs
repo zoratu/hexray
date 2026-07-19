@@ -1264,11 +1264,7 @@ where
 /// list (`vector<int, std::allocator<int> >` → `vector`) or GNU ABI tag
 /// (`failure[abi:cxx11]` → `failure`).
 fn ctor_segment_base(segment: &str) -> &str {
-    segment
-        .split(|c| c == '<' || c == '[')
-        .next()
-        .unwrap_or(segment)
-        .trim()
+    segment.split(['<', '[']).next().unwrap_or(segment).trim()
 }
 
 /// The last two `::`-separated segments of a qualified name, split at angle
