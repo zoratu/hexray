@@ -940,19 +940,38 @@ where
                 .unwrap_or(false)
         }
 
+        /// A constructor initialising `buf` in place, returning the ctor call's
+        /// target and args. The ctor is either a bare `Class::Class(buf, …)`
+        /// call or that call captured into an otherwise-unused temporary
+        /// `ret = Class::Class(buf, …)` — at `-O0` the compiler keeps the ctor's
+        /// ABI return (the object pointer), which the throw discards. Unwrap the
+        /// optional assignment, then require the first argument to be `buf`.
+        fn ctor_call_into_buf<'a>(
+            stmt: &'a Expr,
+            buf: &str,
+        ) -> Option<(&'a CallTarget, &'a [Expr])> {
+            let call = match &stmt.kind {
+                ExprKind::Call { .. } => stmt,
+                ExprKind::Assign { rhs, .. } => strip_casts(rhs),
+                _ => return None,
+            };
+            let ExprKind::Call { target, args } = &call.kind else {
+                return None;
+            };
+            let first_is_buf = args
+                .first()
+                .map(strip_casts)
+                .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf));
+            first_is_buf.then_some((target, args.as_slice()))
+        }
+
         // Determine the run of buffer-initialisation statements
         // immediately before the throw, and the index where the alloc
         // sits. For the ctor form the run is exactly the single trailing
         // call; for the store form it's one or more consecutive stores
         // walking backwards until the first non-store statement.
         let last_idx = result.len() - 1;
-        let last_is_ctor = matches!(
-            &result[last_idx].kind,
-            ExprKind::Call { args, .. } if args
-                .first()
-                .map(strip_casts)
-                .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name))
-        );
+        let last_is_ctor = ctor_call_into_buf(&result[last_idx], &buf_name).is_some();
         let mut store_run_start = if last_is_ctor {
             last_idx
         } else if is_store_into_buf(&result[last_idx], &buf_name) {
@@ -1143,7 +1162,47 @@ where
 
         let stored_value = if let Some(brace_literal) = multi_store_value {
             Some(brace_literal)
+        } else if let Some((target, args)) =
+            ctor_call_into_buf(&result[last_store_idx], &buf_name)
+        {
+            // Constructor form — bare `Class::Class(buf, …)` or the temp-captured
+            // `ret = Class::Class(buf, …)`. Render `throw TypeName(remaining_args)`,
+            // dropping the implicit buf slot so the throw reads like the source
+            // expression. Falls back to the resolved call name when `Direct`.
+            fn canonicalise_ctor_name(raw: &str) -> String {
+                // Strip glibc/PLT decorations, demangle a raw Itanium symbol
+                // (a `Direct` relocation resolves to the mangled ctor name, e.g.
+                // `_ZNSt13runtime_errorC1EPKc`), then strip the
+                // `[base]`/`[complete]`/`[clone …]` disambiguator labels and the
+                // trailing `(args)` signature — in that order, because each step
+                // exposes the next one's tail. Mirrors the chain in
+                // `PseudoCodeEmitter::format_call_target_name` from deferral #5.
+                let unversioned = hexray_core::unversioned_symbol_name(raw);
+                let demangled =
+                    hexray_demangle::demangle(unversioned).unwrap_or_else(|| unversioned.to_string());
+                let labels_stripped =
+                    crate::symbol_names::strip_demangler_disambiguator_labels(&demangled);
+                crate::symbol_names::strip_demangled_signature(labels_stripped).to_string()
+            }
+            let target_name = match target {
+                CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
+                CallTarget::Direct {
+                    target: addr,
+                    call_site,
+                } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
+                _ => None,
+            };
+            // Trim `TypeName::TypeName` chains to just `TypeName(args)` when the
+            // trailing component repeats the class name
+            // (`std::runtime_error::runtime_error` → `std::runtime_error`).
+            target_name.map(|name| {
+                let prettified = collapse_ctor_pretty_name(&name);
+                let rest_args: Vec<String> =
+                    args.iter().skip(1).map(|a| format!("{}", a)).collect();
+                format!("{}({})", prettified, rest_args.join(", "))
+            })
         } else {
+            // Scalar store form: `*(T *)buf = value`.
             match &result[last_store_idx].kind {
                 ExprKind::Assign { lhs, rhs } => {
                     let target_matches = match &lhs.kind {
@@ -1157,56 +1216,6 @@ where
                         Some(format!("{}", (**rhs).clone()))
                     } else {
                         None
-                    }
-                }
-                ExprKind::Call { target, args } => {
-                    // Constructor form: first arg must be the buffer.
-                    let first_is_buf = args
-                        .first()
-                        .map(strip_casts)
-                        .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name));
-                    if !first_is_buf {
-                        None
-                    } else {
-                        // Render `TypeName(remaining_args)` — drop the
-                        // implicit buf slot so the throw reads like the
-                        // source expression. Falls back to the resolved
-                        // call name when the target is `Direct`.
-                        fn canonicalise_ctor_name(raw: &str) -> String {
-                            // Strip glibc/PLT decorations, then the
-                            // `[base]`/`[complete]`/`[clone …]` disambiguator
-                            // labels, then the trailing `(args)` signature —
-                            // in that order, because each step exposes the
-                            // next one's tail. Mirrors the chain in
-                            // `PseudoCodeEmitter::format_call_target_name`
-                            // from deferral #5.
-                            let unversioned = hexray_core::unversioned_symbol_name(raw);
-                            let labels_stripped =
-                                crate::symbol_names::strip_demangler_disambiguator_labels(
-                                    unversioned,
-                                );
-                            crate::symbol_names::strip_demangled_signature(labels_stripped)
-                                .to_string()
-                        }
-                        let target_name = match target {
-                            CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
-                            CallTarget::Direct {
-                                target: addr,
-                                call_site,
-                            } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
-                            _ => None,
-                        };
-                        let Some(target_name) = target_name else {
-                            result.push(stmt);
-                            continue;
-                        };
-                        // Trim `TypeName::TypeName` chains to just `TypeName(args)`
-                        // when the trailing component repeats the class name
-                        // (`std::runtime_error::runtime_error` → `std::runtime_error`).
-                        let prettified = collapse_ctor_pretty_name(&target_name);
-                        let rest_args: Vec<String> =
-                            args.iter().skip(1).map(|a| format!("{}", a)).collect();
-                        Some(format!("{}({})", prettified, rest_args.join(", ")))
                     }
                 }
                 _ => None,
@@ -15687,6 +15696,62 @@ mod tests {
         assert!(
             text.starts_with("throw std::runtime_error("),
             "expected `throw std::runtime_error(...)`, got {text:?}"
+        );
+        assert!(
+            text.contains("\"boom\""),
+            "expected the boom argument preserved, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_collapses_captured_ctor_via_direct_call() {
+        // At -O0 the constructor's ABI return (the object pointer) is captured
+        // into an otherwise-unused temporary: `ret_1 = Class::Class(buf, args)`.
+        // The ctor is reached by a `Direct` relocation resolving to the mangled
+        // Itanium symbol, so the recogniser must unwrap the assignment AND
+        // demangle the ctor name — the real-binary shape for `throw
+        // std::runtime_error("boom")`.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(16)],
+                    ),
+                ),
+                // Captured ctor call via a Direct relocation.
+                Expr::assign(
+                    local("ret_1", 8),
+                    Expr::call(
+                        CallTarget::Direct {
+                            target: 0x1000,
+                            call_site: 0x2000,
+                        },
+                        vec![local("ret_0", 8), Expr::unknown("\"boom\"")],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for std::runtime_error"),
+            ],
+        )];
+
+        // Resolve the ctor's Direct target to its mangled Itanium symbol.
+        let resolve = |addr: u64, _: u64| -> Option<String> {
+            (addr == 0x1000).then(|| "_ZNSt13runtime_errorC1EPKc".to_string())
+        };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        let text = match &statements[0].kind {
+            ExprKind::Unknown(t) => t.as_str(),
+            other => panic!("expected Unknown, got {:?}", other),
+        };
+        assert!(
+            text.starts_with("throw std::runtime_error("),
+            "expected demangled `throw std::runtime_error(...)`, got {text:?}"
         );
         assert!(
             text.contains("\"boom\""),
