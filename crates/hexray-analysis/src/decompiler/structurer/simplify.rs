@@ -1200,10 +1200,11 @@ where
                 } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
                 _ => None,
             };
-            // Trim `TypeName::TypeName` chains to just `TypeName(args)` when the
-            // trailing component repeats the class name
-            // (`std::runtime_error::runtime_error` → `std::runtime_error`).
-            target_name.map(|name| {
+            // Require the callee to actually be a constructor (its last two
+            // `::`-segments name the same class) so a captured helper return
+            // (`ret = memcpy(buf, …)`) is not mistaken for the ctor. Then trim
+            // the doubled `TypeName::TypeName` to `TypeName(args)`.
+            target_name.filter(|name| looks_like_constructor(name)).map(|name| {
                 let prettified = collapse_ctor_pretty_name(&name);
                 let rest_args: Vec<String> =
                     args.iter().skip(1).map(|a| format!("{}", a)).collect();
@@ -1264,6 +1265,26 @@ fn collapse_ctor_pretty_name(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+/// Whether a demangled name is a C++ constructor: its last two `::`-segments
+/// name the same class (`ns::Class::Class`, `Class<T>::Class`). This gates the
+/// throw recogniser's ctor form so an ordinary helper that returns its first
+/// argument and is captured into a temp — `ret = memcpy(buf, src, n)` — is not
+/// mistaken for the discarded constructor return and rewritten into a `throw`.
+fn looks_like_constructor(name: &str) -> bool {
+    // Compare the base identifier (before any template-argument list) of the
+    // last two segments; `Class<T>::Class` is still a constructor.
+    fn base(s: &str) -> &str {
+        s.split('<').next().unwrap_or(s).trim()
+    }
+    let Some((head, tail)) = name.rsplit_once("::") else {
+        return false;
+    };
+    let Some(prev) = head.rsplit("::").next() else {
+        return false;
+    };
+    !base(tail).is_empty() && base(prev) == base(tail)
 }
 
 fn suppress_asan_scaffolding(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -15807,6 +15828,59 @@ mod tests {
         assert!(
             text.starts_with("throw compute_exception(") && text.contains("ret_0"),
             "expected the store's call preserved with argument 0, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn looks_like_constructor_distinguishes_ctors_from_helpers() {
+        assert!(looks_like_constructor("std::runtime_error::runtime_error"));
+        assert!(looks_like_constructor("ns::Widget::Widget"));
+        assert!(looks_like_constructor("Foo<int>::Foo")); // template class ctor
+        assert!(!looks_like_constructor("memcpy"));
+        assert!(!looks_like_constructor("ns::make_error"));
+        assert!(!looks_like_constructor("Foo::~Foo")); // destructor, not ctor
+    }
+
+    #[test]
+    fn recover_cxa_throw_declines_captured_non_ctor_helper() {
+        // `ret_1 = memcpy(buf, src, 8)` between the alloc and the throw returns
+        // its first argument and is captured into a temp, but it is NOT a
+        // constructor — the recogniser must leave the raw sequence intact rather
+        // than emit `throw memcpy(src, 8)`.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(8)],
+                    ),
+                ),
+                Expr::assign(
+                    local("ret_1", 8),
+                    Expr::call(
+                        CallTarget::Named("memcpy".to_string()),
+                        vec![local("ret_0", 8), local("src", 8), Expr::int(8)],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for int"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        // Nothing collapsed: alloc + memcpy + throw all remain, and no `throw`
+        // marker was synthesised.
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(
+            !statements
+                .iter()
+                .any(|s| matches!(&s.kind, ExprKind::Unknown(t) if t.starts_with("throw"))),
+            "must not synthesise a throw for a non-ctor helper: {statements:#?}"
         );
     }
 
