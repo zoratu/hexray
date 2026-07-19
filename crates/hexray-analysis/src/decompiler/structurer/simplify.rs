@@ -1252,14 +1252,51 @@ where
 /// `Namespace::Class` so a recovered `throw Class(args)` reads like
 /// source rather than the doubled-segment Itanium-ABI form. Leaves any
 /// non-matching name untouched.
+/// The base identifier of a `::`-segment: the part before any template-argument
+/// list (`vector<int, std::allocator<int> >` → `vector`).
+fn ctor_segment_base(segment: &str) -> &str {
+    segment.split('<').next().unwrap_or(segment).trim()
+}
+
+/// The last two `::`-separated segments of a qualified name, split at angle
+/// depth 0 so a `::` inside template arguments (`std::allocator<int>`) is not
+/// mistaken for a segment boundary. Returns `(prev, tail)`, or `None` when the
+/// name has no top-level `::`.
+fn last_two_top_level_segments(name: &str) -> Option<(&str, &str)> {
+    let bytes = name.as_bytes();
+    let mut depth = 0i32;
+    let mut seps: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                seps.push(i);
+                i += 1; // skip the second ':'
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = *seps.last()?;
+    let prev_start = if seps.len() >= 2 {
+        seps[seps.len() - 2] + 2
+    } else {
+        0
+    };
+    Some((&name[prev_start..last], &name[last + 2..]))
+}
+
 fn collapse_ctor_pretty_name(name: &str) -> String {
-    // Walk the `::`-separated chain from the right; if the last two
-    // segments are identical, drop the trailing one.
-    if let Some((head, tail)) = name.rsplit_once("::") {
-        // `head` might still end in another `::Class` we need to
-        // compare against. Look at the last segment of `head`.
-        if let Some(prev_tail) = head.rsplit("::").next() {
-            if prev_tail == tail {
+    // Drop the trailing ctor segment when the last two top-level segments name
+    // the same class (`A::B::B` → `A::B`, `std::vector<…>::vector` →
+    // `std::vector<…>`), comparing the base before any template arguments.
+    if let Some((prev, tail)) = last_two_top_level_segments(name) {
+        if !ctor_segment_base(tail).is_empty()
+            && ctor_segment_base(prev) == ctor_segment_base(tail)
+        {
+            if let Some(head) = name.strip_suffix(tail).and_then(|s| s.strip_suffix("::")) {
                 return head.to_string();
             }
         }
@@ -1267,24 +1304,17 @@ fn collapse_ctor_pretty_name(name: &str) -> String {
     name.to_string()
 }
 
-/// Whether a demangled name is a C++ constructor: its last two `::`-segments
-/// name the same class (`ns::Class::Class`, `Class<T>::Class`). This gates the
-/// throw recogniser's ctor form so an ordinary helper that returns its first
-/// argument and is captured into a temp — `ret = memcpy(buf, src, n)` — is not
-/// mistaken for the discarded constructor return and rewritten into a `throw`.
+/// Whether a demangled name is a C++ constructor: its last two top-level
+/// `::`-segments name the same class (`ns::Class::Class`, `Class<T>::Class`,
+/// `std::vector<int, std::allocator<int> >::vector`). This gates the throw
+/// recogniser's ctor form so an ordinary helper that returns its first argument
+/// and is captured into a temp — `ret = memcpy(buf, src, n)` — is not mistaken
+/// for the discarded constructor return and rewritten into a `throw`.
 fn looks_like_constructor(name: &str) -> bool {
-    // Compare the base identifier (before any template-argument list) of the
-    // last two segments; `Class<T>::Class` is still a constructor.
-    fn base(s: &str) -> &str {
-        s.split('<').next().unwrap_or(s).trim()
-    }
-    let Some((head, tail)) = name.rsplit_once("::") else {
+    let Some((prev, tail)) = last_two_top_level_segments(name) else {
         return false;
     };
-    let Some(prev) = head.rsplit("::").next() else {
-        return false;
-    };
-    !base(tail).is_empty() && base(prev) == base(tail)
+    !ctor_segment_base(tail).is_empty() && ctor_segment_base(prev) == ctor_segment_base(tail)
 }
 
 fn suppress_asan_scaffolding(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -15836,9 +15866,24 @@ mod tests {
         assert!(looks_like_constructor("std::runtime_error::runtime_error"));
         assert!(looks_like_constructor("ns::Widget::Widget"));
         assert!(looks_like_constructor("Foo<int>::Foo")); // template class ctor
+        // Template arguments containing `::` must not confuse the segment split.
+        assert!(looks_like_constructor(
+            "std::vector<int, std::allocator<int> >::vector"
+        ));
+        assert!(looks_like_constructor("Foo<ns::Bar>::Foo"));
         assert!(!looks_like_constructor("memcpy"));
         assert!(!looks_like_constructor("ns::make_error"));
         assert!(!looks_like_constructor("Foo::~Foo")); // destructor, not ctor
+
+        // The collapse must likewise ignore `::` inside template arguments.
+        assert_eq!(
+            collapse_ctor_pretty_name("std::vector<int, std::allocator<int> >::vector"),
+            "std::vector<int, std::allocator<int> >"
+        );
+        assert_eq!(
+            collapse_ctor_pretty_name("std::runtime_error::runtime_error"),
+            "std::runtime_error"
+        );
     }
 
     #[test]
