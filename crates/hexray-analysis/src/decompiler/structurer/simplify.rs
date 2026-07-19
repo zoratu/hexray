@@ -940,19 +940,54 @@ where
                 .unwrap_or(false)
         }
 
+        /// A constructor initialising `buf` in place, returning the ctor call's
+        /// target and args. The ctor is either a bare `Class::Class(buf, …)`
+        /// call or that call captured into an otherwise-unused temporary
+        /// `ret = Class::Class(buf, …)` — at `-O0` the compiler keeps the ctor's
+        /// ABI return (the object pointer), which the throw discards. Unwrap the
+        /// optional assignment, then require the first argument to be `buf`.
+        fn ctor_call_into_buf<'a>(
+            stmt: &'a Expr,
+            buf: &str,
+        ) -> Option<(&'a CallTarget, &'a [Expr])> {
+            // A disposable call-return holder: the lifter's `ret`/`ret_N`
+            // capture temps or a raw ABI return register. Restricting the ctor
+            // unwrap to these (rather than any `Var`) means a real, observable
+            // assignment `some_var = Foo::Foo(buf, …)` is never truncated away,
+            // and a store `*buf = …` (LHS is a `Deref`) is excluded so its whole
+            // value is preserved as the scalar-store form.
+            fn is_call_return_holder(lhs: &Expr) -> bool {
+                let name = match &strip_casts(lhs).kind {
+                    ExprKind::Var(v) => v.name.as_str(),
+                    ExprKind::Unknown(n) => n.as_str(),
+                    _ => return false,
+                };
+                name == "ret"
+                    || name.starts_with("ret_")
+                    || crate::decompiler::abi::is_return_register(name)
+            }
+            let call = match &stmt.kind {
+                ExprKind::Call { .. } => stmt,
+                ExprKind::Assign { lhs, rhs } if is_call_return_holder(lhs) => strip_casts(rhs),
+                _ => return None,
+            };
+            let ExprKind::Call { target, args } = &call.kind else {
+                return None;
+            };
+            let first_is_buf = args
+                .first()
+                .map(strip_casts)
+                .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf));
+            first_is_buf.then_some((target, args.as_slice()))
+        }
+
         // Determine the run of buffer-initialisation statements
         // immediately before the throw, and the index where the alloc
         // sits. For the ctor form the run is exactly the single trailing
         // call; for the store form it's one or more consecutive stores
         // walking backwards until the first non-store statement.
         let last_idx = result.len() - 1;
-        let last_is_ctor = matches!(
-            &result[last_idx].kind,
-            ExprKind::Call { args, .. } if args
-                .first()
-                .map(strip_casts)
-                .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name))
-        );
+        let last_is_ctor = ctor_call_into_buf(&result[last_idx], &buf_name).is_some();
         let mut store_run_start = if last_is_ctor {
             last_idx
         } else if is_store_into_buf(&result[last_idx], &buf_name) {
@@ -1143,7 +1178,48 @@ where
 
         let stored_value = if let Some(brace_literal) = multi_store_value {
             Some(brace_literal)
+        } else if let Some((target, args)) =
+            ctor_call_into_buf(&result[last_store_idx], &buf_name)
+        {
+            // Constructor form — bare `Class::Class(buf, …)` or the temp-captured
+            // `ret = Class::Class(buf, …)`. Render `throw TypeName(remaining_args)`,
+            // dropping the implicit buf slot so the throw reads like the source
+            // expression. Falls back to the resolved call name when `Direct`.
+            fn canonicalise_ctor_name(raw: &str) -> String {
+                // Strip glibc/PLT decorations, demangle a raw Itanium symbol
+                // (a `Direct` relocation resolves to the mangled ctor name, e.g.
+                // `_ZNSt13runtime_errorC1EPKc`), then strip the
+                // `[base]`/`[complete]`/`[clone …]` disambiguator labels and the
+                // trailing `(args)` signature — in that order, because each step
+                // exposes the next one's tail. Mirrors the chain in
+                // `PseudoCodeEmitter::format_call_target_name` from deferral #5.
+                let unversioned = hexray_core::unversioned_symbol_name(raw);
+                let demangled =
+                    hexray_demangle::demangle(unversioned).unwrap_or_else(|| unversioned.to_string());
+                let labels_stripped =
+                    crate::symbol_names::strip_demangler_disambiguator_labels(&demangled);
+                crate::symbol_names::strip_demangled_signature(labels_stripped).to_string()
+            }
+            let target_name = match target {
+                CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
+                CallTarget::Direct {
+                    target: addr,
+                    call_site,
+                } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
+                _ => None,
+            };
+            // Require the callee to actually be a constructor (its last two
+            // `::`-segments name the same class) so a captured helper return
+            // (`ret = memcpy(buf, …)`) is not mistaken for the ctor. Then trim
+            // the doubled `TypeName::TypeName` to `TypeName(args)`.
+            target_name.filter(|name| looks_like_constructor(name)).map(|name| {
+                let prettified = collapse_ctor_pretty_name(&name);
+                let rest_args: Vec<String> =
+                    args.iter().skip(1).map(|a| format!("{}", a)).collect();
+                format!("{}({})", prettified, rest_args.join(", "))
+            })
         } else {
+            // Scalar store form: `*(T *)buf = value`.
             match &result[last_store_idx].kind {
                 ExprKind::Assign { lhs, rhs } => {
                     let target_matches = match &lhs.kind {
@@ -1157,56 +1233,6 @@ where
                         Some(format!("{}", (**rhs).clone()))
                     } else {
                         None
-                    }
-                }
-                ExprKind::Call { target, args } => {
-                    // Constructor form: first arg must be the buffer.
-                    let first_is_buf = args
-                        .first()
-                        .map(strip_casts)
-                        .is_some_and(|e| matches!(&e.kind, ExprKind::Var(v) if v.name == buf_name));
-                    if !first_is_buf {
-                        None
-                    } else {
-                        // Render `TypeName(remaining_args)` — drop the
-                        // implicit buf slot so the throw reads like the
-                        // source expression. Falls back to the resolved
-                        // call name when the target is `Direct`.
-                        fn canonicalise_ctor_name(raw: &str) -> String {
-                            // Strip glibc/PLT decorations, then the
-                            // `[base]`/`[complete]`/`[clone …]` disambiguator
-                            // labels, then the trailing `(args)` signature —
-                            // in that order, because each step exposes the
-                            // next one's tail. Mirrors the chain in
-                            // `PseudoCodeEmitter::format_call_target_name`
-                            // from deferral #5.
-                            let unversioned = hexray_core::unversioned_symbol_name(raw);
-                            let labels_stripped =
-                                crate::symbol_names::strip_demangler_disambiguator_labels(
-                                    unversioned,
-                                );
-                            crate::symbol_names::strip_demangled_signature(labels_stripped)
-                                .to_string()
-                        }
-                        let target_name = match target {
-                            CallTarget::Named(name) => Some(canonicalise_ctor_name(name)),
-                            CallTarget::Direct {
-                                target: addr,
-                                call_site,
-                            } => resolve(*addr, *call_site).map(|raw| canonicalise_ctor_name(&raw)),
-                            _ => None,
-                        };
-                        let Some(target_name) = target_name else {
-                            result.push(stmt);
-                            continue;
-                        };
-                        // Trim `TypeName::TypeName` chains to just `TypeName(args)`
-                        // when the trailing component repeats the class name
-                        // (`std::runtime_error::runtime_error` → `std::runtime_error`).
-                        let prettified = collapse_ctor_pretty_name(&target_name);
-                        let rest_args: Vec<String> =
-                            args.iter().skip(1).map(|a| format!("{}", a)).collect();
-                        Some(format!("{}({})", prettified, rest_args.join(", ")))
                     }
                 }
                 _ => None,
@@ -1234,19 +1260,70 @@ where
 /// `Namespace::Class` so a recovered `throw Class(args)` reads like
 /// source rather than the doubled-segment Itanium-ABI form. Leaves any
 /// non-matching name untouched.
+/// The base identifier of a `::`-segment: the part before any template-argument
+/// list (`vector<int, std::allocator<int> >` → `vector`) or GNU ABI tag
+/// (`failure[abi:cxx11]` → `failure`).
+fn ctor_segment_base(segment: &str) -> &str {
+    segment.split(['<', '[']).next().unwrap_or(segment).trim()
+}
+
+/// The last two `::`-separated segments of a qualified name, split at angle
+/// depth 0 so a `::` inside template arguments (`std::allocator<int>`) is not
+/// mistaken for a segment boundary. Returns `(prev, tail)`, or `None` when the
+/// name has no top-level `::`.
+fn last_two_top_level_segments(name: &str) -> Option<(&str, &str)> {
+    let bytes = name.as_bytes();
+    let mut depth = 0i32;
+    let mut seps: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => depth += 1,
+            b'>' => depth -= 1,
+            b':' if depth == 0 && i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                seps.push(i);
+                i += 1; // skip the second ':'
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = *seps.last()?;
+    let prev_start = if seps.len() >= 2 {
+        seps[seps.len() - 2] + 2
+    } else {
+        0
+    };
+    Some((&name[prev_start..last], &name[last + 2..]))
+}
+
 fn collapse_ctor_pretty_name(name: &str) -> String {
-    // Walk the `::`-separated chain from the right; if the last two
-    // segments are identical, drop the trailing one.
-    if let Some((head, tail)) = name.rsplit_once("::") {
-        // `head` might still end in another `::Class` we need to
-        // compare against. Look at the last segment of `head`.
-        if let Some(prev_tail) = head.rsplit("::").next() {
-            if prev_tail == tail {
+    // Drop the trailing ctor segment when the last two top-level segments name
+    // the same class (`A::B::B` → `A::B`, `std::vector<…>::vector` →
+    // `std::vector<…>`), comparing the base before any template arguments.
+    if let Some((prev, tail)) = last_two_top_level_segments(name) {
+        if !ctor_segment_base(tail).is_empty()
+            && ctor_segment_base(prev) == ctor_segment_base(tail)
+        {
+            if let Some(head) = name.strip_suffix(tail).and_then(|s| s.strip_suffix("::")) {
                 return head.to_string();
             }
         }
     }
     name.to_string()
+}
+
+/// Whether a demangled name is a C++ constructor: its last two top-level
+/// `::`-segments name the same class (`ns::Class::Class`, `Class<T>::Class`,
+/// `std::vector<int, std::allocator<int> >::vector`). This gates the throw
+/// recogniser's ctor form so an ordinary helper that returns its first argument
+/// and is captured into a temp — `ret = memcpy(buf, src, n)` — is not mistaken
+/// for the discarded constructor return and rewritten into a `throw`.
+fn looks_like_constructor(name: &str) -> bool {
+    let Some((prev, tail)) = last_two_top_level_segments(name) else {
+        return false;
+    };
+    !ctor_segment_base(tail).is_empty() && ctor_segment_base(prev) == ctor_segment_base(tail)
 }
 
 fn suppress_asan_scaffolding(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
@@ -15691,6 +15768,217 @@ mod tests {
         assert!(
             text.contains("\"boom\""),
             "expected the boom argument preserved, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_collapses_captured_ctor_via_direct_call() {
+        // At -O0 the constructor's ABI return (the object pointer) is captured
+        // into an otherwise-unused temporary: `ret_1 = Class::Class(buf, args)`.
+        // The ctor is reached by a `Direct` relocation resolving to the mangled
+        // Itanium symbol, so the recogniser must unwrap the assignment AND
+        // demangle the ctor name — the real-binary shape for `throw
+        // std::runtime_error("boom")`.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(16)],
+                    ),
+                ),
+                // Captured ctor call via a Direct relocation.
+                Expr::assign(
+                    local("ret_1", 8),
+                    Expr::call(
+                        CallTarget::Direct {
+                            target: 0x1000,
+                            call_site: 0x2000,
+                        },
+                        vec![local("ret_0", 8), Expr::unknown("\"boom\"")],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for std::runtime_error"),
+            ],
+        )];
+
+        // Resolve the ctor's Direct target to its mangled Itanium symbol.
+        let resolve = |addr: u64, _: u64| -> Option<String> {
+            (addr == 0x1000).then(|| "_ZNSt13runtime_errorC1EPKc".to_string())
+        };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        let text = match &statements[0].kind {
+            ExprKind::Unknown(t) => t.as_str(),
+            other => panic!("expected Unknown, got {:?}", other),
+        };
+        assert!(
+            text.starts_with("throw std::runtime_error("),
+            "expected demangled `throw std::runtime_error(...)`, got {text:?}"
+        );
+        assert!(
+            text.contains("\"boom\""),
+            "expected the boom argument preserved, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_preserves_scalar_store_whose_value_is_a_call() {
+        // A scalar store whose value is a call taking the buffer as its first
+        // argument — `*buf = f(buf, x)` — is NOT the captured-ctor shape (its
+        // LHS is a store, not a temporary), so the whole call is preserved as
+        // the thrown value; argument 0 must not be dropped.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(8)],
+                    ),
+                ),
+                Expr::assign(
+                    Expr::deref(local("ret_0", 8), 8),
+                    Expr::call(
+                        CallTarget::Named("compute_exception".to_string()),
+                        vec![local("ret_0", 8), Expr::int(5)],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for int"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 1, "{statements:#?}");
+        let text = match &statements[0].kind {
+            ExprKind::Unknown(t) => t.as_str(),
+            other => panic!("expected Unknown, got {:?}", other),
+        };
+        assert!(
+            text.starts_with("throw compute_exception(") && text.contains("ret_0"),
+            "expected the store's call preserved with argument 0, got {text:?}"
+        );
+    }
+
+    #[test]
+    fn looks_like_constructor_distinguishes_ctors_from_helpers() {
+        assert!(looks_like_constructor("std::runtime_error::runtime_error"));
+        assert!(looks_like_constructor("ns::Widget::Widget"));
+        assert!(looks_like_constructor("Foo<int>::Foo")); // template class ctor
+        // Template arguments containing `::` must not confuse the segment split.
+        assert!(looks_like_constructor(
+            "std::vector<int, std::allocator<int> >::vector"
+        ));
+        assert!(looks_like_constructor("Foo<ns::Bar>::Foo"));
+        // GNU ABI tag on the class segment (libstdc++ cxx11 types).
+        assert!(looks_like_constructor(
+            "std::ios_base::failure[abi:cxx11]::failure"
+        ));
+        assert!(!looks_like_constructor("memcpy"));
+        assert!(!looks_like_constructor("ns::make_error"));
+        assert!(!looks_like_constructor("Foo::~Foo")); // destructor, not ctor
+
+        // The collapse must likewise ignore `::` inside template arguments.
+        assert_eq!(
+            collapse_ctor_pretty_name("std::vector<int, std::allocator<int> >::vector"),
+            "std::vector<int, std::allocator<int> >"
+        );
+        assert_eq!(
+            collapse_ctor_pretty_name("std::runtime_error::runtime_error"),
+            "std::runtime_error"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_declines_captured_non_ctor_helper() {
+        // `ret_1 = memcpy(buf, src, 8)` between the alloc and the throw returns
+        // its first argument and is captured into a temp, but it is NOT a
+        // constructor — the recogniser must leave the raw sequence intact rather
+        // than emit `throw memcpy(src, 8)`.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(8)],
+                    ),
+                ),
+                Expr::assign(
+                    local("ret_1", 8),
+                    Expr::call(
+                        CallTarget::Named("memcpy".to_string()),
+                        vec![local("ret_0", 8), local("src", 8), Expr::int(8)],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for int"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        // Nothing collapsed: alloc + memcpy + throw all remain, and no `throw`
+        // marker was synthesised.
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(
+            !statements
+                .iter()
+                .any(|s| matches!(&s.kind, ExprKind::Unknown(t) if t.starts_with("throw"))),
+            "must not synthesise a throw for a non-ctor helper: {statements:#?}"
+        );
+    }
+
+    #[test]
+    fn recover_cxa_throw_declines_ctor_captured_into_observable_var() {
+        // `local_18 = Foo::Foo(buf, x)` captures the ctor return into a real,
+        // observable variable (not a `ret`/`ret_N`/return-register holder), so
+        // truncating it would drop that assignment — leave the raw sequence.
+        let body = vec![block(
+            0,
+            vec![
+                Expr::assign(
+                    local("ret_0", 8),
+                    Expr::call(
+                        CallTarget::Named("__cxa_allocate_exception".to_string()),
+                        vec![Expr::int(16)],
+                    ),
+                ),
+                Expr::assign(
+                    local("local_18", 8),
+                    Expr::call(
+                        CallTarget::Named("Foo::Foo".to_string()),
+                        vec![local("ret_0", 8), Expr::int(5)],
+                    ),
+                ),
+                cxa_throw_named("ret_0", "&typeinfo for Foo"),
+            ],
+        )];
+
+        let resolve = |_: u64, _: u64| -> Option<String> { None };
+        let rewritten = recover_cxa_throw_pattern(body, &resolve);
+        let StructuredNode::Block { statements, .. } = &rewritten[0] else {
+            panic!("expected Block, got {:?}", rewritten[0]);
+        };
+        assert_eq!(statements.len(), 3, "{statements:#?}");
+        assert!(
+            !statements
+                .iter()
+                .any(|s| matches!(&s.kind, ExprKind::Unknown(t) if t.starts_with("throw"))),
+            "must not collapse a ctor captured into an observable variable: {statements:#?}"
         );
     }
 
