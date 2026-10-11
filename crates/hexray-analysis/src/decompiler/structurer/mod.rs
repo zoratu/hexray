@@ -50,7 +50,6 @@ use gotos::{
 };
 #[cfg(test)]
 use simplify::capture_return_register_uses_in_block;
-pub use simplify::prune_dead_register_artifacts;
 pub use simplify::recover_cxa_throw_pattern;
 // Re-export for catch handler body processing (P1-2 fix).
 pub use simplify::propagate_call_args;

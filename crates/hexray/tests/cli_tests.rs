@@ -2158,3 +2158,59 @@ fn test_signatures_list() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+// =============================================================================
+// C++20 coroutine resume-dispatch recovery (end-to-end)
+// =============================================================================
+
+/// End-to-end regression for loop-around-`co_await` recovery.
+///
+/// The `.actor` resume clone of a GCC-compiled coroutine dispatches to its
+/// suspend states through a PIC jump table emitted into `.rodata`. In an
+/// unlinked `.o` that table is a run of `R_X86_64_PC32` relocations whose bytes
+/// are zero, so before relocation-aware jump-table resolution the dispatch was
+/// an unresolved indirect jump: the whole resume state machine was unreachable
+/// and absent from the output (no `switch`, no per-state bodies).
+///
+/// This asserts the dispatch is now recovered: the `.actor` clone of
+/// `loop_around_await` (at 0x196 in the fixture) decompiles to a `switch` with
+/// the resume-state bodies present (each co_await stores its next resume state
+/// into the frame, `arr[18] = N`, before suspending). This is the end-to-end
+/// proof that the jump table resolves from relocations alone.
+#[test]
+fn test_coroutine_loop_around_co_await_dispatch_recovered() {
+    let fixture = workspace_fixture_path("cpp_loop_around_co_await.o");
+    if !Path::new(&fixture).exists() {
+        eprintln!("skipping: fixture cpp_loop_around_co_await.o not present");
+        return;
+    }
+
+    // 0x196 is the `[clone .actor]` resume stepper for loop_around_await.
+    let output = run_hexray(&[&fixture, "decompile", "0x196", "-O2"]);
+    assert!(
+        output.status.success(),
+        "decompile of the .actor clone should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // The resume dispatch must be recovered as a switch (previously the jump
+    // table was unresolved and the body was absent entirely).
+    assert!(
+        stdout.contains("switch ("),
+        "resume dispatch should be recovered as a switch; got:\n{stdout}"
+    );
+    // Multiple resume-state cases must be present (the 12-state dispatch).
+    let case_count = stdout.matches("case ").count();
+    assert!(
+        case_count >= 6,
+        "expected several recovered resume-state cases, found {case_count}; got:\n{stdout}"
+    );
+    // Each suspend point stores its next resume index into the frame before
+    // suspending; `arr[18] = N` is that store. Its presence proves the per-state
+    // bodies (not just empty cases) were extracted.
+    assert!(
+        stdout.contains("arr[18] ="),
+        "expected resume-index stores in the recovered state bodies; got:\n{stdout}"
+    );
+}

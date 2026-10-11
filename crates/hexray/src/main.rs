@@ -3749,6 +3749,17 @@ fn decompile_function(
 
     let mut binary_data_ctx = build_binary_data_context(fmt);
     seed_resolved_call_target_names(&mut binary_data_ctx, &symbol_table, &relocation_table);
+    // Capture PIC jump-table entry relocations (unlinked `.o`), so switch
+    // recovery can resolve a table whose on-disk bytes are zero. Must run before
+    // the CFG builder below, which resolves indirect jumps from this context.
+    seed_jump_table_relocs(binary, &mut binary_data_ctx);
+    // Carry resolved PC-relative data-reference targets (e.g. a jump table's
+    // `lea reg, [rip+disp]` base) so switch recovery can find the real table
+    // base in an unlinked `.o`, where the `lea`'s displacement is a zeroed
+    // relocation.
+    for (inst_addr, target_addr) in relocation_table.data_relocation_targets() {
+        binary_data_ctx.add_pc_relative_data_target(inst_addr, target_addr);
+    }
     let seed_ctx = DirectCalleeSignatureSeedContext {
         relocation_table: &relocation_table,
         symbol_table: &symbol_table,
@@ -4489,6 +4500,65 @@ fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
     }
 
     ctx
+}
+
+/// Records the resolved targets of PIC jump-table entries that live in a data
+/// section as relocations in an unlinked relocatable object (`.o`).
+///
+/// A position-independent jump table (`jmp *(table + idx*4)` where each entry is
+/// `target - table_base`) is emitted into `.rodata` as a run of
+/// `R_X86_64_PC32` relocations. In a *linked* binary those entries carry
+/// concrete bytes that [`SwitchRecovery::read_jump_table`] can read directly, but
+/// in an unlinked `.o` the on-disk bytes are all zero and the real target of
+/// each entry is known only from its relocation — so switch recovery reads a
+/// table of all-`table_base` entries and bails. This captures each such entry's
+/// resolved target into the [`BinaryDataContext`] so the reader can use it.
+///
+/// Only PC-relative relocations APPLIED to a non-executable section are taken: a
+/// `Pc32` in an executable section is a `call`/`jmp rel32`, which
+/// [`build_relocation_table`] already handles against the instruction address.
+fn seed_jump_table_relocs(binary: &Binary, ctx: &mut BinaryDataContext) {
+    use hexray_formats::RelocationType;
+
+    let elf = match binary {
+        Binary::Elf(elf) => elf,
+        _ => return,
+    };
+    let symbols: Vec<_> = elf.symbols().cloned().collect();
+
+    for reloc in &elf.relocations {
+        if !matches!(reloc.r_type, RelocationType::Pc32 | RelocationType::Plt32) {
+            continue;
+        }
+        let Some(section) = elf.sections.get(reloc.section_index) else {
+            continue;
+        };
+        // A PC32 in a code section is a branch/call (handled elsewhere); a PIC
+        // jump table lives in read-only DATA.
+        if section.is_executable() {
+            continue;
+        }
+        let Some(symbol) = symbols.get(reloc.symbol_index as usize) else {
+            continue;
+        };
+        // Only local, section-defined code targets form a jump table; an
+        // undefined (external) symbol is never a resume-state target.
+        if symbol.section_index.is_none() {
+            continue;
+        }
+        // Key by the entry's SECTION-RELATIVE offset (ELF `r_offset`): an
+        // unlinked `.o` leaves `sh_addr == 0` for every section, but the
+        // decompiler rebases data sections, so an absolute address computed from
+        // the raw ELF would not match the rebased address the reader sees. The
+        // reader recovers this offset as `entry_addr - data_section_base`.
+        //
+        // Resolved target is `S + A` — a data-table entry's PC32 relocation has
+        // no `call rel32` `-4`/`+4` instruction skew (see
+        // `relocation_defined_target_addr`), so it must NOT go through that path.
+        // `symbol.address` is the target's address in the decompiler's space.
+        let target_addr = symbol.address.wrapping_add_signed(reloc.addend);
+        ctx.add_jump_table_reloc(reloc.offset, target_addr);
+    }
 }
 
 fn is_float_constant_pool_section_name(name: &str) -> bool {

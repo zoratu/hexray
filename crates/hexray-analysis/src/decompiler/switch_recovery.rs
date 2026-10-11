@@ -247,6 +247,11 @@ impl<'a> SwitchRecovery<'a> {
         let mut entry_size: u8 = 4; // Default to 4-byte entries
         let mut is_relative = true;
 
+        // In an unlinked `.o` a jump table's `lea reg, [rip+disp]` base has a
+        // zeroed displacement (the real address is a relocation), so resolve it
+        // from the recorded PC-relative data target keyed by instruction address.
+        let binary_ctx = self.binary_ctx;
+
         // Helper function to scan a block for patterns
         // We scan in reverse to find the comparison closest to the branch (the actual bounds check)
         let scan_block = |block: &BasicBlock,
@@ -260,7 +265,14 @@ impl<'a> SwitchRecovery<'a> {
                 match inst.operation {
                     // Look for LEA (table base address)
                     Operation::LoadEffectiveAddress => {
-                        if inst.operands.len() >= 2 {
+                        // Prefer a relocation-resolved PC-relative target (unlinked
+                        // `.o`, where the instruction's own displacement is zero).
+                        if let Some(reloc_target) =
+                            binary_ctx.and_then(|ctx| ctx.pc_relative_data_target(inst.address))
+                        {
+                            *table_base = Some(reloc_target);
+                            *is_relative = true;
+                        } else if inst.operands.len() >= 2 {
                             match &inst.operands[1] {
                                 Operand::PcRelative { target, .. } => {
                                     *table_base = Some(*target);
@@ -520,6 +532,26 @@ impl<'a> SwitchRecovery<'a> {
             let entry_offset = offset + (i as usize * info.entry_size as usize);
             if entry_offset + (info.entry_size as usize) > data.len() {
                 break;
+            }
+
+            let entry_addr = info.table_base + (i as u64 * info.entry_size as u64);
+            // The entry's offset within its data section (jump-table relocations
+            // are keyed section-relative; see `BinaryDataContext::jump_table_relocs`).
+            let entry_section_offset = entry_addr.wrapping_sub(data_base);
+
+            // In an unlinked relocatable object (`.o`) a PIC jump table's entry
+            // bytes are all zero and the real target lives only in a relocation.
+            // Prefer a recorded relocation target over the (zero) on-disk bytes.
+            if let Some(reloc_target) = self
+                .binary_ctx
+                .and_then(|ctx| ctx.jump_table_reloc_target(entry_section_offset))
+            {
+                let case_value = info.min_value + i as i64;
+                target_to_values
+                    .entry(reloc_target)
+                    .or_default()
+                    .push(case_value as i128);
+                continue;
             }
 
             // Read entry based on size and type

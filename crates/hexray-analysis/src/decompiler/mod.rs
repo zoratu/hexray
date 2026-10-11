@@ -152,6 +152,27 @@ pub struct BinaryDataContext {
     /// Used by the emitter to decode rip-relative rodata float
     /// constants with the correct byte order on big-endian targets.
     endianness: hexray_core::Endianness,
+    /// Resolved targets of jump-table entries that live in a data section
+    /// (`.rodata`) as relocations rather than concrete bytes. In an unlinked
+    /// relocatable object (`.o`) a PIC jump table is emitted as a run of
+    /// `R_X86_64_PC32` relocations whose on-disk bytes are all zero; the real
+    /// target of each entry is only known from the relocation. Keyed by the
+    /// entry's SECTION-RELATIVE offset (the ELF `r_offset` within its data
+    /// section), valued by the resolved target address. Section-relative keying
+    /// sidesteps the `.o` address-space problem: an unlinked object leaves every
+    /// section at `sh_addr == 0`, but the decompiler rebases data sections to
+    /// non-overlapping addresses, so an absolute entry address computed from the
+    /// raw ELF would not match the rebased address used at read time. The reader
+    /// recovers the offset as `entry_addr - data_section_base`. Empty for a
+    /// linked binary, where `section_containing` returns the concrete bytes.
+    jump_table_relocs: HashMap<u64, u64>,
+    /// Resolved targets of PC-relative data references (`lea reg, [rip+disp]`)
+    /// keyed by the referencing instruction's address. In an unlinked `.o` the
+    /// `disp` bytes are a relocation (zero), so computing `rip + disp` from the
+    /// instruction yields the wrong address; switch recovery uses this to recover
+    /// the real jump-table BASE address of such a `lea`. Empty for a linked
+    /// binary. Populated from the relocation table's data relocations.
+    pc_relative_data_targets: HashMap<u64, u64>,
 }
 
 impl Default for BinaryDataContext {
@@ -173,6 +194,8 @@ impl BinaryDataContext {
             call_target_names_by_call_site: HashMap::new(),
             float_constant_pool_ranges: Vec::new(),
             endianness: hexray_core::Endianness::Little,
+            jump_table_relocs: HashMap::new(),
+            pc_relative_data_targets: HashMap::new(),
         }
     }
 
@@ -209,6 +232,37 @@ impl BinaryDataContext {
         self.float_constant_pool_ranges
             .iter()
             .any(|(start, end)| addr >= *start && addr < *end)
+    }
+
+    /// Records the resolved target of a data-section jump-table entry whose
+    /// bytes are a relocation (an unlinked `.o`'s PIC table). `section_offset` is
+    /// the entry's offset within its data section (the ELF `r_offset`);
+    /// `target_addr` is the resolved destination in the decompiler's address
+    /// space. See [`jump_table_relocs`](Self::jump_table_relocs) for why the key
+    /// is section-relative rather than absolute.
+    pub fn add_jump_table_reloc(&mut self, section_offset: u64, target_addr: u64) {
+        self.jump_table_relocs.insert(section_offset, target_addr);
+    }
+
+    /// Looks up the relocation-resolved target of a jump-table entry at
+    /// `section_offset` (the entry's offset within its data section), if one was
+    /// recorded (see [`add_jump_table_reloc`](Self::add_jump_table_reloc)).
+    pub fn jump_table_reloc_target(&self, section_offset: u64) -> Option<u64> {
+        self.jump_table_relocs.get(&section_offset).copied()
+    }
+
+    /// Records the resolved target of a PC-relative data reference (`lea reg,
+    /// [rip+disp]`) at instruction address `inst_addr` (see
+    /// [`pc_relative_data_target`]).
+    pub fn add_pc_relative_data_target(&mut self, inst_addr: u64, target_addr: u64) {
+        self.pc_relative_data_targets.insert(inst_addr, target_addr);
+    }
+
+    /// Looks up the relocation-resolved target of a PC-relative data reference at
+    /// `inst_addr`, if one was recorded. Used by switch recovery to find a jump
+    /// table's base in an unlinked `.o` where the `lea`'s displacement is zero.
+    pub fn pc_relative_data_target(&self, inst_addr: u64) -> Option<u64> {
+        self.pc_relative_data_targets.get(&inst_addr).copied()
     }
 
     /// Returns the section containing the given address.
@@ -882,6 +936,15 @@ impl RelocationTable {
         self.data_relocations
             .get(&inst_addr)
             .is_some_and(|reloc| reloc.is_pc_relative)
+    }
+
+    /// Returns all data relocations as `(instruction_address, target_address)`
+    /// pairs. Used to seed PC-relative data-reference targets so switch recovery
+    /// can resolve a jump-table base in an unlinked `.o`.
+    pub fn data_relocation_targets(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        self.data_relocations
+            .iter()
+            .map(|(addr, reloc)| (*addr, reloc.target_addr))
     }
 
     /// Gets all data relocations within an address range, sorted by address.
