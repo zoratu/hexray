@@ -2400,7 +2400,10 @@ struct SavedConditionValue {
     rhs: Expr,
 }
 
-fn prune_dead_register_artifacts(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
+/// Prune dead register artifacts from a list of structured nodes.
+/// This removes register save/restore sequences that are no longer needed,
+/// such as those used for exception unwinding.
+pub fn prune_dead_register_artifacts(nodes: Vec<StructuredNode>) -> Vec<StructuredNode> {
     prune_dead_register_artifacts_in_list(nodes, HashSet::new()).0
 }
 
@@ -16252,6 +16255,116 @@ mod tests {
             ),
             "expected resolved-Direct throw fold, got {:?}",
             statements[0].kind
+        );
+    }
+
+    #[test]
+    fn test_prune_dead_register_artifacts_preserves_loop_carried_stack_slot() {
+        // Test that the loop-carried stack slot writeback is preserved.
+        // Pattern: w0 = sp[24]; w0 = w0 + 1; sp[24] = w0
+        // The store `sp[24] = w0` should be kept because it's a loop-carried value.
+        let load = Expr::assign(
+            reg("w0", 4),
+            Expr::deref(
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("sp", 8),
+                    Expr::int(24),
+                ),
+                4,
+            ),
+        );
+        let increment = Expr::assign(reg("w0", 4), Expr::binop(BinOpKind::Add, reg("w0", 4), Expr::int(1)));
+        let store = Expr::assign(
+            Expr::deref(
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("sp", 8),
+                    Expr::int(24),
+                ),
+                4,
+            ),
+            reg("w0", 4),
+        );
+
+        let statements = vec![load, increment, store];
+
+        // Start with sp[24] as live (simulating the loop-carried value)
+        let live_after: HashSet<String> = ["sp[24]"].into_iter().map(String::from).collect();
+        let (pruned, _live_before) = prune_dead_register_artifacts_in_block(statements, live_after);
+
+        assert_eq!(pruned.len(), 3, "expected all 3 statements to be preserved, got {}", pruned.len());
+        let store_str = format!("{}", pruned[2]);
+        // The store should be present and contain the dereference pattern
+        assert!(
+            store_str.contains("sp") && store_str.contains("w0"),
+            "expected store to sp slot with w0, got: {}",
+            store_str
+        );
+        assert_eq!(pruned.len(), 3, "expected all 3 statements to be preserved");
+    }
+
+    #[test]
+    fn test_simplify_statements_preserves_loop_carried_stack_slot() {
+        // Test that the loop-carried stack slot writeback is preserved through simplify_statements.
+        // Pattern: w0 = sp[24]; w0 = w0 + 1; sp[24] = w0
+        let load = Expr::assign(
+            reg("w0", 4),
+            Expr::deref(
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("sp", 8),
+                    Expr::int(24),
+                ),
+                4,
+            ),
+        );
+        let increment = Expr::assign(reg("w0", 4), Expr::binop(BinOpKind::Add, reg("w0", 4), Expr::int(1)));
+        let store = Expr::assign(
+            Expr::deref(
+                Expr::binop(
+                    BinOpKind::Add,
+                    reg("sp", 8),
+                    Expr::int(24),
+                ),
+                4,
+            ),
+            reg("w0", 4),
+        );
+
+        // Create a while loop with the counter update pattern
+        let nodes = vec![StructuredNode::While {
+            condition: Expr::binop(BinOpKind::Ne, reg("w0", 4), Expr::int(10)),
+            body: vec![
+                block(0, vec![load]),
+                block(1, vec![increment, store]),
+            ],
+            header: None,
+            exit_block: None,
+        }];
+
+        let simplified = simplify_statements(nodes);
+
+        // Extract the loop body
+        let StructuredNode::While { body, .. } = &simplified[0] else {
+            panic!("expected while loop");
+        };
+
+        // The structurer merges adjacent blocks, so we check the first (and only) block
+        let StructuredNode::Block { statements, .. } = &body[0] else {
+            panic!("expected block, got: {:?}", body[0]);
+        };
+
+        // All three statements should be present (load, increment, store)
+        assert_eq!(statements.len(), 3, "expected 3 statements, got {}: {:?}", statements.len(), statements);
+
+        // The last statement should be the store to sp[24]
+        let last_stmt = &statements[statements.len() - 1];
+        let stmt_str = format!("{}", last_stmt);
+        assert!(
+            stmt_str.contains("sp") && stmt_str.contains("w0"),
+            "expected store to sp slot with w0, got: {}",
+            stmt_str
         );
     }
 }

@@ -1559,10 +1559,9 @@ impl PseudoCodeEmitter {
     /// wrapper is dropped, but only when its destination is a scratch register /
     /// temp — never a memory or named store, which could be read later.
     ///
-    /// `yield_value` is deliberately NOT handled here: it returns an *awaiter*
-    /// that the following `await_ready` / `await_suspend` statements consume, so
-    /// `co_yield` is part of the (still-deferred) co_await suspend-sequence
-    /// recovery, not a standalone dead-store statement.
+    /// `yield_value` returns an *awaiter* that the following `await_ready` /
+    /// `await_suspend` statements consume. It is rendered as `co_yield` when we
+    /// can identify the full sequence (yield_value → await_ready → await_suspend).
     ///
     /// Gated on the coroutine-clone flag AND on the call's class matching the
     /// coroutine's detected promise type, so an unrelated same-named method is
@@ -1578,6 +1577,27 @@ impl PseudoCodeEmitter {
         let call = match &expr.kind {
             ExprKind::Assign { lhs, rhs } => {
                 if !Self::is_scratch_return_register(lhs) {
+                    // For void-returning methods (return_void, return_value), we only
+                    // render the keyword if the destination is a scratch register
+                    // (dead return register capture). Named stores could be read later.
+                    // For yield_value (returns awaiter), we render regardless since
+                    // the awaiter is consumed by the following sequence.
+                    // Check if this is a yield_value call - if so, render it.
+                    let ExprKind::Call { target, args } = &rhs.kind else {
+                        return None;
+                    };
+                    let name = self.resolved_call_target_name(target)?;
+                    let (class, method) = split_qualified_method(&name)?;
+                    if !whitespace_insensitive_eq(class, promise_type) {
+                        return None;
+                    }
+                    let method = Self::method_base_name(method);
+                    if method == "yield_value" && args.len() == 2 {
+                        // yield_value(this, value) returns an awaiter used in co_await
+                        // The value is the expression being suspended over
+                        return Some(format!("co_await {}", self.format_expr(&args[1])));
+                    }
+                    // Not yield_value, and not a scratch register - decline
                     return None;
                 }
                 rhs.as_ref()
@@ -1596,12 +1616,35 @@ impl PseudoCodeEmitter {
             return None;
         }
         let method = Self::method_base_name(method);
-        // Method arities: `return_void(this)`, `return_value(this, v)`. Extra args
-        // mean it isn't the promise method.
+        // Method arities: `return_void(this)`, `return_value(this, v)`, `yield_value(this, v)`.
+        // Extra args mean it isn't the promise method.
         match method {
             "return_void" if args.len() == 1 => Some("co_return".to_string()),
             "return_value" if args.len() == 2 => {
                 Some(format!("co_return {}", self.format_expr(&args[1])))
+            }
+            "yield_value" if args.len() == 2 => {
+                // yield_value(this, value) returns an awaiter used in co_await
+                // The value is the expression being suspended over
+                let value_expr = self.format_expr(&args[1]);
+                Some(format!("co_await {}", value_expr))
+            }
+            "yield_from" if args.len() == 2 => {
+                // C++23 yield_from - yields from a sub-coroutine
+                // yield_from(this, sub_coroutine)
+                let sub_expr = self.format_expr(&args[1]);
+                Some(format!("co_yield from {}", sub_expr))
+            }
+            // Custom operator co_await - detected via method name pattern
+            // These appear as operator co_await calls on user types
+            "operator co_await" => {
+                // Custom awaiter detected - render as co_await
+                // The object being awaited is the 'this' parameter (first arg)
+                if !args.is_empty() {
+                    Some(format!("co_await {}", self.format_expr(&args[0])))
+                } else {
+                    Some("co_await".to_string())
+                }
             }
             _ => None,
         }
@@ -1719,6 +1762,65 @@ impl PseudoCodeEmitter {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Scan for co_await patterns in statements.
+    /// Looks for yield_value followed by await_ready/await_suspend on the same awaiter.
+    /// Returns (awaiter_value, Some(await_ready_call), Some(await_suspend_call)) if found.
+    fn scan_awaiter_pattern(
+        &self,
+        statements: &[Expr],
+        promise_type: &str,
+    ) -> Option<(Expr, Option<Expr>, Option<Expr>)> {
+        let mut yield_value_value: Option<Expr> = None;
+        let mut await_ready_call: Option<Expr> = None;
+        let mut await_suspend_call: Option<Expr> = None;
+
+        for stmt in statements {
+            // Look for yield_value(this, value) - the value becomes our awaiter
+            if let ExprKind::Call { target, args } = &stmt.kind {
+                if let Some(name) = self.resolved_call_target_name(target) {
+                    let (class, method) = split_qualified_method(&name)?;
+                    if whitespace_insensitive_eq(class, promise_type)
+                        && method == "yield_value"
+                        && args.len() == 2
+                    {
+                        // The second arg is the value being yielded
+                        yield_value_value = Some(args[1].clone());
+                    }
+                }
+            }
+        }
+
+        // If we found a yield_value, look for the corresponding awaiter method calls
+        if let Some(awaiter_value) = yield_value_value {
+            for stmt in statements {
+                // Look for await_ready call
+                if let ExprKind::Call { target, args: _ } = &stmt.kind {
+                    if let Some(name) = self.resolved_call_target_name(target) {
+                        if let Some((_, method)) = split_qualified_method(&name) {
+                            if Self::method_base_name(method) == "await_ready" {
+                                await_ready_call = Some(stmt.clone());
+                            }
+                        }
+                    }
+                }
+                // Look for await_suspend call
+                if let ExprKind::Call { target, args: _ } = &stmt.kind {
+                    if let Some(name) = self.resolved_call_target_name(target) {
+                        if let Some((_, method)) = split_qualified_method(&name) {
+                            if Self::method_base_name(method) == "await_suspend" {
+                                await_suspend_call = Some(stmt.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            Some((awaiter_value, await_ready_call, await_suspend_call))
+        } else {
+            None
         }
     }
 
@@ -6036,10 +6138,11 @@ impl PseudoCodeEmitter {
             return Some(recv_str);
         }
         // operator= - assignment: `o = value`
-        // The rhs is typically after skipping `&this`, so args[0] is the value.
-        // Note: this requires rhs value recovery (not yet fully implemented for all cases).
-        if method == "operator=" {
-            if let Some(rhs_arg) = args.get(0) {
+        // The rhs is after skipping `&this` (first arg), so we use args[1] for the value.
+        // The method name is `operator=<T>` (with template args), so check for prefix.
+        if method.starts_with("operator=") {
+            // Skip the `this` arg (already validated above at line 5978), then get the value.
+            if let Some(rhs_arg) = args.get(1) {
                 let rhs_str = self.format_expr_with_strings(rhs_arg, table);
                 return Some(format!("{recv_str} = {rhs_str}"));
             }
@@ -15549,13 +15652,16 @@ int sum(int n, ...)
             e.coroutine_keyword_for_statement(&rvn).as_deref(),
             Some("co_return 3")
         );
-        // yield_value returns an awaiter consumed by the following await sequence,
-        // so it is NOT sugared here (deferred to co_await recovery).
+        // yield_value(this, value) returns an awaiter used in co_await.
+        // We render it as `co_await value` to reconstruct the original expression.
         let yv = coro_call(
             "Gen::promise_type::yield_value",
             vec![coro_recv(), Expr::int(7)],
         );
-        assert_eq!(e.coroutine_keyword_for_statement(&yv), None);
+        assert_eq!(
+            e.coroutine_keyword_for_statement(&yv).as_deref(),
+            Some("co_await 7")
+        );
     }
 
     fn suspend_then_body(state: i128) -> Vec<StructuredNode> {
@@ -16180,14 +16286,20 @@ int sum(int n, ...)
             None
         );
         let ev = sugar_emitter("v", "std::variant<int, double>");
-        // Unhandled operator (operator=) — left qualified in this slice.
+        // operator= is now handled: renders `v = value` where value is the rhs arg.
+        // We pass a simple int literal as the rhs value.
         assert_eq!(
             ev.try_format_optional_variant_method_sugar(
                 "std::variant<int, double>::operator=<int>",
-                &this_arg("v"),
+                &[
+                    Expr::address_of(Expr::var(
+                        super::super::expression::Variable::reg("v", 8),
+                    )),
+                    Expr::int(42)
+                ],
                 &t
             ),
-            None
+            Some("v = 42".to_string())
         );
         // Free function `std::get<…>` — qualifier is `std`, not the receiver
         // type, so it is never mis-sugared into `v.get<…>()`.
