@@ -45,7 +45,8 @@ pub fn normalize_loop_condition(
 /// Extracts iterator information from initialization and update expressions.
 fn extract_iterator_info(init: Option<&Expr>, update: Option<&Expr>) -> Option<LoopIterator> {
     // Extract from init: var = value
-    let (var_key, init_value) = if let Some(init_expr) = init {
+    let (var_key, init_value) = {
+        let init_expr = init?;
         if let ExprKind::Assign { lhs, rhs } = &init_expr.kind {
             let key = get_expr_var_key(lhs)?;
             let val = get_const_value(rhs);
@@ -53,8 +54,6 @@ fn extract_iterator_info(init: Option<&Expr>, update: Option<&Expr>) -> Option<L
         } else {
             return None;
         }
-    } else {
-        return None;
     };
 
     // Extract step from update: var++, var--, var += n, var -= n

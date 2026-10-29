@@ -488,6 +488,63 @@ for (i = 0; i < len; i++) {
 
 ---
 
+## Working From a Project (`.hxdb`)
+
+A single-file project keeps the analyzed image, every result and your edits in
+one place, so reopening never needs the original file again.
+
+```bash
+# Create a project (runs discovery + per-function CFG analysis)
+hexray db create /path/to/binary -o sample.hxdb
+
+# Read results out of it
+hexray db query sample.hxdb info
+hexray db query sample.hxdb functions
+hexray db query sample.hxdb disasm main
+hexray db query sample.hxdb decompile main --update   # rebuild if missing
+hexray db query sample.hxdb callgraph | head
+
+# Edit, then undo or redo
+hexray db edit sample.hxdb name 0x401000 parse_header
+hexray db undo sample.hxdb
+
+# Interactive shell
+hexray db open sample.hxdb
+```
+
+Analysis cost is bounded by two knobs, and both accept the same values one-shot
+or in the shell:
+
+```bash
+hexray db analyze sample.hxdb --force --render \
+    --jobs 4 --analysis-memory-mib 512 --timings
+```
+
+- `--jobs 0` (default) uses one worker per available core, `1` is serial, and
+  the value is capped at 256. `--analysis-memory-mib` bounds the scheduler's own
+  in-flight scratch/payload estimate, not the process RSS. `--timings` prints
+  per-stage wall times on stderr (and adds a `timings` object to `--json`).
+
+### Excluding bytes on purpose
+
+Packed or uninteresting ranges can be excluded from *automatic* analysis. This
+is a normal, undoable edit — never a silent decision:
+
+```bash
+hexray db input-info /path/to/binary --section-hints   # evidence, read-only
+hexray db edit sample.hxdb scope --skip-section .packed
+hexray db query sample.hxdb scope                     # what is excluded now
+hexray db analyze sample.hxdb --force                 # re-run within the scope
+hexray db edit sample.hxdb scope                      # no flags clears it
+```
+
+The hints report file bytes, Shannon entropy and the reasons behind a suggested
+skip; they never prove a section is packed, and nothing is skipped
+automatically. Data reads, cross-references into excluded ranges, and your own
+names/comments/types keep working — only decoding stops at the boundary.
+
+---
+
 ## Further Reading
 
 - [Intel x86-64 Manual](https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html)

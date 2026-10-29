@@ -120,15 +120,33 @@ mod hex_hash {
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        let bytes: Vec<u8> = (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(serde::de::Error::custom)?;
 
-        bytes
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("invalid hash length"))
+        // A SHA-256 digest is exactly 32 bytes. Validate before slicing:
+        // the previous implementation sliced `&s[i..i + 2]` on a 2-byte
+        // stride, which panicked on odd-length input and on any
+        // non-ASCII byte that straddled a `char` boundary. Both shapes
+        // come from untrusted project files, so they must produce a
+        // `serde` error, never a panic.
+        if s.len() != 64 {
+            return Err(serde::de::Error::custom(format!(
+                "invalid hash length: expected 64 hex characters, got {}",
+                s.len()
+            )));
+        }
+        if !s.is_ascii() {
+            return Err(serde::de::Error::custom(
+                "invalid hash: non-ASCII character in hex digest",
+            ));
+        }
+
+        let mut hash = [0u8; 32];
+        for (index, byte) in hash.iter_mut().enumerate() {
+            let start = index * 2;
+            *byte = u8::from_str_radix(&s[start..start + 2], 16).map_err(|_| {
+                serde::de::Error::custom(format!("invalid hex digit at offset {start}"))
+            })?;
+        }
+        Ok(hash)
     }
 }
 
@@ -856,6 +874,74 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// Round-trips a hash field through the `hex_hash` serde adapter.
+    #[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+    struct HashProbe {
+        #[serde(with = "hex_hash")]
+        hash: [u8; 32],
+    }
+
+    fn probe_hash(hash_json: &str) -> Result<HashProbe, serde_json::Error> {
+        serde_json::from_str(&format!(r#"{{"hash": {hash_json}}}"#))
+    }
+
+    #[test]
+    fn test_hex_hash_roundtrip() {
+        let mut expected = [0u8; 32];
+        for (index, byte) in expected.iter_mut().enumerate() {
+            *byte = index as u8 * 7;
+        }
+
+        let json = serde_json::to_string(&HashProbe { hash: expected }).unwrap();
+        // Serialized shape is unchanged: a lowercase hex string.
+        assert!(json.contains("00070e151c232a31383f464d545b626970777e858c939aa1a8afb6bdc4cbd2d9"));
+        let decoded: HashProbe = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.hash, expected);
+    }
+
+    #[test]
+    fn test_hex_hash_rejects_odd_length() {
+        // 63 characters: the old 2-byte slicing loop panicked on this.
+        let odd = "0".repeat(63);
+        let err = probe_hash(&format!("\"{odd}\"")).unwrap_err();
+        assert!(err.to_string().contains("invalid hash length"), "{err}");
+    }
+
+    #[test]
+    fn test_hex_hash_rejects_non_ascii() {
+        // 64 bytes long, but the first character is 2 bytes of UTF-8: the
+        // old code sliced `&s[0..2]` across a char boundary and panicked.
+        let mut s = String::from("\u{00e9}"); // 'é' = 2 bytes
+        s.push_str(&"a".repeat(62));
+        assert_eq!(s.len(), 64);
+        assert!(!s.is_ascii());
+
+        let err = probe_hash(&format!("{:?}", s)).unwrap_err();
+        assert!(err.to_string().contains("non-ASCII"), "{err}");
+    }
+
+    #[test]
+    fn test_hex_hash_rejects_invalid_digits() {
+        // Correct 64-character length, but 'z' is not a hex digit.
+        let mut s = "z".to_string();
+        s.push_str(&"0".repeat(63));
+        assert_eq!(s.len(), 64);
+
+        let err = probe_hash(&format!("\"{s}\"")).unwrap_err();
+        assert!(err.to_string().contains("invalid hex digit"), "{err}");
+    }
+
+    #[test]
+    fn test_hex_hash_rejects_empty_and_short() {
+        for value in [String::new(), "00".to_string(), "0".repeat(62)] {
+            assert!(
+                probe_hash(&format!("\"{value}\"")).is_err(),
+                "expected rejection for len {}",
+                value.len()
+            );
+        }
+    }
 
     fn create_test_binary() -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();

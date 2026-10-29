@@ -5,8 +5,14 @@ use hexray_core::{Architecture, Bitness, Endianness, Symbol};
 /// A parsed binary file.
 ///
 /// This trait abstracts over different binary formats (ELF, Mach-O, etc.)
-/// to provide a uniform interface for the disassembler.
-pub trait BinaryFormat {
+/// to provide a uniform interface to the disassembler.
+///
+/// `Sync` is a supertrait because one parsed image is shared read-only by every
+/// analysis worker: section iterators are created inside a worker, and the
+/// parsed data itself is never mutated after construction. Implementors with
+/// interior-mutable caches must materialize them as immutable owned data
+/// instead of relaxing this bound.
+pub trait BinaryFormat: Sync {
     /// Returns the target architecture.
     fn architecture(&self) -> Architecture;
 
@@ -76,6 +82,13 @@ pub trait Section {
 
     /// Size in bytes.
     fn size(&self) -> u64;
+
+    /// File offset of the section payload inside the parsed container.
+    ///
+    /// Consumers that translate between virtual addresses and file bytes (byte
+    /// patching, export) need this; without it they would have to guess from
+    /// section names.
+    fn file_offset(&self) -> u64;
 
     /// Raw section data.
     fn data(&self) -> &[u8];

@@ -5,6 +5,40 @@ All notable changes to hexray will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### `.hxdb` analysis acceleration
+
+- **No more whole-project materialization.** `db query` reads only the rows a
+  query names: paging, symbol/string/type pages, and the owner artifacts of the
+  functions a command actually touches. A list query no longer loads every
+  instruction, CFG and rendered text in the project.
+- **One decode per window.** Discovery, CFG construction and callee-signature
+  seeding share a per-command decode cache, so the same function (or the same
+  callee, seen from many callers) is decoded once. Relocations and TLS rewriting
+  are still applied per consumer, and no caller's signature hints are shared.
+- **Function-level parallelism.** `db create/import-legacy/analyze/open` and
+  `db query` accept `-j/--jobs` (`0` = one per core, `1` = serial, up to 256),
+  `--analysis-memory-mib` for the in-flight working-set budget, and `--timings`.
+  Worker counts and the virtual stack reserving per worker are reported; the
+  budget bounds the scheduler's own scratch, not the process RSS. A function
+  whose estimate exceeds the whole budget runs alone, on one thread.
+- **Analysis scope.** `db edit <db> scope [--skip-section NAME]...
+  [--skip-range START:END]...` replaces the project's automatic-analysis
+  exclusion policy as a normal, undoable user edit; `db query <db> scope` shows
+  it. Excluded ranges are not decoded by discovery, CFG analysis, callee
+  signatures or the cold-thunk scan. Data reads, xrefs into excluded targets and
+  user state are untouched, excluded rows are kept (marked `skipped_by_scope`),
+  and `db info` reports `coverage: filtered` with a `partial` overall state
+  rather than claiming a finished analysis.
+- **Packing hints.** `db input-info <binary> --section-hints` and
+  `db query <db> scope --section-hints` report per-section file bytes, Shannon
+  entropy, and the reasons behind a suggested skip. Nothing is skipped
+  automatically: high entropy and a UPX-shaped name are evidence, not a verdict.
+- **Single publish sweep.** The orphaned-instruction sweep runs once per publish
+  batch instead of once per function, so two owners sharing a tail instruction
+  cannot lose it when only one of them is replaced.
+
 ## [1.3.20] - 2026-10-13
 
 Correctness-infrastructure release (Bug Bash 2026 playbook adoption). No

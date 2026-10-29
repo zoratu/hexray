@@ -497,10 +497,9 @@ impl<'a> SwitchRecovery<'a> {
         // Get the data slice and base address - try binary_ctx first, then legacy method
         let (data, data_base) = if let Some(ctx) = self.binary_ctx {
             ctx.section_containing(info.table_base)?
-        } else if let Some(data) = self.binary_data {
-            (data, self.data_base)
         } else {
-            return None;
+            let data = self.binary_data?;
+            (data, self.data_base)
         };
 
         // Calculate offset into data

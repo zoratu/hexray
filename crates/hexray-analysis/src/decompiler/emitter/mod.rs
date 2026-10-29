@@ -382,11 +382,13 @@ impl GlobalAccessTracker {
 pub struct PseudoCodeEmitter {
     indent: String,
     emit_addresses: bool,
-    string_table: Option<StringTable>,
-    symbol_table: Option<SymbolTable>,
-    relocation_table: Option<RelocationTable>,
+    /// Image-wide read-only tables, shared by `Arc` so building an emitter
+    /// per rendered function never copies them.
+    string_table: Option<Arc<StringTable>>,
+    symbol_table: Option<Arc<SymbolTable>>,
+    relocation_table: Option<Arc<RelocationTable>>,
     gnu_version_ambiguous_bases: RefCell<Option<HashSet<String>>>,
-    tls_symbol_offsets: HashMap<i64, String>,
+    tls_symbol_offsets: Arc<HashMap<i64, String>>,
     /// Type information for variables (var_name -> type_string).
     type_info: std::collections::HashMap<String, String>,
     /// DWARF variable names (stack_offset -> name).
@@ -431,6 +433,14 @@ pub struct PseudoCodeEmitter {
     /// registers/locals), so this lets the operator sugar recognize an optional/variant operand
     /// that arrives as a bare reference parameter. Populated in `emit_with_signature`.
     optional_variant_param_types: RefCell<HashMap<String, String>>,
+    /// User variable name/type overrides. Consulted where a variable's
+    /// `VarKind` binds to a display name or type — never applied as text
+    /// rewriting.
+    variable_overrides: Vec<super::VariableOverride>,
+    /// Types from `variable_overrides`, keyed by the emitted display name.
+    /// Filled while the body is formatted so the declaration pass, which runs
+    /// afterwards, sees the user-supplied type.
+    variable_type_overrides: RefCell<HashMap<String, String>>,
     /// Fallback expression for bare returns when signature is non-void.
     /// Uses RefCell for interior mutability during emission.
     return_fallback_expr: RefCell<Option<String>>,
@@ -752,7 +762,7 @@ impl PseudoCodeEmitter {
             symbol_table: None,
             relocation_table: None,
             gnu_version_ambiguous_bases: RefCell::new(None),
-            tls_symbol_offsets: HashMap::new(),
+            tls_symbol_offsets: Arc::new(HashMap::new()),
             type_info: std::collections::HashMap::new(),
             dwarf_names: std::collections::HashMap::new(),
             dwarf_param_names: Vec::new(),
@@ -768,6 +778,8 @@ impl PseudoCodeEmitter {
             global_tracker: RefCell::new(GlobalAccessTracker::new()),
             param_name_overrides: RefCell::new(HashMap::new()),
             optional_variant_param_types: RefCell::new(HashMap::new()),
+            variable_overrides: Vec::new(),
+            variable_type_overrides: RefCell::new(HashMap::new()),
             integer_arg_param_count: Cell::new(usize::MAX),
             float_arg_param_count: Cell::new(usize::MAX),
             return_fallback_expr: RefCell::new(None),
@@ -2579,7 +2591,7 @@ impl PseudoCodeEmitter {
 
     fn is_guarded_stack_canary_branch(&self, condition: &Expr, body: &[StructuredNode]) -> bool {
         Self::expr_mentions_stack_canary_guard(condition)
-            && is_stack_canary_check_body(body, self.symbol_table.as_ref())
+            && is_stack_canary_check_body(body, self.symbol_table.as_deref())
     }
 
     fn rewrite_small_aggregate_slots_for_emission(
@@ -3660,6 +3672,171 @@ impl PseudoCodeEmitter {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// Finds the user override addressing `var` by its `VarKind`, if any.
+    fn variable_override_for(
+        &self,
+        var: &super::expression::Variable,
+    ) -> Option<&super::VariableOverride> {
+        self.variable_overrides
+            .iter()
+            .find(|over| over.locator.matches_variable(var))
+    }
+
+    /// Finds the user override addressing a frame-relative stack offset.
+    ///
+    /// Frame slots are often still rendered from `Deref(rbp ± offset)` rather
+    /// than a `VarKind::Stack` variable, so the offset is the binding locator
+    /// on that path.
+    fn stack_slot_override(&self, offset: i128) -> Option<&super::VariableOverride> {
+        let offset = i64::try_from(offset).ok()?;
+        self.variable_overrides.iter().find(|over| {
+            matches!(
+                over.locator,
+                super::VariableOverrideLocator::Stack(slot) if slot == offset
+            )
+        })
+    }
+
+    /// Applies a stack-slot override to the name that would otherwise be
+    /// emitted for the frame slot at `offset`, recording any user type under
+    /// the resulting name.
+    fn stack_slot_name_with_override(&self, offset: i128, default_name: String) -> String {
+        let Some(over) = self.stack_slot_override(offset) else {
+            return default_name;
+        };
+        let display = match &over.name {
+            Some(name) => normalize_variable_name(name),
+            None => default_name,
+        };
+        if let Some(ty) = &over.type_name {
+            self.variable_type_overrides
+                .borrow_mut()
+                .insert(display.clone(), ty.clone());
+        }
+        display
+    }
+
+    /// Returns the user-supplied type bound to an emitted display name.
+    fn variable_type_override(&self, name: &str) -> Option<String> {
+        self.variable_type_overrides.borrow().get(name).cloned()
+    }
+
+    /// Resolves the override-free display name for `var`, exactly as the
+    /// `ExprKind::Var` formatting path would.
+    fn default_var_display_name(&self, var: &super::expression::Variable) -> String {
+        if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
+            normalize_variable_name(&self.apply_param_name_override(&semantic_name))
+        } else {
+            let renamed = self.rename_register_for_display(&var.name);
+            normalize_variable_name(&self.apply_param_name_override(&renamed))
+        }
+    }
+
+    /// Applies user overrides at the `VarKind` → display-name/type binding
+    /// point for one variable.
+    ///
+    /// Returns the name to emit. When the override carries a type, it is
+    /// recorded under that emitted name so the declaration pass (which runs
+    /// after the body is formatted) uses the user's type.
+    fn var_display_name_with_override(&self, var: &super::expression::Variable) -> String {
+        let Some(over) = self.variable_override_for(var) else {
+            return self.default_var_display_name(var);
+        };
+        let display = match &over.name {
+            Some(name) => normalize_variable_name(name),
+            None => self.default_var_display_name(var),
+        };
+        if let Some(ty) = &over.type_name {
+            self.variable_type_overrides
+                .borrow_mut()
+                .insert(display.clone(), ty.clone());
+        }
+        display
+    }
+
+    /// Applies `Parameter` locator overrides to a signature so the emitted
+    /// header and the body agree on parameter names.
+    ///
+    /// Returns `(previous name, override name)` pairs so the caller can also
+    /// map the recovered/DWARF-derived name onto the override after clearing
+    /// per-function name state.
+    ///
+    /// Types are rendered from the user's `type_name` at the header call sites
+    /// (see [`Self::parameter_override_type`]); `ParamType` has no C-string
+    /// parser and is not mutated here.
+    fn apply_parameter_overrides_to_signature(
+        &self,
+        signature: &mut FunctionSignature,
+    ) -> Vec<(String, String)> {
+        let mut aliases = Vec::new();
+        for over in &self.variable_overrides {
+            let super::VariableOverrideLocator::Parameter(index) = over.locator else {
+                continue;
+            };
+            let Some(name) = &over.name else {
+                continue;
+            };
+            let Some(param) = signature.parameters.get_mut(usize::from(index)) else {
+                continue;
+            };
+            if param.name != *name {
+                aliases.push((param.name.clone(), name.clone()));
+                param.name = name.clone();
+            }
+        }
+        aliases
+    }
+
+    /// Returns the user-supplied C type for parameter `index`, if any.
+    fn parameter_override_type(&self, index: usize) -> Option<&str> {
+        self.variable_overrides.iter().find_map(|over| match over.locator {
+            super::VariableOverrideLocator::Parameter(param) if usize::from(param) == index => {
+                over.type_name.as_deref()
+            }
+            _ => None,
+        })
+    }
+
+    /// Formats a parameter with a user-supplied type when it is a plain type
+    /// specifier.
+    ///
+    /// Declarator-shaped types (`int (*)(int)`, `int[4]`) cannot be spliced as
+    /// `type name` and return `None`, falling back to the recovered shape.
+    fn format_parameter_with_user_type(
+        type_name: &str,
+        rendered_name: &str,
+    ) -> Option<String> {
+        let ty = type_name.trim();
+        if ty.is_empty() || ty.contains(['(', ')', '[', ']']) {
+            return None;
+        }
+        Some(format!("{ty} {rendered_name}"))
+    }
+
+    /// Binds `Parameter` locator names to the `argN` and lifted-stack-slot
+    /// aliases the emitter resolves body variables through, so an override
+    /// applies even when the recovered parameter list differs from it.
+    ///
+    /// Only the parameters the current signature actually declares are bound;
+    /// an out-of-range locator must not rename a local that happens to sit at
+    /// the alias offset.
+    fn install_parameter_override_aliases(&self, parameter_count: usize) {
+        for over in &self.variable_overrides {
+            let super::VariableOverrideLocator::Parameter(index) = over.locator else {
+                continue;
+            };
+            let Some(name) = &over.name else {
+                continue;
+            };
+            let index = usize::from(index);
+            if index >= parameter_count {
+                continue;
+            }
+            self.set_param_name_override(&format!("arg{index}"), name);
+            self.set_lifted_param_slot_overrides(index, name);
+        }
+    }
+
     fn rename_register_for_display(&self, name: &str) -> String {
         if self.preserve_register_names.get() {
             return name.to_string();
@@ -3884,14 +4061,21 @@ impl PseudoCodeEmitter {
     }
 
     fn resolve_display_identifier_name(&self, name: &str) -> String {
-        if let Some(semantic_name) = self.try_get_semantic_var_name(name) {
+        let default = if let Some(semantic_name) = self.try_get_semantic_var_name(name) {
             let overridden = self.apply_param_name_override(&semantic_name);
-            return normalize_variable_name(&overridden);
-        }
+            normalize_variable_name(&overridden)
+        } else {
+            let renamed = self.rename_register_for_display(name);
+            let overridden = self.apply_param_name_override(&renamed);
+            normalize_variable_name(&overridden)
+        };
 
-        let renamed = self.rename_register_for_display(name);
-        let overridden = self.apply_param_name_override(&renamed);
-        normalize_variable_name(&overridden)
+        // A `Stack` locator is bound to the frame offset encoded in the
+        // lifted name (`local_N` / `arg_N` / `var_N`).
+        match Self::parse_lifted_stack_offset(name) {
+            Some((offset, _)) => self.stack_slot_name_with_override(offset, default),
+            None => default,
+        }
     }
 
     fn should_prefer_specific_param_name(candidate: &str) -> bool {
@@ -3966,12 +4150,25 @@ impl PseudoCodeEmitter {
 
     /// Sets the string table for resolving addresses.
     pub fn with_string_table(mut self, table: Option<StringTable>) -> Self {
+        self.string_table = table.map(Arc::new);
+        self
+    }
+
+    /// Sets the string table from an already shared table.
+    pub fn with_string_table_arc(mut self, table: Option<Arc<StringTable>>) -> Self {
         self.string_table = table;
         self
     }
 
     /// Sets the symbol table for resolving function addresses.
     pub fn with_symbol_table(mut self, table: Option<SymbolTable>) -> Self {
+        self.symbol_table = table.map(Arc::new);
+        *self.gnu_version_ambiguous_bases.borrow_mut() = None;
+        self
+    }
+
+    /// Sets the symbol table from an already shared table.
+    pub fn with_symbol_table_arc(mut self, table: Option<Arc<SymbolTable>>) -> Self {
         self.symbol_table = table;
         *self.gnu_version_ambiguous_bases.borrow_mut() = None;
         self
@@ -3979,6 +4176,13 @@ impl PseudoCodeEmitter {
 
     /// Sets the relocation table for resolving call targets in relocatable files.
     pub fn with_relocation_table(mut self, table: Option<RelocationTable>) -> Self {
+        self.relocation_table = table.map(Arc::new);
+        *self.gnu_version_ambiguous_bases.borrow_mut() = None;
+        self
+    }
+
+    /// Sets the relocation table from an already shared table.
+    pub fn with_relocation_table_arc(mut self, table: Option<Arc<RelocationTable>>) -> Self {
         self.relocation_table = table;
         *self.gnu_version_ambiguous_bases.borrow_mut() = None;
         self
@@ -3986,6 +4190,12 @@ impl PseudoCodeEmitter {
 
     /// Sets thread-pointer-relative TLS symbol names keyed by byte offset.
     pub fn with_tls_symbol_offsets(mut self, offsets: HashMap<i64, String>) -> Self {
+        self.tls_symbol_offsets = Arc::new(offsets);
+        self
+    }
+
+    /// Sets thread-pointer-relative TLS symbol names from an already shared map.
+    pub fn with_tls_symbol_offsets_arc(mut self, offsets: Arc<HashMap<i64, String>>) -> Self {
         self.tls_symbol_offsets = offsets;
         self
     }
@@ -4066,9 +4276,52 @@ impl PseudoCodeEmitter {
             .map(|s| s.as_str())
     }
 
+    /// Sets user variable name/type overrides.
+    ///
+    /// Overrides are consumed where a variable's `VarKind` binds to a display
+    /// name or type, so the emitted text is generated with them instead of
+    /// being patched afterwards. A `Parameter` override also updates the
+    /// emitted parameter list when a signature is available.
+    pub fn with_variable_overrides(mut self, overrides: Vec<super::VariableOverride>) -> Self {
+        self.variable_overrides = overrides;
+        self
+    }
+
     /// Gets the type string for a variable, defaulting to "int".
-    fn get_type(&self, var_name: &str) -> &str {
-        self.lookup_type_info(var_name).unwrap_or("int")
+    fn get_type(&self, var_name: &str) -> String {
+        if let Some(ty) = self.variable_type_override(var_name) {
+            return ty;
+        }
+        self.lookup_type_info(var_name).unwrap_or("int").to_string()
+    }
+
+    /// Picks the declared type for a local variable.
+    ///
+    /// Priority: user override, then assignment/pointer-usage inference, then
+    /// the type map (with the char-array fallback). This is the type-binding
+    /// point the declaration pass consumes.
+    fn declared_local_type(
+        &self,
+        var: &str,
+        inferred_assignment_types: &HashMap<String, String>,
+        inferred_pointer_usage_types: &HashMap<String, String>,
+        body_output: &str,
+    ) -> String {
+        if let Some(ty) = self.variable_type_override(var) {
+            return ty;
+        }
+        if let Some(ty) = inferred_assignment_types.get(var) {
+            return ty.clone();
+        }
+        if let Some(ty) = inferred_pointer_usage_types.get(var) {
+            return ty.clone();
+        }
+        let ty = self.get_type(var);
+        if ty == "int" && body_output.contains(&format!("{}[", var)) {
+            "char*".to_string()
+        } else {
+            ty
+        }
     }
 
     /// Gets the type of an expression if known.
@@ -4261,14 +4514,13 @@ impl PseudoCodeEmitter {
 
         // Extract struct name from type string
         // Patterns: "struct foo *", "struct foo*", "struct foo"
-        let struct_name = if let Some(rest) = type_str.strip_prefix("struct ") {
+        let struct_name = {
+            let rest = type_str.strip_prefix("struct ")?;
             // Skip "struct "
             // Find the end of the struct name (before * or space or end)
             let name_end = rest.find(['*', ' ']).unwrap_or(rest.len());
             let name = rest[..name_end].trim();
             format!("struct {}", name)
-        } else {
-            return None;
         };
 
         // Look up field at offset in type database
@@ -4624,7 +4876,7 @@ impl PseudoCodeEmitter {
         // Always use format_expr_with_strings for stack slot resolution and DWARF names
         // The string table is optional - we pass an empty one if not available
         let empty = super::StringTable::new();
-        let table = self.string_table.as_ref().unwrap_or(&empty);
+        let table = self.string_table.as_deref().unwrap_or(&empty);
         self.format_expr_with_strings(expr, table)
     }
 
@@ -6024,7 +6276,7 @@ impl PseudoCodeEmitter {
         // operator[] - index access: `o[idx]`
         if method == "operator[]" {
             // The receiver is `&recv`, args[0] is the index
-            if let Some(idx_arg) = args.get(0) {
+            if let Some(idx_arg) = args.first() {
                 let idx_str = self.format_expr_with_strings(idx_arg, table);
                 return Some(format!("{recv_str}[{idx_str}]"));
             }
@@ -6039,7 +6291,7 @@ impl PseudoCodeEmitter {
         // The rhs is typically after skipping `&this`, so args[0] is the value.
         // Note: this requires rhs value recovery (not yet fully implemented for all cases).
         if method == "operator=" {
-            if let Some(rhs_arg) = args.get(0) {
+            if let Some(rhs_arg) = args.first() {
                 let rhs_str = self.format_expr_with_strings(rhs_arg, table);
                 return Some(format!("{recv_str} = {rhs_str}"));
             }
@@ -6860,17 +7112,12 @@ impl PseudoCodeEmitter {
                     // / type hints collected via textual `var_N` →
                     // `+N` parsing wouldn't be applied. SSE-5
                     // follow-up — see project_sse_canary_return_typing.
-                    if let Some(semantic_name) = self.try_get_semantic_var_name(&var.name) {
-                        // Apply parameter name overrides and normalization
-                        let overridden = self.apply_param_name_override(&semantic_name);
-                        normalize_variable_name(&overridden)
-                    } else {
-                        // Rename callee-saved registers to meaningful names
-                        // These are commonly used to hold return values/error codes
-                        let renamed = self.rename_register_for_display(&var.name);
-                        let overridden = self.apply_param_name_override(&renamed);
-                        normalize_variable_name(&overridden)
-                    }
+                    //
+                    // User overrides are bound here: by `VarKind`, before
+                    // DWARF/register renaming, so they win over every
+                    // inferred name and their type reaches the declaration
+                    // pass through `variable_type_overrides`.
+                    self.var_display_name_with_override(var)
                 }
             }
             ExprKind::Unknown(name) => {
@@ -7048,18 +7295,22 @@ impl PseudoCodeEmitter {
                                 byte_offset
                             };
 
-                            // Check for DWARF name first
-                            if let Some(name) = self.get_dwarf_name(actual_offset) {
-                                return name.to_string();
-                            }
-
-                            // Use NamingContext for pattern-based naming
-                            let is_param = is_frame_ptr && actual_offset > 0;
-                            let name = self
-                                .naming_ctx
-                                .borrow_mut()
-                                .get_name(actual_offset, is_param);
-                            return normalize_variable_name(&name);
+                            // Preserve the historical naming offset, but bind a
+                            // user `Stack` override to the frame-relative byte
+                            // delta (`rbp[-1]` is offset -8).
+                            let default_name = if let Some(name) = self.get_dwarf_name(actual_offset)
+                            {
+                                name.to_string()
+                            } else {
+                                // Use NamingContext for pattern-based naming
+                                let is_param = is_frame_ptr && actual_offset > 0;
+                                let name = self
+                                    .naming_ctx
+                                    .borrow_mut()
+                                    .get_name(actual_offset, is_param);
+                                normalize_variable_name(&name)
+                            };
+                            return self.stack_slot_name_with_override(byte_offset, default_name);
                         }
                     } else if is_pc_relative {
                         // RIP/EIP-relative array access - this is a global variable reference
@@ -7172,8 +7423,8 @@ impl PseudoCodeEmitter {
         // Use advanced signature recovery if enabled
         let signature = if self.use_signature_recovery {
             let mut recovery = SignatureRecovery::new(self.calling_convention)
-                .with_relocation_table(self.relocation_table.clone())
-                .with_symbol_table(self.symbol_table.clone())
+                .with_relocation_table_arc(self.relocation_table.clone())
+                .with_symbol_table_arc(self.symbol_table.clone())
                 .with_summary_database(self.summary_database.clone())
                 .with_dwarf_param_names(self.dwarf_param_names.clone())
                 .with_function_name(func_name);
@@ -7181,6 +7432,12 @@ impl PseudoCodeEmitter {
         } else {
             None
         };
+        // User parameter overrides outrank recovered names.
+        let mut parameter_name_aliases: Vec<(String, String)> = Vec::new();
+        let signature = signature.map(|mut signature| {
+            parameter_name_aliases = self.apply_parameter_overrides_to_signature(&mut signature);
+            signature
+        });
 
         let provisional_body = self.rewrite_small_aggregate_slots_for_emission(&cfg.body);
         let legacy_func_info = self.analyze_function(&provisional_body);
@@ -7232,7 +7489,7 @@ impl PseudoCodeEmitter {
             self.analyze_function(&display_body)
         };
 
-        let param_override_sources: Vec<String> = if let Some(ref sig) = signature {
+        let mut param_override_sources: Vec<String> = if let Some(ref sig) = signature {
             if sig.parameters.is_empty() {
                 func_info.parameters.clone()
             } else {
@@ -7270,6 +7527,19 @@ impl PseudoCodeEmitter {
         } else {
             func_info.parameters.clone()
         };
+        // User parameter overrides are final: neither the recovered
+        // "specific name" preference above nor DWARF renaming may replace them.
+        for over in &self.variable_overrides {
+            let super::VariableOverrideLocator::Parameter(index) = over.locator else {
+                continue;
+            };
+            if let (Some(name), Some(slot)) = (
+                &over.name,
+                param_override_sources.get_mut(usize::from(index)),
+            ) {
+                *slot = name.clone();
+            }
+        }
         let rendered_param_names: Vec<String> = param_override_sources
             .iter()
             .enumerate()
@@ -7277,6 +7547,9 @@ impl PseudoCodeEmitter {
             .collect();
 
         self.clear_param_name_overrides();
+        // Per-function state: a reused emitter must not carry type overrides
+        // bound for a previous function's emitted names.
+        self.variable_type_overrides.borrow_mut().clear();
         // The `emit()` path never populates optional/variant reference-parameter types (only
         // `emit_with_signature` does), but clear the map here too so a reused emitter cannot carry
         // stale entries from a prior function into this one's comparison-operator sugar.
@@ -7286,6 +7559,14 @@ impl PseudoCodeEmitter {
             self.set_param_name_override(source_name, rendered_name);
             self.set_param_name_override(&format!("arg{}", idx), rendered_name);
             self.set_lifted_param_slot_overrides(idx, rendered_name);
+        }
+        // Bind `argN`/lifted-slot aliases for parameter overrides that the
+        // recovered parameter list does not cover.
+        self.install_parameter_override_aliases(param_override_sources.len());
+        // The body may render a parameter through its recovered/DWARF name;
+        // map the pre-override name onto the user's name as well.
+        for (from, to) in &parameter_name_aliases {
+            self.set_param_name_override(from, to);
         }
 
         // Function header with detected signature
@@ -7310,6 +7591,12 @@ impl PseudoCodeEmitter {
                     .map(|(idx, p)| {
                         let source_name = &param_override_sources[idx];
                         let rendered_name = rendered_param_names[idx].clone();
+                        if let Some(formatted) = self
+                            .parameter_override_type(idx)
+                            .and_then(|ty| Self::format_parameter_with_user_type(ty, &rendered_name))
+                        {
+                            return formatted;
+                        }
                         let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
                         self.format_signature_param_with_type_hint(
                             p,
@@ -7459,18 +7746,12 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}va_list ap;", indent).unwrap();
             }
             for var in &all_vars {
-                let var_type = inferred_assignment_types
-                    .get(var)
-                    .map(String::as_str)
-                    .or_else(|| inferred_pointer_usage_types.get(var).map(String::as_str))
-                    .unwrap_or_else(|| {
-                        if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var))
-                        {
-                            "char*"
-                        } else {
-                            self.get_type(var)
-                        }
-                    });
+                let var_type = self.declared_local_type(
+                    var,
+                    &inferred_assignment_types,
+                    &inferred_pointer_usage_types,
+                    &body_output,
+                );
                 let scope_comment = self.dwarf_scope_comment(var).unwrap_or_default();
                 if loop_zero_init_vars.contains(var) {
                     writeln!(
@@ -7521,6 +7802,23 @@ impl PseudoCodeEmitter {
                 self.detect_coroutine_promise_type(&cfg.body);
         }
 
+        // User parameter overrides outrank the provided (recovered,
+        // C++-adjusted or user-supplied) signature's parameter names. Clone
+        // only when overrides exist so the no-override path is untouched.
+        let mut parameter_name_aliases: Vec<(String, String)> = Vec::new();
+        let effective_signature;
+        let signature = if self.variable_overrides.is_empty() {
+            signature
+        } else {
+            effective_signature = {
+                let mut signature = signature.clone();
+                parameter_name_aliases =
+                    self.apply_parameter_overrides_to_signature(&mut signature);
+                signature
+            };
+            &effective_signature
+        };
+
         let display_body = self.rewrite_small_aggregate_slots_for_emission(
             &Self::rewrite_tail_call_returns_for_emission(&cfg.body, signature.has_return),
         );
@@ -7546,6 +7844,9 @@ impl PseudoCodeEmitter {
             .collect();
 
         self.clear_param_name_overrides();
+        // Per-function state: a reused emitter must not carry type overrides
+        // bound for a previous function's emitted names.
+        self.variable_type_overrides.borrow_mut().clear();
         self.optional_variant_param_types.borrow_mut().clear();
         for (idx, source_name) in signature_param_names.iter().enumerate() {
             let rendered_name = &rendered_param_names[idx];
@@ -7557,6 +7858,14 @@ impl PseudoCodeEmitter {
                 idx,
                 &signature.parameters[idx].param_type,
             );
+        }
+        // Bind `argN`/lifted-slot aliases for parameter overrides that the
+        // signature's parameter list does not cover.
+        self.install_parameter_override_aliases(signature.parameters.len());
+        // The body may render a parameter through its recovered/DWARF name;
+        // map the pre-override name onto the user's name as well.
+        for (from, to) in &parameter_name_aliases {
+            self.set_param_name_override(from, to);
         }
 
         // Record how many argument registers are actual parameters, so a higher
@@ -7605,6 +7914,12 @@ impl PseudoCodeEmitter {
             .map(|(idx, p)| {
                 let source_name = &signature_param_names[idx];
                 let rendered_name = rendered_param_names[idx].clone();
+                if let Some(formatted) = self
+                    .parameter_override_type(idx)
+                    .and_then(|ty| Self::format_parameter_with_user_type(ty, &rendered_name))
+                {
+                    return formatted;
+                }
                 let type_hint = self.find_param_type_hint(idx, source_name, &rendered_name);
                 self.format_signature_param_with_type_hint(p, &rendered_name, type_hint.as_deref())
             })
@@ -7703,18 +8018,12 @@ impl PseudoCodeEmitter {
                 writeln!(output, "{}va_list ap;", indent).unwrap();
             }
             for var in &all_vars {
-                let var_type = inferred_assignment_types
-                    .get(var)
-                    .map(String::as_str)
-                    .or_else(|| inferred_pointer_usage_types.get(var).map(String::as_str))
-                    .unwrap_or_else(|| {
-                        if self.get_type(var) == "int" && body_output.contains(&format!("{}[", var))
-                        {
-                            "char*"
-                        } else {
-                            self.get_type(var)
-                        }
-                    });
+                let var_type = self.declared_local_type(
+                    var,
+                    &inferred_assignment_types,
+                    &inferred_pointer_usage_types,
+                    &body_output,
+                );
                 let scope_comment = self.dwarf_scope_comment(var).unwrap_or_default();
                 if loop_zero_init_vars.contains(var) {
                     writeln!(
@@ -7755,8 +8064,8 @@ impl PseudoCodeEmitter {
         func_name: Option<&str>,
     ) -> FunctionSignature {
         let mut recovery = SignatureRecovery::new(self.calling_convention)
-            .with_relocation_table(self.relocation_table.clone())
-            .with_symbol_table(self.symbol_table.clone())
+            .with_relocation_table_arc(self.relocation_table.clone())
+            .with_symbol_table_arc(self.symbol_table.clone())
             .with_summary_database(self.summary_database.clone())
             .with_dwarf_param_names(self.dwarf_param_names.clone());
         if let Some(name) = func_name {
@@ -10681,6 +10990,12 @@ impl PseudoCodeEmitter {
     fn try_get_var_name(&self, expr: &Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::Var(v) => {
+                if let Some(name) = self
+                    .variable_override_for(v)
+                    .and_then(|over| over.name.as_deref())
+                {
+                    return Some(normalize_variable_name(name));
+                }
                 // Include both original and semantically renamed variables
                 if is_declarable_variable(&v.name) {
                     // Return the renamed name for consistency with format_expr
@@ -10774,9 +11089,12 @@ impl PseudoCodeEmitter {
             if base.name == "sp" {
                 // Check for DWARF name at offset 0
                 if let Some(name) = self.get_dwarf_name(0) {
-                    return Some(normalize_variable_name(name));
+                    return Some(self.stack_slot_name_with_override(
+                        0,
+                        normalize_variable_name(name),
+                    ));
                 }
-                return Some("var_0".to_string());
+                return Some(self.stack_slot_name_with_override(0, "var_0".to_string()));
             }
         }
 
@@ -10798,7 +11116,10 @@ impl PseudoCodeEmitter {
 
                         // First, check for DWARF name at this offset
                         if let Some(name) = self.get_dwarf_name(actual_offset) {
-                            return Some(normalize_variable_name(name));
+                            return Some(self.stack_slot_name_with_override(
+                                actual_offset,
+                                normalize_variable_name(name),
+                            ));
                         }
 
                         // Use NamingContext for pattern-based naming (loop indices, type hints, etc.)
@@ -10808,7 +11129,10 @@ impl PseudoCodeEmitter {
                             .naming_ctx
                             .borrow_mut()
                             .get_name(actual_offset, is_param);
-                        return Some(normalize_variable_name(&name));
+                        return Some(self.stack_slot_name_with_override(
+                            actual_offset,
+                            normalize_variable_name(&name),
+                        ));
                     }
                 }
             }
@@ -10858,7 +11182,8 @@ impl PseudoCodeEmitter {
                 .get_name(actual_offset, is_param)
         };
 
-        let base_name = normalize_variable_name(&stack_name);
+        let base_name =
+            self.stack_slot_name_with_override(actual_offset, normalize_variable_name(&stack_name));
         let index_str = self.format_expr_no_string_resolve(dynamic_index);
         Some(format!("{}[{}]", base_name, index_str))
     }
@@ -10889,7 +11214,9 @@ impl PseudoCodeEmitter {
                             .borrow_mut()
                             .get_name(actual_offset, is_param)
                     };
-                    return Some(normalize_variable_name(&name));
+                    return Some(
+                        self.stack_slot_name_with_override(byte_offset, normalize_variable_name(&name)),
+                    );
                 }
             }
         }
@@ -16234,5 +16561,94 @@ int sum(int n, ...)
                 "must not sugar sret-returning {method}"
             );
         }
+    }
+
+    /// Register and temp locators bind by `VarKind` + byte size, and the
+    /// name/type are generated at the binding point (not patched into the
+    /// text afterwards).
+    #[test]
+    fn test_variable_overrides_bind_register_and_temp_by_kind_and_size() {
+        use super::super::expression::Variable;
+
+        let body = vec![StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![
+                Expr::assign(
+                    Expr::var(Variable {
+                        kind: super::super::expression::VarKind::Register(13),
+                        name: "r13".to_string(),
+                        size: 8,
+                    }),
+                    Expr::int(1),
+                ),
+                Expr::assign(
+                    Expr::var(Variable {
+                        kind: super::super::expression::VarKind::Temp(3),
+                        name: "tmp3".to_string(),
+                        size: 4,
+                    }),
+                    Expr::int(2),
+                ),
+            ],
+            address_range: (0x1000, 0x1010),
+        }];
+        let cfg = StructuredCfg {
+            body,
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let emitter = PseudoCodeEmitter::new("    ", false).with_variable_overrides(vec![
+            super::super::VariableOverride::new(
+                super::super::VariableOverrideLocator::Register {
+                    index: 13,
+                    size: 8,
+                },
+            )
+            .with_name("kept_value"),
+            super::super::VariableOverride::new(super::super::VariableOverrideLocator::Temp {
+                index: 3,
+                size: 4,
+            })
+            .with_name("scratch")
+            .with_type_name("int32_t"),
+        ]);
+        let output = emitter.emit(&cfg, "kind_binding");
+
+        assert!(output.contains("kept_value = 1;"), "{output}");
+        assert!(output.contains("scratch = 2;"), "{output}");
+        assert!(
+            output.contains("int32_t scratch;"),
+            "override type must drive the declaration:\n{output}"
+        );
+        assert!(
+            !output.contains("r13") && !output.contains("tmp3"),
+            "automatic names must be gone:\n{output}"
+        );
+    }
+
+    /// A locator that matches no variable leaves the output unchanged.
+    #[test]
+    fn test_variable_overrides_no_match_is_a_noop() {
+        let body = vec![StructuredNode::Block {
+            id: hexray_core::BasicBlockId::new(0),
+            statements: vec![Expr::assign(
+                Expr::var(super::super::expression::Variable::reg("rbx", 8)),
+                Expr::int(7),
+            )],
+            address_range: (0x1000, 0x1010),
+        }];
+        let cfg = StructuredCfg {
+            body,
+            cfg_entry: hexray_core::BasicBlockId::new(0),
+        };
+
+        let baseline = PseudoCodeEmitter::new("    ", false).emit(&cfg, "noop");
+        let with_override = PseudoCodeEmitter::new("    ", false)
+            .with_variable_overrides(vec![super::super::VariableOverride::new(
+                super::super::VariableOverrideLocator::Stack(-0x40),
+            )
+            .with_name("unused")])
+            .emit(&cfg, "noop");
+        assert_eq!(baseline, with_override);
     }
 }

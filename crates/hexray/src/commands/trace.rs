@@ -59,7 +59,7 @@ fn parse_register_id(arch: Architecture, value: &str) -> Result<u16> {
 }
 
 /// Data flow trace actions.
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum TraceAction {
     /// Trace value backwards: where did it come from?
     Backward {

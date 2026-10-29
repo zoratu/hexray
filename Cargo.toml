@@ -20,6 +20,7 @@ hexray-demangle = { path = "crates/hexray-demangle" }
 hexray-types = { path = "crates/hexray-types" }
 hexray-signatures = { path = "crates/hexray-signatures" }
 hexray-emulate = { path = "crates/hexray-emulate" }
+hexray-db = { path = "crates/hexray-db" }
 
 # Error handling
 thiserror = "2.0"

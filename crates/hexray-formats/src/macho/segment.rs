@@ -253,6 +253,10 @@ impl crate::Section for Section {
         &self.sectname
     }
 
+    fn file_offset(&self) -> u64 {
+        u64::from(self.offset)
+    }
+
     fn virtual_address(&self) -> u64 {
         self.addr
     }

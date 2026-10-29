@@ -8643,12 +8643,9 @@ fn recover_typed_call_arguments(
                         }
                         recovered_args.push(pass_through_arg_expr(reg_name));
                     }
-                } else if let Some(value) =
-                    reuse_existing_positional_integer_arg(existing_args, param_index)
-                {
-                    recovered_args.push(value);
                 } else {
-                    return None;
+                    let value = reuse_existing_positional_integer_arg(existing_args, param_index)?;
+                    recovered_args.push(value);
                 }
                 int_slot += 1;
             }
@@ -8714,12 +8711,9 @@ fn recover_typed_call_arguments(
                         }
                         recovered_args.push(pass_through_float_arg_expr(reg_name));
                     }
-                } else if let Some(value) =
-                    reuse_existing_positional_float_arg(existing_args, param_index)
-                {
-                    recovered_args.push(value);
                 } else {
-                    return None;
+                    let value = reuse_existing_positional_float_arg(existing_args, param_index)?;
+                    recovered_args.push(value);
                 }
                 float_slot += 1;
             }

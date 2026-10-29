@@ -22,7 +22,7 @@ use hexray_analysis::{
     AnalysisProject, BinaryDataContext, BinaryDiff, CallGraph, CallGraphBuilder,
     CallGraphDotExporter, CallGraphHtmlExporter, CallGraphJsonExporter, CallSite, CallType,
     CfgBuilder, CfgDotExporter, CfgHtmlExporter, CfgJsonExporter, Decompiler, DecompilerConfig,
-    ExceptionExtractor, ExceptionInfo, FunctionInfo, OptimizationLevel, OptimizationPass,
+    ExceptionExtractor, ExceptionInfo, FunctionInfo,
     ParallelCallGraphBuilder, Patch, PatchType, RelocationTable, StringConfig,
     StringDetector, StringTable, SymbolTable, XrefBuilder, XrefType,
 };
@@ -40,7 +40,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+mod analysis_pipeline;
+mod analysis_scope;
 mod commands;
+mod database;
 mod session;
 
 use commands::emulate::EmulateAction;
@@ -146,6 +149,11 @@ enum Commands {
         /// Show signature-recovery diagnostics (including function-pointer provenance)
         #[arg(long)]
         diagnostics: bool,
+    },
+    /// Persistent analysis project (.hxdb)
+    Db {
+        #[command(subcommand)]
+        action: database::DbAction,
     },
     /// Build and display call graph
     Callgraph {
@@ -351,14 +359,14 @@ pub fn parse_hex(s: &str) -> Result<u64, String> {
 }
 
 /// Wrapper enum to hold either format
-enum Binary<'a> {
+pub(crate) enum Binary<'a> {
     Elf(Elf<'a>),
     MachO(MachO<'a>),
     Pe(Pe<'a>),
 }
 
 impl<'a> Binary<'a> {
-    fn as_format(&self) -> &dyn BinaryFormat {
+    pub(crate) fn as_format(&self) -> &dyn BinaryFormat {
         match self {
             Self::Elf(elf) => elf,
             Self::MachO(macho) => macho,
@@ -366,7 +374,7 @@ impl<'a> Binary<'a> {
         }
     }
 
-    fn format_name(&self) -> &'static str {
+    pub(crate) fn format_name(&self) -> &'static str {
         match self {
             Self::Elf(_) => "ELF",
             Self::MachO(_) => "Mach-O",
@@ -374,7 +382,7 @@ impl<'a> Binary<'a> {
         }
     }
 
-    fn exception_info_for_function(
+    pub(crate) fn exception_info_for_function(
         &self,
         func_start: u64,
         func_end: u64,
@@ -623,7 +631,7 @@ fn append_exception_metadata(output: &mut String, binary: &Binary<'_>) {
     output.push_str(&format!("LSDA Section:  {}\n", lsda));
 }
 
-fn default_calling_convention(
+pub(crate) fn default_calling_convention(
     binary_type: BinaryType,
     arch: Architecture,
 ) -> hexray_analysis::CallingConvention {
@@ -756,12 +764,61 @@ fn ensure_project_matches_binary(
     Ok(())
 }
 
+/// Stack for the CLI thread.
+///
+/// clap builds the whole nested subcommand tree eagerly, and a debug build of
+/// that code needs far more than the 1 MiB the Windows main thread gets by
+/// default — `--help` alone overflows it. Running the CLI on an explicitly
+/// sized thread keeps every subcommand usable without shrinking the command
+/// surface.
+const CLI_STACK_BYTES: usize = 32 * 1024 * 1024;
+
 fn main() -> Result<()> {
+    let worker = std::thread::Builder::new()
+        .stack_size(CLI_STACK_BYTES)
+        .spawn(run_cli)
+        .context("failed to start the CLI thread")?;
+    match worker.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            // Exit classes: 1 operational/input error, 2 argument parsing
+            // (clap exits itself), 3 revision/analysis-generation conflict,
+            // 4 resource limit or busy database.
+            let code = error
+                .downcast_ref::<hexray_db::DbError>()
+                .map(hexray_db::DbError::exit_code)
+                .unwrap_or(1);
+            eprintln!("Error: {error:?}");
+            std::process::exit(code);
+        }
+        Err(payload) => {
+            eprintln!("Error: {}", panic_message(payload));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "worker thread panicked".to_string()
+}
+
+fn run_cli() -> Result<()> {
     // Restore the Unix default so piped output exits quietly on EPIPE.
     sigpipe::reset();
 
     let cli = Cli::parse();
     let global_project_path = cli.project.clone();
+
+    // Handle `db` before anything requires a positional binary.
+    if let Some(Commands::Db { ref action }) = cli.command {
+        return database::handle(action.clone());
+    }
 
     // Handle commands that don't require a binary file
     if let Some(Commands::Types { action }) = cli.command {
@@ -921,7 +978,7 @@ fn main() -> Result<()> {
             let type_db = load_type_database(&binary, types.as_deref())?;
 
             // Build decompiler config
-            let config = build_decompiler_config(&opt_level, &enable_passes, &disable_passes)?;
+            let config = analysis_pipeline::build_decompiler_config(&opt_level, &enable_passes, &disable_passes)?;
 
             if follow {
                 decompile_with_follow(
@@ -1010,6 +1067,10 @@ fn main() -> Result<()> {
         Some(Commands::Diff { .. }) => {
             // Already handled before binary loading
             unreachable!("Diff command should have been handled earlier");
+        }
+        Some(Commands::Db { .. }) => {
+            // Already handled before binary loading
+            unreachable!("Db command should have been handled earlier");
         }
         None => {
             // Default: disassemble
@@ -1791,7 +1852,7 @@ fn display_symbol_name(
         .unwrap_or_else(|| demangle_or_original(&symbol.name))
 }
 
-fn find_preferred_symbol_at(
+pub(crate) fn find_preferred_symbol_at(
     symbols: &[hexray_core::Symbol],
     address: u64,
 ) -> Option<&hexray_core::Symbol> {
@@ -2359,7 +2420,7 @@ fn synthesize_signature_function_symbols(
     };
 
     for (address, size, heuristic_bounds) in
-        discover_function_starts(fmt, fmt.architecture(), symbols)
+        discover_function_starts(fmt, fmt.architecture(), symbols, None)
     {
         if has_named_symbol_at(address, symbols) {
             continue;
@@ -3332,6 +3393,75 @@ fn disassemble_cfg(
     Ok(())
 }
 
+/// Decode one bounded window and report why the scan stopped.
+///
+/// This is the single decode core: the discovery pass, the CFG pass and the
+/// callee signature seed all go through it, so "what the decoder saw" cannot
+/// diverge between them. The caller is responsible for clamping the window to
+/// the analysis scope and for caching the result.
+///
+/// `scope_bounded` marks a window whose end is an analysis-scope boundary, not a
+/// natural bound. There, an instruction that does not fit must end the scan:
+/// resynchronising past it would decode the tail of a cut instruction as if it
+/// were a new one, inventing code inside excluded bytes.
+pub(crate) fn disassemble_window(
+    fmt: &dyn BinaryFormat,
+    address: u64,
+    max_bytes: usize,
+    stop_after_first_return: bool,
+    scope_bounded: bool,
+) -> Result<(Vec<hexray_core::Instruction>, crate::analysis_pipeline::DecodeStopReason)> {
+    let bytes = fmt.bytes_at(address, max_bytes).context("Cannot read bytes")?;
+    let (instructions, reason) = match fmt.architecture() {
+        Architecture::X86_64 | Architecture::X86 => {
+            let disasm = X86_64Disassembler::new();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        Architecture::Arm64 => {
+            let disasm = Arm64Disassembler::new();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        Architecture::RiscV64 => {
+            let disasm = RiscVDisassembler::new();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        Architecture::RiscV32 => {
+            let disasm = RiscVDisassembler::new_rv32();
+            disassemble_for_cfg_detailed(
+                &disasm,
+                fmt,
+                bytes,
+                address,
+                stop_after_first_return,
+                scope_bounded,
+            )
+        }
+        arch => bail!("Unsupported architecture: {:?}", arch),
+    };
+    Ok((instructions, reason))
+}
+
 fn disassemble_for_cfg<D: Disassembler>(
     disasm: &D,
     fmt: &dyn BinaryFormat,
@@ -3339,11 +3469,26 @@ fn disassemble_for_cfg<D: Disassembler>(
     start_addr: u64,
     stop_after_first_return: bool,
 ) -> Vec<hexray_core::Instruction> {
+    disassemble_for_cfg_detailed(disasm, fmt, bytes, start_addr, stop_after_first_return, false).0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn disassemble_for_cfg_detailed<D: Disassembler>(
+    disasm: &D,
+    fmt: &dyn BinaryFormat,
+    bytes: &[u8],
+    start_addr: u64,
+    stop_after_first_return: bool,
+    scope_bounded: bool,
+) -> (Vec<hexray_core::Instruction>, crate::analysis_pipeline::DecodeStopReason) {
+    use crate::analysis_pipeline::DecodeStopReason;
     let binary_data_ctx = build_binary_data_context(fmt);
     let scan_limit = start_addr.saturating_add(bytes.len() as u64);
     let mut instructions = Vec::new();
     let mut offset = 0;
     let mut min_scan_end = start_addr;
+    let mut stop_reason = DecodeStopReason::RangeEnd;
+    let mut last_decode_failed = false;
 
     while offset < bytes.len() && instructions.len() < 500 {
         let remaining = &bytes[offset..];
@@ -3351,6 +3496,7 @@ fn disassemble_for_cfg<D: Disassembler>(
 
         match disasm.decode_instruction(remaining, addr) {
             Ok(decoded) => {
+                last_decode_failed = false;
                 let is_ret = decoded.instruction.is_return();
                 let is_halt = matches!(
                     decoded.instruction.control_flow,
@@ -3433,16 +3579,44 @@ fn disassemble_for_cfg<D: Disassembler>(
                     && !must_keep_scanning
                     && (is_ret || is_halt || is_noreturn_call || is_heuristic_tail_jump)
                 {
+                    stop_reason = if is_noreturn_call {
+                        DecodeStopReason::Noreturn
+                    } else if is_heuristic_tail_jump {
+                        DecodeStopReason::TailJump
+                    } else {
+                        DecodeStopReason::Return
+                    };
                     break;
                 }
             }
             Err(_) => {
+                if scope_bounded {
+                    // The window ends at an analysis-scope boundary: the bytes
+                    // that failed here belong to an instruction the user
+                    // excluded, so the scan ends instead of re-synchronising on
+                    // its tail and calling that tail a new instruction.
+                    stop_reason = DecodeStopReason::AnalysisScope;
+                    break;
+                }
+                last_decode_failed = true;
                 offset += disasm.min_instruction_size().max(1);
             }
         }
     }
 
-    instructions
+    if offset >= bytes.len() {
+        if last_decode_failed {
+            stop_reason = DecodeStopReason::InvalidDecode;
+        } else if stop_reason == DecodeStopReason::RangeEnd {
+            // The window itself ran out; this is the ordinary "function is
+            // bigger than the window" case.
+            stop_reason = DecodeStopReason::RangeEnd;
+        }
+    } else if instructions.len() >= 500 {
+        stop_reason = DecodeStopReason::InstructionLimit;
+    }
+
+    (instructions, stop_reason)
 }
 
 fn is_known_noreturn_call_target(
@@ -3479,15 +3653,15 @@ fn looks_like_x86_ud2_trap_stub(fmt: &dyn BinaryFormat, target: u64) -> bool {
     bytes.starts_with(&[0x0f, 0x0b])
 }
 
-struct DecompileTargetInfo {
-    start_addr: u64,
-    name: String,
-    max_bytes: usize,
-    stop_after_first_return: bool,
-    symbol_kind: Option<hexray_core::SymbolKind>,
+pub(crate) struct DecompileTargetInfo {
+    pub(crate) start_addr: u64,
+    pub(crate) name: String,
+    pub(crate) max_bytes: usize,
+    pub(crate) stop_after_first_return: bool,
+    pub(crate) symbol_kind: Option<hexray_core::SymbolKind>,
 }
 
-fn decompile_target_info_for_address(
+pub(crate) fn decompile_target_info_for_address(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
     addr: u64,
@@ -3518,7 +3692,7 @@ fn decompile_target_info_for_address(
     }
 }
 
-fn resolve_decompile_target_info(
+pub(crate) fn resolve_decompile_target_info(
     fmt: &dyn BinaryFormat,
     project: Option<&AnalysisProject>,
     target: &str,
@@ -3553,69 +3727,35 @@ fn resolve_decompile_target_info(
     }
 }
 
-fn disassemble_function_for_cfg(
+pub(crate) fn disassemble_function_for_cfg(
     fmt: &dyn BinaryFormat,
     address: u64,
     max_bytes: usize,
     stop_after_first_return: bool,
 ) -> Result<Vec<hexray_core::Instruction>> {
-    let bytes = fmt
-        .bytes_at(address, max_bytes)
-        .context("Cannot read bytes")?;
-    match fmt.architecture() {
-        Architecture::X86_64 | Architecture::X86 => {
-            let disasm = X86_64Disassembler::new();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        Architecture::Arm64 => {
-            let disasm = Arm64Disassembler::new();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        Architecture::RiscV64 => {
-            let disasm = RiscVDisassembler::new();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        Architecture::RiscV32 => {
-            let disasm = RiscVDisassembler::new_rv32();
-            Ok(disassemble_for_cfg(
-                &disasm,
-                fmt,
-                bytes,
-                address,
-                stop_after_first_return,
-            ))
-        }
-        arch => bail!("Unsupported architecture: {:?}", arch),
-    }
+    Ok(disassemble_window(fmt, address, max_bytes, stop_after_first_return, false)?.0)
 }
 
-struct DirectCalleeSignatureSeedContext<'a> {
+pub(crate) struct DirectCalleeSignatureSeedContext<'a> {
     relocation_table: &'a RelocationTable,
     symbol_table: &'a SymbolTable,
     calling_convention: hexray_analysis::CallingConvention,
     tls_access_targets: &'a [TlsAccessTarget],
     tls_slot_map: &'a std::collections::HashMap<u64, u64>,
+    /// Raw decodes this command already produced. Callees found here are not
+    /// decoded again; a miss still decodes on demand, so the recovered
+    /// signatures are byte-for-byte the ones the serial baseline produced.
+    decoded: Option<&'a std::collections::HashMap<
+        crate::analysis_pipeline::DecodeKey,
+        Arc<crate::analysis_pipeline::DecodedFunction>,
+    >>,
+    /// Active analysis scope. A callee inside an excluded range is never
+    /// decoded, which is the point of the scope: the caller's own CFG is
+    /// unaffected, only the cross-range seed work disappears.
+    scope: Option<&'a crate::analysis_scope::ScopeMap>,
 }
 
-fn seed_direct_callee_signature_hints(
+pub(crate) fn seed_direct_callee_signature_hints(
     binary: &Binary,
     instructions: &[hexray_core::Instruction],
     binary_data_ctx: &mut BinaryDataContext,
@@ -3628,10 +3768,39 @@ fn seed_direct_callee_signature_hints(
             stop_after_first_return,
             ..
         } = decompile_target_info_for_address(fmt, None, callee_addr);
-        let Ok(mut callee_instructions) =
-            disassemble_function_for_cfg(fmt, callee_addr, max_bytes, stop_after_first_return)
-        else {
+        let allowed = match seed_ctx.scope {
+            Some(scope) => {
+                let (allowed, _) = scope.clamp_window(callee_addr, max_bytes);
+                allowed
+            }
+            None => max_bytes,
+        };
+        if allowed == 0 {
             continue;
+        }
+        let scope_bounded = allowed != max_bytes;
+        let cached = seed_ctx.decoded.and_then(|table| {
+            let scope = seed_ctx.scope?;
+            let key = crate::analysis_pipeline::decode_key_for(
+                scope,
+                callee_addr,
+                max_bytes,
+                stop_after_first_return,
+            );
+            table.get(&key).cloned()
+        });
+        let mut callee_instructions = match cached {
+            Some(decoded) => decoded.instructions.to_vec(),
+            None => match disassemble_window(
+                fmt,
+                callee_addr,
+                allowed,
+                stop_after_first_return,
+                scope_bounded,
+            ) {
+                Ok((instructions, _)) => instructions,
+                Err(_) => continue,
+            },
         };
         apply_instruction_relocations(&mut callee_instructions, seed_ctx.relocation_table);
         rewrite_tls_memory_operands(
@@ -3666,237 +3835,49 @@ fn decompile_function(
     type_db: Option<&std::sync::Arc<TypeDatabase>>,
     config: Option<&DecompilerConfig>,
 ) -> Result<()> {
-    let fmt = binary.as_format();
-    let relocation_table = build_relocation_table(binary);
-
-    let DecompileTargetInfo {
-        start_addr,
-        name,
-        max_bytes,
-        stop_after_first_return,
-        symbol_kind,
-    } = resolve_decompile_target_info(fmt, project, target, &relocation_table).map_err(|_| {
-        anyhow::anyhow!(
-            "Symbol '{}' not found. It may be an external/undefined symbol (e.g., from a shared library).",
-            target
-        )
-    })?;
-
-    // Validate the address is reasonable
-    if start_addr == 0 {
-        bail!("Invalid address 0x0 - symbol may be undefined or external");
-    }
-
-    // Check if address is in an executable section
-    let in_executable = fmt.sections().any(|s| {
-        let section_start = s.virtual_address();
-        let section_end = section_start.saturating_add(s.size());
-        start_addr >= section_start && start_addr < section_end && s.is_executable()
-    });
-    if !in_executable {
-        bail!(
-            "Address {:#x} is not in an executable section - cannot decompile data",
-            start_addr
-        );
-    }
-
-    println!("Decompiling {} at {:#x}\n", name, start_addr);
-
-    let arch = fmt.architecture();
-    let mut instructions =
-        disassemble_function_for_cfg(fmt, start_addr, max_bytes, stop_after_first_return)?;
-    apply_instruction_relocations(&mut instructions, &relocation_table);
-    let tls_access_targets = build_tls_access_targets(binary);
-    let tls_symbol_offsets = build_tls_symbol_offset_map(binary);
-    let tls_slot_map = build_tls_slot_map(binary);
-    rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
-
-    // Build symbol table for function names, merging with project overrides
-    let mut symbol_table = build_symbol_table(binary);
-    if let Some(proj) = project {
-        for addr in proj.overridden_functions() {
-            if let Some(name) = proj.get_function_name(addr) {
-                symbol_table.insert(addr, name.to_string());
-            }
-        }
-    }
-    let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
-
-    // Try to load DWARF debug info for function-scoped variable and parameter names.
-    let dwarf_names = if let Some(debug_info) = load_dwarf_info(binary_path, binary) {
-        get_dwarf_function_names(&debug_info, start_addr, binary)
-    } else {
-        DwarfFunctionNames::default()
-    };
-
-    // Decompile
-    // Create constant database for magic number recognition
-    let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
-
-    // Determine calling convention from architecture
-    let calling_convention = default_calling_convention(
-        match binary {
-            Binary::Elf(_) => BinaryType::Elf,
-            Binary::MachO(_) => BinaryType::MachO,
-            Binary::Pe(_) => BinaryType::Pe,
+    let debug_info = load_dwarf_info(binary_path, binary);
+    let shared = analysis_pipeline::SharedAnalysisContext::build(
+        binary,
+        analysis_pipeline::SharedTables {
+            project,
+            type_db,
+            debug_info,
+            names: &[],
+            scope: None,
         },
-        arch,
     );
-    let pointer_size = match fmt.bitness() {
-        hexray_core::Bitness::Bits32 => 4usize,
-        hexray_core::Bitness::Bits64 => 8usize,
+    let inputs = analysis_pipeline::AnalysisInputs {
+        shared: &shared,
+        config,
+        diagnostics,
+        signature_override: None,
+        variable_overrides: &[],
+        decoded: None,
+        scope_map: None,
     };
+    let analyzed = analysis_pipeline::analyze_function(
+        binary,
+        &analysis_pipeline::FunctionRequest::new(target),
+        &inputs,
+    )?;
 
-    let mut binary_data_ctx = build_binary_data_context(fmt);
-    seed_resolved_call_target_names(&mut binary_data_ctx, &symbol_table, &relocation_table);
-    let seed_ctx = DirectCalleeSignatureSeedContext {
-        relocation_table: &relocation_table,
-        symbol_table: &symbol_table,
-        calling_convention,
-        tls_access_targets: &tls_access_targets,
-        tls_slot_map: &tls_slot_map,
-    };
-    seed_direct_callee_signature_hints(binary, &instructions, &mut binary_data_ctx, &seed_ctx);
+    println!("Decompiling {} at {:#x}\n", analyzed.name, analyzed.start);
 
-    // Build CFG using both read-only section bytes and direct-callee signature hints.
-    let noreturn_call_sites = collect_noreturn_call_sites(&instructions, fmt, &relocation_table);
-    let cfg = CfgBuilder::build_with_binary_context_and_noreturn_calls(
-        &instructions,
-        start_addr,
-        &binary_data_ctx,
-        &noreturn_call_sites,
-    );
+    let rendered = analysis_pipeline::render_function(
+        analyzed,
+        &analysis_pipeline::RenderOptions {
+            show_addresses,
+            comments: Some(analysis_pipeline::CommentOverlay::from_project(project)),
+        },
+    )?;
 
-    // Clone relocation table for exception info lookup (moved to decompiler below)
-    let relocation_table_for_exception = relocation_table.clone();
-
-    // Build string table from data sections
-    let string_table = build_string_table(fmt);
-
-    let mut decompiler = Decompiler::new()
-        .with_addresses(show_addresses)
-        .with_string_table(string_table)
-        .with_symbol_table(symbol_table)
-        .with_relocation_table(relocation_table)
-        .with_tls_symbol_offsets(tls_symbol_offsets)
-        .with_throw_thunks(throw_thunks)
-        .with_current_function_kind(symbol_kind)
-        .with_binary_data(binary_data_ctx)
-        .with_dwarf_names(dwarf_names.stack_names)
-        .with_dwarf_param_names(dwarf_names.parameter_names)
-        .with_dwarf_scope_ranges(dwarf_names.local_scope_ranges)
-        .with_constant_database(const_db)
-        .with_struct_inference(true)
-        .with_calling_convention(calling_convention)
-        .with_pointer_size(pointer_size);
-    decompiler = decompiler.analyze_cpp_special(&cfg, &instructions, Some(&name));
-    if let Some(info) = binary.exception_info_for_function(start_addr, start_addr, &relocation_table_for_exception) {
-        decompiler = decompiler.with_exception_info(info);
-    }
-    if let Some(db) = type_db {
-        decompiler = decompiler.with_type_database(db.clone());
-    }
-    if let Some(cfg_opts) = config {
-        decompiler = decompiler.with_config(cfg_opts.clone());
-    }
-    if diagnostics {
-        let signature = decompiler.recover_signature(&cfg);
-        print_signature_diagnostics(&name, &signature);
-    }
-    let pseudocode = ensure_nonempty_pseudocode(annotate_pseudocode_with_project_comments(
-        decompiler.decompile(&cfg, &name),
-        project,
-        show_addresses,
-    ));
-
-    println!("{}", pseudocode);
+    println!("{}", rendered.text);
 
     Ok(())
 }
 
-fn annotate_pseudocode_with_project_comments(
-    pseudocode: String,
-    project: Option<&AnalysisProject>,
-    show_addresses: bool,
-) -> String {
-    if !show_addresses {
-        return pseudocode;
-    }
-    let Some(project) = project else {
-        return pseudocode;
-    };
-
-    let mut comments: Vec<(u64, String)> = project
-        .annotated_addresses()
-        .filter_map(|addr| {
-            project
-                .get_comment(addr)
-                .map(|comment| (addr, comment.to_string()))
-        })
-        .collect();
-    comments.sort_by_key(|(addr, _)| *addr);
-    if comments.is_empty() {
-        return pseudocode;
-    }
-
-    let trailing_newline = pseudocode.ends_with('\n');
-    let mut rendered = String::new();
-    let mut next_comment = 0usize;
-
-    for line in pseudocode.lines() {
-        rendered.push_str(line);
-        rendered.push('\n');
-
-        let Some((start, end, indent)) = parse_basic_block_address_line(line) else {
-            continue;
-        };
-
-        while next_comment < comments.len() && comments[next_comment].0 < start {
-            next_comment += 1;
-        }
-        while next_comment < comments.len() && comments[next_comment].0 <= end {
-            rendered.push_str(&indent);
-            rendered.push_str("// ");
-            rendered.push_str(&comments[next_comment].1);
-            rendered.push('\n');
-            next_comment += 1;
-        }
-    }
-
-    if trailing_newline {
-        rendered
-    } else {
-        rendered.trim_end_matches('\n').to_string()
-    }
-}
-
-fn ensure_nonempty_pseudocode(mut pseudocode: String) -> String {
-    if pseudocode.trim().is_empty() {
-        pseudocode.push_str("/* decompilation body not recoverable */");
-    }
-    pseudocode
-}
-
-fn parse_basic_block_address_line(line: &str) -> Option<(u64, u64, String)> {
-    let indent_len = line.len() - line.trim_start().len();
-    let indent = line[..indent_len].to_string();
-    let trimmed = &line[indent_len..];
-    if !trimmed.starts_with("// bb") {
-        return None;
-    }
-
-    let open = trimmed.find('[')?;
-    let close = trimmed[open + 1..].find(']')? + open + 1;
-    let range = &trimmed[open + 1..close];
-    let (start_str, end_str) = range.split_once("..")?;
-    let start = u64::from_str_radix(start_str.strip_prefix("0x")?, 16).ok()?;
-    let end = u64::from_str_radix(end_str.strip_prefix("0x")?, 16).ok()?;
-
-    Some((start, end, indent))
-}
-
 /// Builds a string table from readable data sections in the binary.
-fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
+pub(crate) fn build_string_table(fmt: &dyn BinaryFormat) -> StringTable {
     let mut table = StringTable::new();
 
     // Look for string-specific section names
@@ -3936,10 +3917,10 @@ struct ElfTlsLayout {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TlsAccessTarget {
-    tpoff: i64,
-    address: u64,
-    size: u64,
+pub(crate) struct TlsAccessTarget {
+    pub(crate) tpoff: i64,
+    pub(crate) address: u64,
+    pub(crate) size: u64,
 }
 
 fn elf_tls_layout(binary: &Binary) -> Option<ElfTlsLayout> {
@@ -3987,7 +3968,7 @@ fn tls_static_block_size(layout: ElfTlsLayout) -> Option<i64> {
     i64::try_from(aligned).ok()
 }
 
-fn build_tls_access_targets(binary: &Binary) -> Vec<TlsAccessTarget> {
+pub(crate) fn build_tls_access_targets(binary: &Binary) -> Vec<TlsAccessTarget> {
     let Some(layout) = elf_tls_layout(binary) else {
         return Vec::new();
     };
@@ -4014,7 +3995,7 @@ fn build_tls_access_targets(binary: &Binary) -> Vec<TlsAccessTarget> {
     targets
 }
 
-fn build_tls_symbol_offset_map(binary: &Binary) -> std::collections::HashMap<i64, String> {
+pub(crate) fn build_tls_symbol_offset_map(binary: &Binary) -> std::collections::HashMap<i64, String> {
     let Some(layout) = elf_tls_layout(binary) else {
         return std::collections::HashMap::new();
     };
@@ -4044,7 +4025,7 @@ fn build_tls_symbol_offset_map(binary: &Binary) -> std::collections::HashMap<i64
     offsets
 }
 
-fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
+pub(crate) fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
     let Binary::Elf(elf) = binary else {
         return std::collections::HashMap::new();
     };
@@ -4067,7 +4048,7 @@ fn build_tls_slot_map(binary: &Binary) -> std::collections::HashMap<u64, u64> {
     map
 }
 
-fn rip_relative_memory_target(
+pub(crate) fn rip_relative_memory_target(
     mem: &hexray_core::MemoryRef,
     inst: &hexray_core::Instruction,
 ) -> Option<u64> {
@@ -4134,7 +4115,7 @@ fn resolve_tls_access_target(
     None
 }
 
-fn rewrite_tls_memory_operands(
+pub(crate) fn rewrite_tls_memory_operands(
     instructions: &mut [hexray_core::Instruction],
     tls_access_targets: &[TlsAccessTarget],
     tls_slot_map: &std::collections::HashMap<u64, u64>,
@@ -4296,7 +4277,7 @@ fn rewrite_tls_memory_operands(
 }
 
 /// Builds a symbol table from the binary's symbols.
-fn build_symbol_table(binary: &Binary) -> SymbolTable {
+pub(crate) fn build_symbol_table(binary: &Binary) -> SymbolTable {
     let fmt = binary.as_format();
     let tls_layout = elf_tls_layout(binary);
     let mut table = SymbolTable::new();
@@ -4350,10 +4331,11 @@ fn build_symbol_table(binary: &Binary) -> SymbolTable {
     table
 }
 
-fn collect_throw_thunks(
+pub(crate) fn collect_throw_thunks(
     binary: &Binary,
     symbol_table: &SymbolTable,
     relocation_table: &RelocationTable,
+    scope: Option<&crate::analysis_scope::ScopeMap>,
 ) -> std::collections::HashMap<u64, String> {
     let fmt = binary.as_format();
     let arch = fmt.architecture();
@@ -4377,7 +4359,16 @@ fn collect_throw_thunks(
         } else {
             256usize
         };
-        let Some(bytes) = fmt.bytes_at(symbol.address, max_bytes) else {
+        // The cold-helper scan is part of the automatic chain: a helper inside
+        // an excluded range is never decoded.
+        let allowed = match scope {
+            Some(scope) => scope.clamp_window(symbol.address, max_bytes).0,
+            None => max_bytes,
+        };
+        if allowed == 0 {
+            continue;
+        }
+        let Some(bytes) = fmt.bytes_at(symbol.address, allowed) else {
             continue;
         };
 
@@ -4444,7 +4435,7 @@ fn is_cxx_throw_symbol_name(name: &str) -> bool {
 }
 
 /// Builds a binary data context from read-only data sections for jump table reconstruction.
-fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
+pub(crate) fn build_binary_data_context(fmt: &dyn BinaryFormat) -> BinaryDataContext {
     // Pass through the binary's endianness so the emitter decodes
     // rodata float constants with the correct byte order on
     // big-endian targets (PowerPC, MIPS-BE, big-endian ARM ELF).
@@ -4501,7 +4492,7 @@ fn is_float_constant_pool_section_name(name: &str) -> bool {
         || lower.contains("__literal16")
 }
 
-fn seed_resolved_call_target_names(
+pub(crate) fn seed_resolved_call_target_names(
     binary_data_ctx: &mut BinaryDataContext,
     symbol_table: &SymbolTable,
     relocation_table: &RelocationTable,
@@ -4510,7 +4501,13 @@ fn seed_resolved_call_target_names(
         binary_data_ctx.add_call_target_name_by_address(address, name);
     }
 
-    for (call_site, relocation) in relocation_table.call_relocations() {
+    // HashMap iteration order is per-process random, so when several call
+    // sites share a target address the last-wins name would differ between
+    // runs. Sorting by call site makes that choice deterministic.
+    let mut call_relocations: Vec<_> = relocation_table.call_relocations().collect();
+    call_relocations.sort_by_key(|(call_site, _)| *call_site);
+
+    for (call_site, relocation) in call_relocations {
         binary_data_ctx.add_call_target_name_by_call_site(call_site, relocation.symbol.clone());
         if relocation.target_addr != 0 {
             binary_data_ctx
@@ -4946,7 +4943,7 @@ fn add_ifunc_plt_aliases(binary: &Binary, symbols: &mut Vec<hexray_core::Symbol>
     }
 }
 
-fn collect_analysis_symbols(
+pub(crate) fn collect_analysis_symbols(
     binary: &Binary,
     relocations: &RelocationTable,
 ) -> Vec<hexray_core::Symbol> {
@@ -5040,7 +5037,7 @@ fn synthesize_lifecycle_array_symbols(binary: &Binary, symbols: &mut Vec<hexray_
 ///
 /// For dynamically linked binaries, this also populates GOT/PLT symbol mappings
 /// to resolve indirect calls through the GOT.
-fn build_relocation_table(binary: &Binary) -> RelocationTable {
+pub(crate) fn build_relocation_table(binary: &Binary) -> RelocationTable {
     use hexray_formats::RelocationType;
 
     let mut table = RelocationTable::new();
@@ -5216,7 +5213,7 @@ fn build_relocation_table(binary: &Binary) -> RelocationTable {
 /// Loads a type database based on the specified type library option.
 /// If no option is given, returns None.
 /// If "auto" is specified, selects based on binary format (linux/macos).
-fn load_type_database(
+pub(crate) fn load_type_database(
     binary: &Binary,
     types_opt: Option<&str>,
 ) -> Result<Option<std::sync::Arc<TypeDatabase>>> {
@@ -5283,7 +5280,23 @@ fn load_type_database(
 /// Returns None if DWARF sections are not present.
 fn load_dwarf_info(binary_path: &Path, binary: &Binary) -> Option<DebugInfo> {
     let fmt = binary.as_format();
+    let parsed = parse_dwarf_from_sections(fmt)?;
+    let address_size = dwarf_address_size(fmt);
+    load_split_dwarf_info(binary_path, fmt, &parsed, address_size).or(Some(parsed))
+}
 
+fn dwarf_address_size(fmt: &dyn BinaryFormat) -> u8 {
+    match fmt.architecture() {
+        Architecture::X86 | Architecture::RiscV32 => 4,
+        _ => 8,
+    }
+}
+
+/// Parse the DWARF sections of an already-loaded image.
+///
+/// Kept separate from [`load_dwarf_info`] so a reopened database can parse its
+/// embedded bytes without searching the filesystem.
+pub(crate) fn parse_dwarf_from_sections(fmt: &dyn BinaryFormat) -> Option<DebugInfo> {
     // Get DWARF sections
     let debug_info = fmt
         .sections()
@@ -5318,14 +5331,7 @@ fn load_dwarf_info(binary_path: &Path, binary: &Binary) -> Option<DebugInfo> {
         .find(|s| s.name() == ".debug_addr" || s.name() == "__debug_addr")
         .map(|s| s.data());
 
-    // Determine address size based on architecture
-    let address_size = match fmt.architecture() {
-        Architecture::X86 | Architecture::RiscV32 => 4,
-        _ => 8,
-    };
-
-    // Parse DWARF info
-    let parsed = parse_debug_info(
+    parse_debug_info(
         debug_info,
         debug_abbrev,
         debug_str,
@@ -5334,22 +5340,60 @@ fn load_dwarf_info(binary_path: &Path, binary: &Binary) -> Option<DebugInfo> {
         debug_loclists,
         debug_str_offsets,
         debug_addr,
+        dwarf_address_size(fmt),
+    )
+    .ok()
+}
+
+/// Parse split-DWARF (`.dwo`) bytes that were stored inside a project.
+///
+/// The image's own `.debug_addr` supplies the address table, exactly as the
+/// on-disk path does.
+pub(crate) fn parse_split_dwarf_bytes(
+    bytes: &[u8],
+    fmt: &dyn BinaryFormat,
+    address_size: u8,
+) -> Option<DebugInfo> {
+    let elf = Elf::parse(bytes).ok()?;
+    let section = |names: &[&str]| -> Option<&[u8]> {
+        elf.sections()
+            .find(|section| names.iter().any(|name| section.name() == *name))
+            .map(|section| section.data())
+    };
+    let debug_info = section(&[".debug_info.dwo", ".debug_info"])?;
+    let debug_abbrev = section(&[".debug_abbrev.dwo", ".debug_abbrev"])?;
+    let debug_str = section(&[".debug_str.dwo", ".debug_str"]);
+    let debug_line = section(&[".debug_line.dwo", ".debug_line"]);
+    let debug_loclists = section(&[".debug_loclists.dwo", ".debug_loclists"]);
+    let debug_str_offsets = section(&[".debug_str_offsets.dwo", ".debug_str_offsets"]);
+    let debug_addr = fmt
+        .sections()
+        .find(|section| section.name() == ".debug_addr" || section.name() == "__debug_addr")
+        .map(|section| section.data());
+
+    parse_debug_info(
+        debug_info,
+        debug_abbrev,
+        debug_str,
+        debug_line,
+        None,
+        debug_loclists,
+        debug_str_offsets,
+        debug_addr,
         address_size,
     )
-    .ok()?;
-
-    load_split_dwarf_info(binary_path, fmt, &parsed, address_size).or(Some(parsed))
+    .ok()
 }
 
 #[derive(Default)]
-struct DwarfFunctionNames {
-    stack_names: std::collections::HashMap<i128, String>,
-    parameter_names: Vec<String>,
-    local_scope_ranges: std::collections::HashMap<String, (u64, u64)>,
+pub(crate) struct DwarfFunctionNames {
+    pub(crate) stack_names: std::collections::HashMap<i128, String>,
+    pub(crate) parameter_names: Vec<String>,
+    pub(crate) local_scope_ranges: std::collections::HashMap<String, (u64, u64)>,
 }
 
 /// Gets DWARF variable and parameter names for a function at the given address.
-fn get_dwarf_function_names(
+pub(crate) fn get_dwarf_function_names(
     debug_info: &DebugInfo,
     func_addr: u64,
     binary: &Binary,
@@ -5745,7 +5789,7 @@ fn apply_data_relocations(
     }
 }
 
-fn apply_instruction_relocations(
+pub(crate) fn apply_instruction_relocations(
     instructions: &mut [hexray_core::Instruction],
     relocations: &RelocationTable,
 ) {
@@ -5753,7 +5797,7 @@ fn apply_instruction_relocations(
     apply_data_relocations(instructions, relocations);
 }
 
-fn collect_noreturn_call_sites(
+pub(crate) fn collect_noreturn_call_sites(
     instructions: &[hexray_core::Instruction],
     fmt: &dyn BinaryFormat,
     relocations: &RelocationTable,
@@ -5780,10 +5824,16 @@ fn collect_noreturn_call_sites(
 // coverage, including partially symbolized CET/IBT binaries. Callers
 // can still layer additional discoveries on top (for example
 // round-6.5's xref call-target seeding).
-fn discover_function_starts(
+//
+// `scope` only limits the whole-range ENDBR sweep: symbol and lifecycle-array
+// seeds are data the caller already owns, and filtering them is the caller's
+// job. Passing `None` keeps the unrestricted behaviour the bare-file commands
+// rely on.
+pub(crate) fn discover_function_starts(
     fmt: &dyn BinaryFormat,
     arch: Architecture,
     symbols: &[hexray_core::Symbol],
+    scope: Option<&crate::analysis_scope::ScopeMap>,
 ) -> Vec<(u64, u64, bool)> {
     let mut starts: Vec<_> = symbols
         .iter()
@@ -5803,7 +5853,7 @@ fn discover_function_starts(
     // (for example dynsym plus a handful of local labels). Always fold in
     // ENDBR-derived starts on x86 so xref/callgraph scans still reach the
     // unsymbolized bodies that make direct calls into PLT stubs.
-    starts.extend(discover_stripped_x86_function_seeds(fmt, arch));
+    starts.extend(discover_stripped_x86_function_seeds(fmt, arch, scope));
 
     starts.extend(
         discover_lifecycle_array_entries(fmt)
@@ -5835,6 +5885,7 @@ fn discover_function_starts(
 fn discover_stripped_x86_function_seeds(
     fmt: &dyn BinaryFormat,
     arch: Architecture,
+    scope: Option<&crate::analysis_scope::ScopeMap>,
 ) -> Vec<(u64, u64, bool)> {
     let pattern: &[u8] = match arch {
         Architecture::X86_64 => &[0xf3, 0x0f, 0x1e, 0xfa],
@@ -5844,15 +5895,31 @@ fn discover_stripped_x86_function_seeds(
 
     let mut seeds = Vec::new();
     for section in fmt.executable_sections() {
-        let starts =
-            discover_endbr_function_starts(section.virtual_address(), section.data(), pattern);
-        for (idx, start) in starts.iter().enumerate() {
-            let end = starts
-                .get(idx + 1)
-                .copied()
-                .unwrap_or_else(|| section.virtual_address().saturating_add(section.size()));
-            let size = end.saturating_sub(*start).max(pattern.len() as u64);
-            seeds.push((*start, size, false));
+        let base = section.virtual_address();
+        let section_end = base.saturating_add(section.size());
+        // Sweep only the bytes the scope leaves included: a fully excluded
+        // section costs nothing, and a partially excluded one is scanned over
+        // its included sub-ranges instead of being scanned and then filtered.
+        let ranges = match scope {
+            Some(scope) => scope.included_ranges(base, section_end),
+            None => vec![(base, section_end)],
+        };
+        for (range_start, range_end) in ranges {
+            let Ok(offset) = usize::try_from(range_start.saturating_sub(base)) else {
+                continue;
+            };
+            let Ok(length) = usize::try_from(range_end.saturating_sub(range_start)) else {
+                continue;
+            };
+            let Some(data) = section.data().get(offset..offset.saturating_add(length)) else {
+                continue;
+            };
+            let starts = discover_endbr_function_starts(range_start, data, pattern);
+            for (idx, start) in starts.iter().enumerate() {
+                let end = starts.get(idx + 1).copied().unwrap_or(range_end);
+                let size = end.saturating_sub(*start).max(pattern.len() as u64);
+                seeds.push((*start, size, false));
+            }
         }
     }
 
@@ -5879,7 +5946,7 @@ fn discover_endbr_function_starts(section_addr: u64, bytes: &[u8], pattern: &[u8
         .collect()
 }
 
-fn discover_materialized_internal_targets(
+pub(crate) fn discover_materialized_internal_targets(
     instructions: &[hexray_core::Instruction],
     fmt: &dyn BinaryFormat,
 ) -> Vec<u64> {
@@ -6330,7 +6397,7 @@ fn build_callgraph(
     // Note: Mach-O symbols don't have size info (nlist doesn't store it),
     // so we use a default size for symbols with size == 0
     let functions_to_analyze: Vec<(u64, String, u64, bool)> = if target == "all" {
-        discover_function_starts(fmt, arch, &symbols)
+        discover_function_starts(fmt, arch, &symbols, None)
             .into_iter()
             .map(|(addr, size, heuristic_bounds)| {
                 let name = find_preferred_symbol_at(&symbols, addr)
@@ -6910,7 +6977,6 @@ fn decompile_with_follow(
     use std::collections::HashSet;
 
     let fmt = binary.as_format();
-    let arch = fmt.architecture();
     let relocation_table = build_relocation_table(binary);
 
     // Track which functions we've already decompiled to avoid duplicates
@@ -6925,28 +6991,20 @@ fn decompile_with_follow(
 
     queue.push((start_addr, name, 0));
 
-    // Build tables once for all decompilations
-    let string_table = build_string_table(fmt);
-    let mut symbol_table = build_symbol_table(binary);
-    // Merge project function names into symbol table
-    if let Some(proj) = project {
-        for addr in proj.overridden_functions() {
-            if let Some(name) = proj.get_function_name(addr) {
-                symbol_table.insert(addr, name.to_string());
-            }
-        }
-    }
-    let throw_thunks = collect_throw_thunks(binary, &symbol_table, &relocation_table);
-    let binary_data_ctx = build_binary_data_context(fmt);
-    let tls_access_targets = build_tls_access_targets(binary);
-    let tls_symbol_offsets = build_tls_symbol_offset_map(binary);
-    let tls_slot_map = build_tls_slot_map(binary);
-
-    // Create constant database for magic number recognition
-    let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
-
-    // Try to load DWARF debug info once
+    // Every image-wide table is built once, through the same constructor the
+    // database path uses.
     let debug_info = load_dwarf_info(binary_path, binary);
+    let shared = analysis_pipeline::SharedAnalysisContext::build(
+        binary,
+        analysis_pipeline::SharedTables {
+            project,
+            type_db,
+            debug_info,
+            names: &[],
+            scope: None,
+        },
+    );
+    let overlay = analysis_pipeline::CommentOverlay::from_project(project);
 
     while let Some((func_addr, func_name, depth)) = queue.pop() {
         if decompiled.contains(&func_addr) {
@@ -6980,100 +7038,57 @@ fn decompile_with_follow(
             func_name, func_addr, depth
         );
 
-        // Disassemble
         let DecompileTargetInfo {
             max_bytes,
             stop_after_first_return,
             ..
         } = decompile_target_info_for_address(fmt, project, func_addr);
-
-        let bytes = match fmt.bytes_at(func_addr, max_bytes) {
-            Some(b) => b,
-            None => continue,
+        let Ok((instructions, _)) =
+            disassemble_window(fmt, func_addr, max_bytes, stop_after_first_return, false)
+        else {
+            continue;
         };
+        let instructions: std::sync::Arc<[hexray_core::Instruction]> = instructions.into();
 
-        let mut instructions = match arch {
-            Architecture::X86_64 | Architecture::X86 => {
-                let disasm = X86_64Disassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            Architecture::Arm64 => {
-                let disasm = Arm64Disassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            Architecture::RiscV64 => {
-                let disasm = RiscVDisassembler::new();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            Architecture::RiscV32 => {
-                let disasm = RiscVDisassembler::new_rv32();
-                disassemble_for_cfg(&disasm, fmt, bytes, func_addr, stop_after_first_return)
-            }
-            _ => continue,
+        let inputs = analysis_pipeline::AnalysisInputs {
+            shared: &shared,
+            config,
+            diagnostics,
+            signature_override: None,
+            variable_overrides: &[],
+            decoded: None,
+            scope_map: None,
         };
-        apply_instruction_relocations(&mut instructions, &relocation_table);
-        crate::rewrite_tls_memory_operands(&mut instructions, &tls_access_targets, &tls_slot_map);
-        let noreturn_call_sites =
-            collect_noreturn_call_sites(&instructions, fmt, &relocation_table);
-
-        // Build CFG
-        let cfg = CfgBuilder::build_with_binary_context_and_noreturn_calls(
-            &instructions,
+        let analyzed = match analysis_pipeline::analyze_decoded(
+            binary,
             func_addr,
-            &binary_data_ctx,
-            &noreturn_call_sites,
-        );
-
-        // Get DWARF variable and parameter names for this function.
-        let dwarf_names = if let Some(ref di) = debug_info {
-            get_dwarf_function_names(di, func_addr, binary)
-        } else {
-            DwarfFunctionNames::default()
-        };
-
-        // Decompile
-        let calling_convention = default_calling_convention(
-            match binary {
-                Binary::Elf(_) => BinaryType::Elf,
-                Binary::MachO(_) => BinaryType::MachO,
-                Binary::Pe(_) => BinaryType::Pe,
+            func_name.clone(),
+            None,
+            max_bytes,
+            stop_after_first_return,
+            &analysis_pipeline::DecodedFunction {
+                instructions,
+                decoded_end: func_addr,
+                stop_reason: analysis_pipeline::DecodeStopReason::RangeEnd,
             },
-            arch,
-        );
-        let mut decompiler = Decompiler::new()
-            .with_addresses(show_addresses)
-            .with_string_table(string_table.clone())
-            .with_symbol_table(symbol_table.clone())
-            .with_relocation_table(relocation_table.clone())
-            .with_tls_symbol_offsets(tls_symbol_offsets.clone())
-            .with_throw_thunks(throw_thunks.clone())
-            .with_dwarf_names(dwarf_names.stack_names)
-            .with_dwarf_param_names(dwarf_names.parameter_names)
-            .with_dwarf_scope_ranges(dwarf_names.local_scope_ranges)
-            .with_constant_database(const_db.clone())
-            .with_struct_inference(true)
-            .with_calling_convention(calling_convention);
-        decompiler = decompiler.analyze_cpp_special(&cfg, &instructions, Some(&func_name));
-        if let Some(info) = binary.exception_info_for_function(func_addr, func_addr, &relocation_table) {
-            decompiler = decompiler.with_exception_info(info);
-        }
-        if let Some(db) = type_db {
-            decompiler = decompiler.with_type_database(db.clone());
-        }
-        if let Some(cfg_opts) = config {
-            decompiler = decompiler.with_config(cfg_opts.clone());
-        }
-        if diagnostics {
-            let signature = decompiler.recover_signature(&cfg);
-            print_signature_diagnostics(&func_name, &signature);
-        }
-        let pseudocode = ensure_nonempty_pseudocode(annotate_pseudocode_with_project_comments(
-            decompiler.decompile(&cfg, &func_name),
-            project,
-            show_addresses,
-        ));
+            &inputs,
+        ) {
+            Ok(analyzed) => analyzed,
+            Err(error) => {
+                eprintln!("error: {error}");
+                continue;
+            }
+        };
+        let instructions = analyzed.instructions.clone();
+        let rendered = analysis_pipeline::render_function(
+            analyzed,
+            &analysis_pipeline::RenderOptions {
+                show_addresses,
+                comments: Some(overlay.clone()),
+            },
+        )?;
 
-        println!("{}", pseudocode);
+        println!("{}", rendered.text);
 
         // If we haven't reached max depth, find internal calls to follow
         if depth < max_depth {
@@ -7105,7 +7120,7 @@ fn decompile_with_follow(
     Ok(())
 }
 
-fn print_signature_diagnostics(name: &str, signature: &hexray_analysis::FunctionSignature) {
+pub(crate) fn print_signature_diagnostics(name: &str, signature: &hexray_analysis::FunctionSignature) {
     let mut printed_any = false;
     for (idx, param) in signature.parameters.iter().enumerate() {
         if !matches!(
@@ -7159,7 +7174,7 @@ fn print_signature_diagnostics(name: &str, signature: &hexray_analysis::Function
 /// Extract internal call targets from instructions.
 /// Returns addresses of functions that are called within this function.
 /// Also detects function pointers passed as arguments (e.g., main passed to __libc_start_main).
-fn extract_internal_call_targets(
+pub(crate) fn extract_internal_call_targets(
     instructions: &[hexray_core::Instruction],
     fmt: &dyn BinaryFormat,
 ) -> Vec<(u64, String)> {
@@ -7262,96 +7277,6 @@ fn extract_internal_call_targets(
     targets
 }
 
-/// Build a DecompilerConfig from CLI options.
-fn build_decompiler_config(
-    opt_level: &str,
-    enable_passes: &[String],
-    disable_passes: &[String],
-) -> Result<DecompilerConfig> {
-    // Parse optimization level
-    let level = match opt_level {
-        "0" | "none" => OptimizationLevel::None,
-        "1" | "basic" => OptimizationLevel::Basic,
-        "2" | "standard" => OptimizationLevel::Standard,
-        "3" | "aggressive" => OptimizationLevel::Aggressive,
-        other => bail!(
-            "Invalid optimization level '{}'. Use: 0/none, 1/basic, 2/standard, 3/aggressive",
-            other
-        ),
-    };
-
-    let mut config = DecompilerConfig::new(level);
-
-    // Apply enabled passes
-    for pass_name in enable_passes {
-        let pass = parse_pass_name(pass_name)?;
-        config = config.enable_pass(pass);
-    }
-
-    // Apply disabled passes
-    for pass_name in disable_passes {
-        let pass = parse_pass_name(pass_name)?;
-        config = config.disable_pass(pass);
-    }
-
-    Ok(config)
-}
-
-/// Parse a pass name string into an OptimizationPass.
-fn parse_pass_name(name: &str) -> Result<OptimizationPass> {
-    match name.to_lowercase().as_str() {
-        "call-arg-propagation" | "call_arg_propagation" => Ok(OptimizationPass::CallArgPropagation),
-        "return-value-merge" | "return_value_merge" => Ok(OptimizationPass::ReturnValueMerge),
-        "temp-simplification" | "temp_simplification" => Ok(OptimizationPass::TempSimplification),
-        "for-loop-detection" | "for_loop_detection" => Ok(OptimizationPass::ForLoopDetection),
-        "loop-invariant-hoisting" | "loop_invariant_hoisting" => {
-            Ok(OptimizationPass::LoopInvariantHoisting)
-        }
-        "loop-pattern-detection" | "loop_pattern_detection" => {
-            Ok(OptimizationPass::LoopPatternDetection)
-        }
-        "switch-detection" | "switch_detection" => Ok(OptimizationPass::SwitchDetection),
-        "short-circuit-detection" | "short_circuit_detection" => {
-            Ok(OptimizationPass::ShortCircuitDetection)
-        }
-        "goto-conversion" | "goto_conversion" => Ok(OptimizationPass::GotoConversion),
-        "guard-clause-flattening" | "guard_clause_flattening" => {
-            Ok(OptimizationPass::GuardClauseFlattening)
-        }
-        "expression-simplification" | "expression_simplification" => {
-            Ok(OptimizationPass::ExpressionSimplification)
-        }
-        "string-pattern-detection" | "string_pattern_detection" => {
-            Ok(OptimizationPass::StringPatternDetection)
-        }
-        "arch-pattern-simplification" | "arch_pattern_simplification" => {
-            Ok(OptimizationPass::ArchPatternSimplification)
-        }
-        "dead-store-elimination" | "dead_store_elimination" => {
-            Ok(OptimizationPass::DeadStoreElimination)
-        }
-        "linked-list-detection" | "linked_list_detection" => {
-            Ok(OptimizationPass::LinkedListDetection)
-        }
-        "variable-naming" | "variable_naming" => Ok(OptimizationPass::VariableNaming),
-        "loop-canonicalization" | "loop_canonicalization" => {
-            Ok(OptimizationPass::LoopCanonicalization)
-        }
-        "memset-idiom-detection" | "memset_idiom_detection" => {
-            Ok(OptimizationPass::MemsetIdiomDetection)
-        }
-        "constant-propagation" | "constant_propagation" => {
-            Ok(OptimizationPass::ConstantPropagation)
-        }
-        "type-inference" | "type_inference" => Ok(OptimizationPass::TypeInference),
-        "switch-recovery" | "switch_recovery" => Ok(OptimizationPass::SwitchRecovery),
-        other => bail!(
-            "Unknown optimization pass '{}'. Use --list-passes to see available passes.",
-            other
-        ),
-    }
-}
-
 /// Print available optimization passes.
 fn print_optimization_passes() {
     println!("Available optimization passes:\n");
@@ -7422,7 +7347,7 @@ fn build_xrefs(
     // Start from the same function-start seeds used by `callgraph all`, then
     // also walk discovered internal callees so stripped callers still
     // contribute xrefs.
-    let functions_to_analyze = discover_function_starts(fmt, arch, &symbols);
+    let functions_to_analyze = discover_function_starts(fmt, arch, &symbols, None);
 
     let is_internal_code = |addr: u64| -> bool {
         fmt.executable_sections().any(|sec| {
@@ -7593,7 +7518,7 @@ fn build_xrefs(
         // real functions and would otherwise dominate the lookup, so we
         // exclude anything starting with __mh_.
         let mut function_starts: Vec<(u64, Option<String>, u64)> =
-            discover_function_starts(fmt, arch, &symbols)
+            discover_function_starts(fmt, arch, &symbols, None)
                 .into_iter()
                 .filter_map(|(addr, size, _)| {
                     let symbol = fmt.symbol_at(addr);
@@ -9289,7 +9214,7 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     .unwrap_or_else(|| format!("sub_{:x}", addr));
 
                 let relocations = build_relocation_table(binary);
-                let throw_thunks = collect_throw_thunks(binary, &symbols, &relocations);
+                let throw_thunks = collect_throw_thunks(binary, &symbols, &relocations, None);
                 let const_db = Arc::new(hexray_types::ConstantDatabase::with_builtins());
                 let calling_convention = default_calling_convention(
                     match binary {
@@ -9313,8 +9238,9 @@ fn execute_repl_command(session: &mut Session, binary: &Binary<'_>, line: &str) 
                     decompiler = decompiler.with_exception_info(info);
                 }
 
-                let pseudo_code =
-                    ensure_nonempty_pseudocode(decompiler.decompile(&cfg, &func_name));
+                let pseudo_code = analysis_pipeline::ensure_nonempty_pseudocode(
+                    decompiler.decompile(&cfg, &func_name),
+                );
 
                 if json_mode {
                     let result = JsonDecompile {
@@ -9448,7 +9374,7 @@ fn parse_address_str(s: &str) -> Result<u64> {
 /// (notably CUDA SASS until M3 lands). The previous behaviour silently
 /// delegated to `X86_64Disassembler`, which would happily emit plausible-but-
 /// wrong instructions from a CUBIN's `.text.*` bytes.
-fn disassemble_block_for_arch(
+pub(crate) fn disassemble_block_for_arch(
     arch: Architecture,
     bytes: &[u8],
     start_addr: u64,
@@ -10035,7 +9961,7 @@ fn print_amdgpu_info(view: &hexray_formats::CodeObjectView<'_>) {
 /// canonical SM names (`sm_80`, `sm_90a`); AMDGPU targets render as full
 /// target IDs (`gfx906`, `gfx90a:xnack+`); other architectures fall back
 /// to their short name plus any ABI-specific detail we'd otherwise lose.
-fn format_arch_for_info(arch: Architecture) -> String {
+pub(crate) fn format_arch_for_info(arch: Architecture) -> String {
     match arch {
         Architecture::Cuda(hexray_core::CudaArchitecture::Sass(sm)) => {
             format!(
@@ -10071,12 +9997,13 @@ mod tests {
         patch_affects_function, resolve_analysis_target, resolve_analysis_target_with_entry_main,
         resolve_materialized_callback_targets, resolve_relocatable_elf_personality,
         resolve_relocation_symbol, resolve_xref_source_label, resolve_xref_target_addresses,
-        string_tags, truncate_for_display, DiffPatchAddressSpace, FileAddressRange,
-        ResolvedAnalysisTarget, SessionExportFormat, SymbolLookupMode,
+        seed_resolved_call_target_names, string_tags, truncate_for_display,
+        DiffPatchAddressSpace, FileAddressRange, ResolvedAnalysisTarget, SessionExportFormat,
+        SymbolLookupMode,
     };
     use hexray_analysis::{
-        CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable, StringEncoding,
-        XrefType,
+        BinaryDataContext, CallGraph, CallSite, CallType, DetectedString, Patch, RelocationTable,
+        StringEncoding, SymbolTable, XrefType,
     };
     use hexray_core::{
         register::x86, Architecture, Bitness, ControlFlow, Endianness, Immediate, Instruction,
@@ -10167,6 +10094,10 @@ mod tests {
 
         fn size(&self) -> u64 {
             self.data.len() as u64
+        }
+
+        fn file_offset(&self) -> u64 {
+            0
         }
 
         fn data(&self) -> &[u8] {
@@ -11110,7 +11041,7 @@ mod tests {
             entry_point: None,
         };
 
-        let seeds = discover_stripped_x86_function_seeds(&binary, Architecture::X86_64);
+        let seeds = discover_stripped_x86_function_seeds(&binary, Architecture::X86_64, None);
 
         assert_eq!(seeds, vec![(0x401020, 8, false), (0x401028, 6, false)]);
     }
@@ -11132,7 +11063,7 @@ mod tests {
             entry_point: Some(0x401000),
         };
 
-        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols);
+        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols, None);
 
         assert_eq!(
             starts,
@@ -11171,7 +11102,7 @@ mod tests {
             entry_point: None,
         };
 
-        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols);
+        let starts = discover_function_starts(&binary, Architecture::X86_64, &binary.symbols, None);
 
         assert!(starts.iter().any(|(addr, _, _)| *addr == 0x401156));
         assert!(starts.iter().any(|(addr, _, _)| *addr == 0x401193));
@@ -12544,5 +12475,39 @@ mod tests {
         assert_eq!(resolved.name.as_deref(), Some("__gxx_personality_v0"));
         assert_eq!(resolved.addr, 0);
         assert!(resolved.resolved_via_relocation);
+    }
+
+    #[test]
+    fn seed_resolved_call_target_names_is_independent_of_hashmap_order() {
+        let forward = {
+            let mut table = RelocationTable::new();
+            table.insert_call(0x1010, "callee_from_low_site".to_string(), 0x5000, false);
+            table.insert_call(0x2020, "callee_from_high_site".to_string(), 0x5000, false);
+            table
+        };
+        let reversed = {
+            let mut table = RelocationTable::new();
+            table.insert_call(0x2020, "callee_from_high_site".to_string(), 0x5000, false);
+            table.insert_call(0x1010, "callee_from_low_site".to_string(), 0x5000, false);
+            table
+        };
+
+        for table in [forward, reversed] {
+            let mut ctx = BinaryDataContext::new();
+            seed_resolved_call_target_names(&mut ctx, &SymbolTable::new(), &table);
+            // Sorted seeding lets the highest call site own the shared target name.
+            assert_eq!(
+                ctx.call_target_name_by_address(0x5000),
+                Some("callee_from_high_site")
+            );
+            assert_eq!(
+                ctx.call_target_name_by_call_site(0x1010),
+                Some("callee_from_low_site")
+            );
+            assert_eq!(
+                ctx.call_target_name_by_call_site(0x2020),
+                Some("callee_from_high_site")
+            );
+        }
     }
 }

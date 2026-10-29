@@ -126,22 +126,38 @@ pub fn analyze_with_builtin_db(
     binary_data: Option<&BinaryDataContext>,
     pointer_size: usize,
 ) -> StackStructBindings {
+    let mut bindings = StackStructBindings::new();
+    bindings.analyze(nodes, builtin_db_for(pointer_size), binary_data);
+    bindings
+}
+
+/// The builtin DB with the caller's pointer width, cached per width.
+///
+/// The previous code deep-cloned the whole posix/linux/libc table on every
+/// call just to override `arch`, paying a full copy per decompiled function.
+/// Every real target is 32- or 64-bit; any other width uses the LP64 copy.
+fn builtin_db_for(pointer_size: usize) -> &'static TypeDatabase {
+    use std::sync::LazyLock;
+
+    static DB32: LazyLock<TypeDatabase> = LazyLock::new(|| builtin_db_with_arch(4));
+    static DB64: LazyLock<TypeDatabase> = LazyLock::new(|| builtin_db_with_arch(8));
+
+    if pointer_size == 4 {
+        &DB32
+    } else {
+        &DB64
+    }
+}
+
+fn builtin_db_with_arch(pointer_size: usize) -> TypeDatabase {
     use hexray_types::database::ArchInfo;
-    // Clone the cached posix/linux/libc DB and override its arch with
-    // the caller's pointer width. The clone is cheap relative to
-    // re-building the type library and is the simplest way to keep
-    // the smart-pointer size derivation (which reads
-    // `db.arch().pointer_size`) in sync with the binary's actual
-    // word size on 32-bit targets.
     let mut db = builtin_db().clone();
     db.set_arch(ArchInfo {
         pointer_size,
         long_size: pointer_size,
         big_endian: false,
     });
-    let mut bindings = StackStructBindings::new();
-    bindings.analyze(nodes, &db, binary_data);
-    bindings
+    db
 }
 
 /// Shared posix + linux + libc type DB, initialised once. Sibling modules

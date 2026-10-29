@@ -149,6 +149,10 @@ impl crate::Section for SectionHeader {
         &self.name
     }
 
+    fn file_offset(&self) -> u64 {
+        u64::from(self.pointer_to_raw_data)
+    }
+
     fn virtual_address(&self) -> u64 {
         self.image_base.saturating_add(self.virtual_address as u64)
     }

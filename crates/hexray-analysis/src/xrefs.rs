@@ -625,6 +625,12 @@ mod tests {
             self.data.len() as u64
         }
 
+        fn file_offset(&self) -> u64 {
+            // The synthetic test image has no file backing; virtual and file
+            // coordinates coincide.
+            self.virtual_address
+        }
+
         fn data(&self) -> &[u8] {
             &self.data
         }

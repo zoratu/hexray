@@ -76,7 +76,7 @@ fn parse_register_id(arch: Architecture, value: &str) -> Result<u16> {
 }
 
 /// Static emulation actions.
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 pub enum EmulateAction {
     /// Execute from a start address and trace execution path
     Run {

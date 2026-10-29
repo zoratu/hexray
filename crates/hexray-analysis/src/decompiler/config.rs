@@ -354,6 +354,42 @@ impl DecompilerConfig {
             .collect()
     }
 
+    /// Returns the base optimization level of this configuration.
+    pub fn level(&self) -> OptimizationLevel {
+        self.level
+    }
+
+    /// Returns the names of the enabled passes, sorted and deduplicated.
+    ///
+    /// The order is canonical (lexicographic) so callers can hash it into a
+    /// stable configuration fingerprint without depending on enum or hash-set
+    /// iteration order. Pass *selection* is unchanged; this is read-only.
+    pub fn enabled_pass_names(&self) -> Vec<&'static str> {
+        Self::sorted_pass_names(self.enabled_passes().into_iter())
+    }
+
+    /// Returns the names of the passes that are **not** enabled, sorted and
+    /// deduplicated.
+    ///
+    /// Complements [`Self::enabled_pass_names`] so a fingerprint can pin both
+    /// directions of the explicit enable/disable overrides.
+    pub fn disabled_pass_names(&self) -> Vec<&'static str> {
+        Self::sorted_pass_names(
+            OptimizationPass::all()
+                .iter()
+                .copied()
+                .filter(|&p| !self.is_pass_enabled(p)),
+        )
+    }
+
+    /// Collects pass names into a sorted, deduplicated vector.
+    fn sorted_pass_names(passes: impl Iterator<Item = OptimizationPass>) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = passes.map(|p| p.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
     /// Lists all available passes with their enabled status.
     pub fn list_passes(&self) -> Vec<(OptimizationPass, bool, &'static str)> {
         OptimizationPass::all()
@@ -527,5 +563,62 @@ mod tests {
 
         let config = DecompilerConfig::from_swarm_bits(0x00FF_FFFF);
         assert!(config.describe().starts_with("24/"));
+    }
+
+    #[test]
+    fn test_level_accessor_matches_field() {
+        for level in [
+            OptimizationLevel::None,
+            OptimizationLevel::Basic,
+            OptimizationLevel::Standard,
+            OptimizationLevel::Aggressive,
+        ] {
+            assert_eq!(DecompilerConfig::new(level).level(), level);
+        }
+    }
+
+    #[test]
+    fn test_enabled_pass_names_sorted_and_unique() {
+        let config = DecompilerConfig::aggressive();
+        let names = config.enabled_pass_names();
+
+        assert!(!names.is_empty(), "aggressive enables every pass");
+        assert_eq!(
+            names.len(),
+            OptimizationPass::all().len(),
+            "aggressive enables exactly the known pass set"
+        );
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "names must be sorted and deduplicated");
+
+        // Read-only accessor: the pass selection itself is untouched.
+        assert_eq!(config.enabled_passes().len(), names.len());
+    }
+
+    #[test]
+    fn test_enabled_and_disabled_pass_names_partition_all_passes() {
+        let config = DecompilerConfig::standard()
+            .disable_pass(OptimizationPass::VariableNaming)
+            .enable_pass(OptimizationPass::InlineAsmFilter);
+
+        let enabled = config.enabled_pass_names();
+        let disabled = config.disabled_pass_names();
+
+        assert!(enabled.contains(&"inline-asm-filter"));
+        assert!(!enabled.contains(&"variable-naming"));
+        assert!(disabled.contains(&"variable-naming"));
+        assert!(!disabled.contains(&"inline-asm-filter"));
+
+        let mut union: Vec<&str> = enabled.iter().chain(disabled.iter()).copied().collect();
+        union.sort_unstable();
+        assert_eq!(union.len(), OptimizationPass::all().len());
+        union.dedup();
+        assert_eq!(union.len(), OptimizationPass::all().len());
+
+        let mut disabled_sorted = disabled.clone();
+        disabled_sorted.sort_unstable();
+        assert_eq!(disabled, disabled_sorted);
     }
 }

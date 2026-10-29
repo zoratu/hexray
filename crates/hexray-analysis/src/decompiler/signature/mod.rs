@@ -208,9 +208,12 @@ pub struct SignatureRecovery {
     /// String functions for detection.
     string_functions: HashSet<&'static str>,
     /// Optional relocation table for resolving IndirectGot call targets.
-    relocation_table: Option<RelocationTable>,
+    ///
+    /// Image-wide and shared by `Arc`; one recovery run per function never
+    /// copies it.
+    relocation_table: Option<Arc<RelocationTable>>,
     /// Optional symbol table for resolving direct-call targets.
-    symbol_table: Option<SymbolTable>,
+    symbol_table: Option<Arc<SymbolTable>>,
     /// Optional inter-procedural summary database for signature hints.
     summary_database: Option<Arc<super::interprocedural::SummaryDatabase>>,
     /// Optional read-only binary data for resolving string-literal arguments.
@@ -1699,12 +1702,27 @@ impl SignatureRecovery {
 
     /// Provides relocation data for resolving indirect GOT call targets.
     pub fn with_relocation_table(mut self, relocation_table: Option<RelocationTable>) -> Self {
+        self.relocation_table = relocation_table.map(Arc::new);
+        self
+    }
+
+    /// Provides relocation data from an already shared table.
+    pub fn with_relocation_table_arc(
+        mut self,
+        relocation_table: Option<Arc<RelocationTable>>,
+    ) -> Self {
         self.relocation_table = relocation_table;
         self
     }
 
     /// Provides symbol names for resolving direct call targets.
     pub fn with_symbol_table(mut self, symbol_table: Option<SymbolTable>) -> Self {
+        self.symbol_table = symbol_table.map(Arc::new);
+        self
+    }
+
+    /// Provides symbol names from an already shared table.
+    pub fn with_symbol_table_arc(mut self, symbol_table: Option<Arc<SymbolTable>>) -> Self {
         self.symbol_table = symbol_table;
         self
     }
@@ -1719,8 +1737,18 @@ impl SignatureRecovery {
     }
 
     /// Provides read-only binary data for resolving string-literal arguments.
+    ///
+    /// The context is copied shallowly: section bytes are `Arc<[u8]>`, so the
+    /// per-function recovery instance shares them with the image-wide context
+    /// instead of duplicating megabytes of `.rodata`.
     pub fn with_binary_data(mut self, binary_data: Option<&BinaryDataContext>) -> Self {
         self.binary_data = binary_data.cloned().map(Arc::new);
+        self
+    }
+
+    /// Provides read-only binary data from an already shared context.
+    pub fn with_binary_data_arc(mut self, binary_data: Option<Arc<BinaryDataContext>>) -> Self {
+        self.binary_data = binary_data;
         self
     }
 

@@ -188,6 +188,10 @@ impl Section for SectionHeader {
         self.name_cache.as_deref().unwrap_or("")
     }
 
+    fn file_offset(&self) -> u64 {
+        self.sh_offset
+    }
+
     fn virtual_address(&self) -> u64 {
         // For relocatable files, use file offset as the virtual address
         // since sh_addr is typically 0 in .o files

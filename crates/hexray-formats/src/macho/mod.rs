@@ -190,6 +190,25 @@ impl<'a> MachO<'a> {
         self.offset != 0
     }
 
+    /// Byte offset of this slice inside the file it was parsed from.
+    ///
+    /// Zero for a thin Mach-O; the fat-container offset otherwise. Needed by
+    /// consumers that must translate their own file offsets back to the
+    /// container the user opened.
+    pub fn file_offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Byte length of this slice, i.e. how much of the input it occupies.
+    pub fn slice_size(&self) -> Option<usize> {
+        let total = self.data.len();
+        let start = self.offset;
+        if start > total {
+            return None;
+        }
+        Some(total.saturating_sub(start))
+    }
+
     /// Human-readable label for the slice this MachO instance was loaded
     /// from (e.g. "x86_64", "arm64e"). Always returns something, even for
     /// non-fat input.

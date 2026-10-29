@@ -86,6 +86,7 @@ pub use decompiler::{
     BinaryDataContext, CallingConvention, CatchInfo, CleanupInfo, Decompiler, DecompilerConfig,
     ExceptionInfo, FunctionSignature, OptimizationLevel, OptimizationPass, ParamType, Parameter,
     ParameterLocation, RelocationTable, SignatureRecovery, StringTable, SymbolTable, TryBlockInfo,
+    VariableOverride, VariableOverrideLocator,
 };
 pub use exception_handling::{
     extract_all_exception_info, extract_all_exception_info_with_rtti, ExceptionError,
