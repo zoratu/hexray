@@ -93,6 +93,22 @@ For stable benchmark comparisons and parallelism tuning guidance, see [`PERFORMA
 - **`scripts/check-security`** — runs `cargo audit`.
 - **`scripts/check-coverage`** — runs `cargo llvm-cov` with a
   configurable line threshold via `HEXRAY_COVERAGE_LINES`.
+- **`scripts/check-mutants`** — mutation testing via `cargo-mutants`.
+  Where proptest/differential/fuzz verify the *code*, this verifies the
+  *test suite*: it injects small behavioural changes ("mutants") and
+  checks the suite catches them. A **surviving** mutant is a behaviour
+  nothing asserts — a named, actionable test gap (the Examplar
+  "conceptual chaff" idea with a tool). Heavy (one test run per mutant),
+  so run it on a disposable aarch64 spot, not a laptop, and scope it:
+  `scripts/check-mutants -f <file>` sweeps one file; `--package <crate>`
+  a whole crate; `--in-diff <ref>` mutates only changed lines (the
+  sustainable CI gate — require every mutant on new code be caught).
+  Config lives in `mutants.toml`. Results land in `mutants.out/`
+  (`missed.txt` = gaps, `caught.txt`, `timeout.txt`, `unviable.txt`).
+  Tests default to the mutated package only; re-run survivors with
+  `--test-workspace true` to confirm they also evade the top-level
+  `hexray` integration/differential/swarm suites before calling them
+  true end-to-end gaps.
 - **`scripts/check-tla`** — model-checks the incremental invalidation
   TLA+ spec with TLC, then runs the matching Rust conformance test
   so the formal model and implementation stay in lockstep.

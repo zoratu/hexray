@@ -1,0 +1,65 @@
+#!/bin/bash
+# check-mutants — mutation testing for hexray.
+#
+# Mutation testing is the Examplar/"conceptual-chaff" idea applied with a tool:
+# we verify the CODE continuously (proptest + differential + fuzz); this verifies
+# the TEST SUITE, by injecting small behavioural changes ("mutants") and checking
+# the suite catches them. A SURVIVING mutant is a behaviour nothing asserts — a
+# named, actionable test gap, not a style nit.
+#
+# cargo-mutants reruns the test suite once per mutant, so it is heavy: run it on a
+# disposable aarch64 spot, not a laptop (see CLAUDE.md), and scope it.
+#
+# Usage:
+#   scripts/check-mutants                     # sweep the curated hot-path files
+#   scripts/check-mutants -f <path> [-f ...]  # sweep specific file(s)
+#   scripts/check-mutants --package <crate>   # sweep an entire crate
+#   scripts/check-mutants --in-diff <ref>     # CI gate: only mutate lines changed
+#                                             # vs <ref> (e.g. origin/main) and
+#                                             # require every one be caught
+#   scripts/check-mutants --list              # list mutants without running tests
+#
+# Any extra args are passed through to cargo-mutants. Results land in
+# mutants.out/ (missed.txt, caught.txt, timeout.txt, unviable.txt).
+
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if ! cargo mutants --version >/dev/null 2>&1; then
+    echo "cargo-mutants is required for mutation testing." >&2
+    echo "Install it with: cargo install cargo-mutants --locked" >&2
+    exit 1
+fi
+
+# Memory is the binding constraint on small spots: cargo-mutants parallelises
+# whole test processes. Default to a conservative job count; override with -j.
+JOBS="${MUTANTS_JOBS:-2}"
+
+# Curated hot-path files to sweep when no explicit target is given. These are the
+# deep, untrusted-byte transformations where a silent behaviour change is most
+# dangerous and least likely to be caught by a coarse differential band.
+DEFAULT_TARGETS=(
+    -f crates/hexray-analysis/src/decompiler/switch_recovery.rs
+    -f crates/hexray-analysis/src/decompiler/short_circuit.rs
+    -f crates/hexray-analysis/src/decompiler/structurer/condition.rs
+    -f crates/hexray-analysis/src/decompiler/array_detection.rs
+)
+
+# If the caller passed any targeting/mode flag, don't inject defaults.
+HAS_TARGET=0
+for arg in "$@"; do
+    case "$arg" in
+        -f|--file|-p|--package|--workspace|--in-diff|--list|-F|--re|-e|--exclude-re)
+            HAS_TARGET=1 ;;
+    esac
+done
+
+ARGS=("$@")
+if [[ "$HAS_TARGET" -eq 0 ]]; then
+    ARGS=("${DEFAULT_TARGETS[@]}" "$@")
+fi
+
+echo ">> cargo mutants -j ${JOBS} ${ARGS[*]}"
+exec cargo mutants -j "${JOBS}" "${ARGS[@]}"

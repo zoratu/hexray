@@ -43,3 +43,7 @@ tests/fixtures/test_gotos
 tests/fixtures/test_gotos2
 tests/fixtures/test_simple_goto
 tests/fixtures/test_structs
+
+# cargo-mutants output / local logs
+mutants.out/
+mutants-*.log

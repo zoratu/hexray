@@ -1,0 +1,31 @@
+# cargo-mutants configuration for hexray.
+#
+# Mutation testing measures *test-suite strength*: cargo-mutants injects small
+# behavioural changes ("mutants") into the source and checks whether the test
+# suite notices (a "caught" mutant) or not (a "missed"/surviving mutant). A
+# surviving mutant is a concrete, named gap in the tests — a behaviour nothing
+# asserts. See scripts/check-mutants and docs/TESTING.md.
+
+# Skip code that mutation testing cannot meaningfully evaluate.
+exclude_globs = [
+    # Test code, benches, and fuzz harnesses are not the system under test.
+    "**/tests/**",
+    "**/benches/**",
+    "fuzz/**",
+    # Generated / data tables: a deleted match arm here is "caught" only by
+    # differential corpora, which are slow; sweep these explicitly, not by default.
+    "crates/hexray-disasm/src/cuda/sass/opcode_table.rs",
+]
+
+# Functions whose mutation is uninformative (pure Debug/Display, etc.).
+exclude_re = [
+    "impl Debug",
+    "impl Display",
+    "fn fmt",
+]
+
+# hexray enforces bounded run time (invariant #4); a mutant that induces a hang
+# must be reported as a timeout (≈ caught), not allowed to stall the run.
+# Cap each mutant test run relative to the measured baseline.
+timeout_multiplier = 3.0
+minimum_test_timeout = 60
