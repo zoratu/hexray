@@ -1960,6 +1960,113 @@ mod tests {
             alias_hi.contains("rbp") && !alias_hi.starts_with("arg"),
             "rax-defines-eax aliasing must be traced, got {alias_hi:?}"
         );
+
+        // Negative cases: an UNRELATED def must NOT be traced. These pin the two
+        // aliasing `&&` conjunctions (dst=="eax" && reg=="rax" / dst=="rax" &&
+        // reg=="eax") against a `||` mutation that would wrongly match eax/rax to
+        // any compared register. cmp rcx (=> arg3) with an eax/rax def that does
+        // not alias rcx: the switch value must stay the argN name, not the load.
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let unrelated_eax = traceback_switch_var(rcx, r(0, 32));
+        assert_eq!(
+            unrelated_eax, "arg3",
+            "an eax def must not be traced for a cmp on rcx"
+        );
+        let unrelated_rax = traceback_switch_var(rcx, r(0, 64));
+        assert_eq!(
+            unrelated_rax, "arg3",
+            "a rax def must not be traced for a cmp on rcx"
+        );
+    }
+
+    #[test]
+    fn test_analyze_jump_table_scale_one_keeps_default_entry_size() {
+        // A scaled load with scale == 1 (index present) must NOT override the
+        // 4-byte default entry size. Pins `mem.scale > 1` against `>= 1`, and the
+        // `index.is_some() && scale>1` conjunction against `||`.
+        use hexray_core::{Architecture, Instruction, MemoryRef, Register, RegisterClass};
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, 16, 64);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.push_instruction(
+            Instruction::new(0x1000, 7, vec![0u8; 7], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x200, 8)),
+                ]),
+        );
+        // mov edx, [rax + rcx*1]  => index present but scale 1 => keep default 4
+        block.push_instruction(
+            Instruction::new(0x1007, 4, vec![0u8; 4], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(edx),
+                    Operand::Memory(MemoryRef::sib(Some(rax), Some(rcx), 1, 0, 1)),
+                ]),
+        );
+        block.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+        let (_, _, info, _) = recovery
+            .analyze_jump_table_block(&block)
+            .expect("table recognized");
+        assert_eq!(info.entry_size, 4, "scale 1 must not change the entry size");
+    }
+
+    #[test]
+    fn test_try_detect_jump_table_fallback_to_possible_targets() {
+        // With no binary data, try_detect_jump_table falls back to possible_targets,
+        // assigning sequential case values min_value + i (min_value == 0). Pins the
+        // whole function (vs -> None), the `!possible_targets.is_empty()` guard, and
+        // the `min_value + i` arithmetic.
+        use hexray_core::{Architecture, Instruction, MemoryRef, Register, RegisterClass};
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, 16, 64);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.push_instruction(
+            Instruction::new(0x1000, 7, vec![0u8; 7], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x200, 8)),
+                ]),
+        );
+        block.push_instruction(
+            Instruction::new(0x1007, 4, vec![0u8; 4], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(edx),
+                    Operand::Memory(MemoryRef::sib(Some(rax), Some(rcx), 4, 0, 4)),
+                ]),
+        );
+        block.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![BasicBlockId::new(10), BasicBlockId::new(11)],
+        };
+
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+        let info = recovery
+            .try_detect_jump_table(&block)
+            .expect("jump table must be detected via possible_targets fallback");
+        assert_eq!(info.kind, SwitchKind::JumpTable);
+        let labels: Vec<i128> = info.cases.iter().flat_map(|(v, _)| v.clone()).collect();
+        assert_eq!(labels, vec![0, 1], "sequential case values min_value + i");
+        assert_eq!(
+            info.cases.iter().map(|(_, t)| *t).collect::<Vec<_>>(),
+            vec![BasicBlockId::new(10), BasicBlockId::new(11)]
+        );
     }
 
     #[test]
