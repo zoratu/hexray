@@ -136,24 +136,41 @@ ComparisonType` table test (signed + unsigned-folded arms) + a register/register
 decline guard. **Verified biting**: dropping `Condition::Less` and swapping
 `Above→Greater` both fail (both were *suite-wide* survivors in Campaign 2).
 
-> Verification method: each test was checked by hand-injecting a representative
-> mutant and confirming the test goes red, then reverting. A precise before/after
-> survivor *count* needs a `scripts/check-mutants` re-run on a spot (local box
-> ENOSPCs — see gotcha above).
+### ✅ Done — switch_recovery.rs jump-table internals (COMPLETE: 69 → 3 equivalent)
+Commits `b77af689e`, `70f6762e3`, `57b9324ff`, `034d66202`, `66c9e61e2`,
+`6ff07fae1`. Six batches of fixtures + tests closing the entire jump-table /
+binary-search survivor set:
+- table-base heuristic (`extract_absolute_table_base` 4 guard conditions + both
+  displacement boundaries) and entry decoding (`read_jump_table` 4-byte / 1-byte /
+  stride / out-of-range decline)
+- index-register `argN` naming (all 8 argument-register arms + fallback)
+- binary-search detection (`try_detect_binary_search` / `collect_comparisons` /
+  `find_switch_candidates` stubs, len bounds, default, case sorting, Sub-compare,
+  `get_stack_slot_key` Var arm)
+- `analyze_jump_table_block` PIC path (LEA / PC-relative / `inst_end + disp` / scale,
+  incl. scale-1 keeps default) and the comparison-register traceback (eax/rax
+  aliasing, incl. negative cases)
+- `try_detect_jump_table` possible-targets fallback (`min_value + i` arithmetic)
 
-## Remaining gaps (ranked)
+**Spot-measured (c7g.4xlarge aarch64, package-scoped, 158 mutants): 69 → 11 → 3.**
+Final run: `158 mutants tested: 3 missed, 131 caught, 24 unviable` — all 3 missed
+are the equivalent-mutant cluster below.
+The final 3 survivors are **equivalent mutants**: `base.name()=="rip"` and
+`base.id==16` (lines 273–274) always agree for x86-64 (the name is derived from the
+id), so no input can distinguish the original from the mutant. Correctly unkillable.
 
-1. **Switch-recovery jump-table internals** (still open, confirmed suite-wide):
-   stride/base arithmetic (`read_jump_table` entry-size arms, `extract_absolute_table_base`
-   `> 0x1000` / `&&` guard), the PIC path (`analyze_jump_table_block` LEA/PcRelative
-   arms), whole-function stubs (`find_switch_candidates → vec![]`), and per-register
-   `argN` index naming. Needs binary-data fixtures (a real jump table in a
-   `BinaryDataContext`), heavier than the pure-table tests above.
-2. **Array-detection shape tests** — `try_detect_struct_array_access`,
-   `try_detect_scaled_access`, `extract_mul_by_constant` (77 crate-local survivors,
-   not yet e2e-calibrated).
-3. **Re-measure on a spot** — re-run `scripts/check-mutants -f …condition.rs -f
-   …switch_recovery.rs` to record the exact survivor drop, and run the `condition.rs`
-   `--test-workspace` calibration that Campaign 2 skipped.
-4. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
+> Verification method: every test was checked by hand-injecting a representative
+> mutant and confirming it goes red, then reverting; and the whole file was
+> re-measured end-to-end with `cargo-mutants` on a spot (69 → 11 after batches 1–5,
+> → 3 equivalent after batch 6).
+
+## Remaining work (other files, ranked)
+
+1. **Array-detection shape tests** — `try_detect_struct_array_access`,
+   `try_detect_scaled_access`, `extract_mul_by_constant` (77 crate-local survivors
+   in `array_detection.rs`, not yet closed).
+2. **`condition.rs` re-measure** — the condition/flag-lifting tables were closed by
+   injection-verification but not yet re-measured end-to-end with `cargo-mutants`
+   (223 crate-local survivors before the tests; expect a large drop).
+3. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
    must ship with tests that catch its mutants, without re-sweeping the whole tree.
