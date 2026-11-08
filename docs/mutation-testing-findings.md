@@ -77,14 +77,49 @@ table — and has **no test**. Deleting any arm silently falls through to a
 the whole suite. It has an obvious pinning property: `negate(negate(c)) ≡ c` for
 comparison ops, plus an exhaustive op→complement table test.
 
-## Campaign 2 — end-to-end calibration (in progress / see below)
+## Campaign 2 — end-to-end calibration (switch_recovery.rs)
 
-Re-running `switch_recovery.rs` with `--test-workspace true` so a mutant counts as
+Re-ran `switch_recovery.rs` with `--test-workspace true` so a mutant counts as
 caught only if **some** test anywhere in the workspace (incl. the top-level
-integration/differential/swarm/e2e suites) notices it. This separates true
-end-to-end gaps from merely-crate-local ones and quantifies the "end-to-end uplift".
+`hexray` integration / differential / swarm / e2e suites) notices it — separating
+true end-to-end gaps from merely-crate-local ones. `-j 4`, 156/158 completed (the
+last 2 lost to ENOSPC again — `--test-workspace` copies the *full* workspace build
+per worker, so use `-j 2` and/or a bigger root volume for workspace-scoped runs).
 
-<!-- RESULT PENDING: counts + uplift to be appended when the run finishes -->
+### Result
+
+| scope | caught | **missed** | unviable |
+|-------|-------:|-----------:|---------:|
+| crate-only (Campaign 1) | ~56 | **69** | 33 |
+| **full workspace (Campaign 2)** | 59 | **64** | 33 |
+
+**The entire top-level test machinery flips only ~5 crate-local survivors to
+caught.** ~41% of `switch_recovery.rs` mutants (64 / 156) survive the *whole* test
+suite — these are real, suite-wide gaps, not an artifact of crate scoping.
+
+### What survives end-to-end (the serious part)
+
+- **Whole-function stubs**: `try_detect_binary_search → None`,
+  `collect_comparisons → None`/`Some(vec![])`, `find_switch_candidates → vec![]`,
+  `extract_comparison → None`. Switch recovery could return "no switches found"
+  and no test anywhere notices.
+- **Binary-search comparison→operator table fully unpinned**: deleting any of
+  `Condition::{Equal,Less,LessOrEqual,Greater,GreaterOrEqual,Below,BelowOrEqual,
+  Above,AboveOrEqual}` arms in `extract_comparison` survives — wrong case
+  predicate, undetected.
+- **Jump-table stride/base arithmetic**: `read_jump_table` entry-size arms
+  `(4,true)`/`(1,true)` delete and `+`→`-`/`*` survive; `extract_absolute_table_base`
+  boundary (`> 0x1000`, `< i64::MAX`) and `&&` guard survive.
+- **PIC path**: `analyze_jump_table_block` `LoadEffectiveAddress` and
+  `Operand::PcRelative` arms delete undetected (the recent reloc-aware work).
+- **Per-register `argN` index naming**: deleting any of `edi/rdi…r9d/r9`, `w0/x0`,
+  `w1/x1` survives — `switch(argN)` readability unguarded.
+
+This promotes switch-recovery guards from "nice to have" to a **confirmed
+suite-wide blind spot**. `condition.rs`'s 223 crate-local survivors were not
+workspace-calibrated (would need `-j 2`, ~3 h); given the tiny uplift observed
+here, expect most to be real too, though condition lifting is more heavily
+exercised by e2e decompile tests so its uplift may be larger.
 
 ## Recommendations (ranked)
 
@@ -95,9 +130,12 @@ end-to-end gaps from merely-crate-local ones and quantifies the "end-to-end upli
    op→expr table tests + the `negate∘negate = id` property test. Each test should
    flip specific survivors missed→caught; re-run `scripts/check-mutants -f
    crates/hexray-analysis/src/decompiler/structurer/condition.rs` to confirm.
-2. **Switch-recovery unit guards** — jump-table detection, the table-base boundary
-   heuristic (`> 0x1000` / `&&` guard), PIC stride arithmetic, and per-register
-   `argN` index naming. Tied to invariant #4 and the recent reloc-aware PIC work.
+2. **Switch-recovery guards — CONFIRMED suite-wide gap (Campaign 2).** The
+   binary-search path (`try_detect_binary_search`, `collect_comparisons`,
+   `extract_comparison`'s `Condition::*` table), jump-table stride/base arithmetic
+   (`read_jump_table`, `extract_absolute_table_base` `> 0x1000`/`&&` guard), the PIC
+   path, and per-register `argN` naming survive the *entire* suite. Tied to
+   invariant #4 and the recent reloc-aware PIC work — highest-confidence gap.
 3. **Array-detection shape tests** — `try_detect_struct_array_access`,
    `try_detect_scaled_access`, `extract_mul_by_constant`.
 4. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
