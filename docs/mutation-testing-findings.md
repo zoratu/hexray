@@ -121,22 +121,39 @@ workspace-calibrated (would need `-j 2`, ~3 h); given the tiny uplift observed
 here, expect most to be real too, though condition lifting is more heavily
 exercised by e2e decompile tests so its uplift may be larger.
 
-## Recommendations (ranked)
+## Gap-closing progress
 
-1. **Pin the condition/flag-lifting tables first** — highest value, lowest effort.
-   `negate_condition`, `condition_to_expr`, `parse_condition_from_mnemonic`,
-   `parse_arm64_condition`, `x86_float_compare_binop` are pure, table-shaped, and
-   correctness-critical (a wrong operator is a wrong decompile). Add exhaustive
-   op→expr table tests + the `negate∘negate = id` property test. Each test should
-   flip specific survivors missed→caught; re-run `scripts/check-mutants -f
-   crates/hexray-analysis/src/decompiler/structurer/condition.rs` to confirm.
-2. **Switch-recovery guards — CONFIRMED suite-wide gap (Campaign 2).** The
-   binary-search path (`try_detect_binary_search`, `collect_comparisons`,
-   `extract_comparison`'s `Condition::*` table), jump-table stride/base arithmetic
-   (`read_jump_table`, `extract_absolute_table_base` `> 0x1000`/`&&` guard), the PIC
-   path, and per-register `argN` naming survive the *entire* suite. Tied to
-   invariant #4 and the recent reloc-aware PIC work — highest-confidence gap.
-3. **Array-detection shape tests** — `try_detect_struct_array_access`,
-   `try_detect_scaled_access`, `extract_mul_by_constant`.
+### ✅ Done — condition/flag-lifting tables (`condition.rs`)
+Commit `aa228e68b`. Added exhaustive table tests for `negate_condition`,
+`condition_to_expr`, `parse_condition_from_mnemonic` (x86) and `parse_arm64_condition`,
+plus the `negate(negate(c)) == c` involution property. **Verified biting** by
+injection: a `Lt→Gt` swap fails the table + involution tests; deleting the arm64
+`hi` arm fails the arm64 table test (both previously surviving mutants).
+
+### ✅ Done — binary-search comparison table (`switch_recovery.rs`)
+Commit `b1223c6a3`. Added an exhaustive `extract_comparison` `Condition →
+ComparisonType` table test (signed + unsigned-folded arms) + a register/register
+decline guard. **Verified biting**: dropping `Condition::Less` and swapping
+`Above→Greater` both fail (both were *suite-wide* survivors in Campaign 2).
+
+> Verification method: each test was checked by hand-injecting a representative
+> mutant and confirming the test goes red, then reverting. A precise before/after
+> survivor *count* needs a `scripts/check-mutants` re-run on a spot (local box
+> ENOSPCs — see gotcha above).
+
+## Remaining gaps (ranked)
+
+1. **Switch-recovery jump-table internals** (still open, confirmed suite-wide):
+   stride/base arithmetic (`read_jump_table` entry-size arms, `extract_absolute_table_base`
+   `> 0x1000` / `&&` guard), the PIC path (`analyze_jump_table_block` LEA/PcRelative
+   arms), whole-function stubs (`find_switch_candidates → vec![]`), and per-register
+   `argN` index naming. Needs binary-data fixtures (a real jump table in a
+   `BinaryDataContext`), heavier than the pure-table tests above.
+2. **Array-detection shape tests** — `try_detect_struct_array_access`,
+   `try_detect_scaled_access`, `extract_mul_by_constant` (77 crate-local survivors,
+   not yet e2e-calibrated).
+3. **Re-measure on a spot** — re-run `scripts/check-mutants -f …condition.rs -f
+   …switch_recovery.rs` to record the exact survivor drop, and run the `condition.rs`
+   `--test-workspace` calibration that Campaign 2 skipped.
 4. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
    must ship with tests that catch its mutants, without re-sweeping the whole tree.
