@@ -1326,4 +1326,112 @@ mod tests {
         assert_ne!(jt, ie);
         assert_ne!(bs, ie);
     }
+
+    // ---------------------------------------------------------------------
+    // Binary-search comparison extraction.
+    //
+    // `extract_comparison` turns a `cmp reg, imm; j<cc>` block into a typed
+    // `ComparisonType`. This condition->ComparisonType table is the per-case
+    // predicate of a binary-search switch — a dropped arm makes the whole case
+    // disappear, and a swapped arm emits the wrong range/boundary. Mutation testing
+    // confirmed every arm here survives the *entire* workspace suite, so pin them.
+    // ---------------------------------------------------------------------
+
+    /// Build a `cmp eax, 5` block and run `extract_comparison` for `cond`.
+    fn comparison_for(cond: hexray_core::Condition) -> Option<ComparisonType> {
+        use hexray_core::{Architecture, Immediate, Instruction, Register, RegisterClass};
+
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(
+            Instruction::new(0x1000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Register(eax),
+                    Operand::Immediate(Immediate {
+                        value: 5,
+                        size: 32,
+                        signed: true,
+                    }),
+                ]),
+        );
+
+        recovery
+            .extract_comparison(&block, cond, BasicBlockId::new(1), BasicBlockId::new(2))
+            .map(|info| info.comparison)
+    }
+
+    #[test]
+    fn test_extract_comparison_condition_table() {
+        use hexray_core::Condition;
+
+        // Signed conditions map to their matching ComparisonType.
+        assert!(matches!(
+            comparison_for(Condition::Equal),
+            Some(ComparisonType::Equal(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::Less),
+            Some(ComparisonType::Less(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::LessOrEqual),
+            Some(ComparisonType::LessOrEqual(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::Greater),
+            Some(ComparisonType::Greater(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::GreaterOrEqual),
+            Some(ComparisonType::GreaterOrEqual(5))
+        ));
+
+        // Unsigned conditions fold onto the same signed ComparisonType family.
+        assert!(matches!(
+            comparison_for(Condition::Below),
+            Some(ComparisonType::Less(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::BelowOrEqual),
+            Some(ComparisonType::LessOrEqual(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::Above),
+            Some(ComparisonType::Greater(5))
+        ));
+        assert!(matches!(
+            comparison_for(Condition::AboveOrEqual),
+            Some(ComparisonType::GreaterOrEqual(5))
+        ));
+
+        // Flag-only / counter conditions are not value comparisons.
+        assert!(comparison_for(Condition::Sign).is_none());
+        assert!(comparison_for(Condition::Overflow).is_none());
+        assert!(comparison_for(Condition::Parity).is_none());
+    }
+
+    #[test]
+    fn test_extract_comparison_requires_immediate_rhs() {
+        use hexray_core::{Architecture, Condition, Instruction, Register, RegisterClass};
+
+        // A register/register compare has no constant boundary: not a binary-search
+        // comparison, so extraction must decline rather than invent a value.
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let ecx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 32);
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(
+            Instruction::new(0x1000, 2, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(eax), Operand::Register(ecx)]),
+        );
+        assert!(recovery
+            .extract_comparison(&block, Condition::Less, BasicBlockId::new(1), BasicBlockId::new(2))
+            .is_none());
+    }
 }
