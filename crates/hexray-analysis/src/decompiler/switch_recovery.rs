@@ -1414,6 +1414,144 @@ mod tests {
         assert!(comparison_for(Condition::Parity).is_none());
     }
 
+    // ---------------------------------------------------------------------
+    // Jump-table internals: table-base heuristic, entry decoding, stride.
+    //
+    // These decode untrusted table bytes into case targets. A dropped entry-size
+    // arm makes a whole table shape unreadable; a flipped stride/boundary resolves
+    // the wrong addresses. Mutation testing (Campaign 2) showed all of these
+    // survive the entire workspace suite, so pin them with precise value asserts.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_extract_absolute_table_base_requires_all_conditions() {
+        use hexray_core::{Architecture, MemoryRef, Register, RegisterClass};
+
+        let idx = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let base = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+
+        // Canonical absolute SIB table ref: no base, has index, large displacement.
+        let ok = MemoryRef::sib(None, Some(idx), 8, 0x4020, 8);
+        assert_eq!(
+            SwitchRecovery::extract_absolute_table_base(&ok),
+            Some(0x4020)
+        );
+
+        // A base register present => not a bare absolute table base (pins 1st &&).
+        let with_base = MemoryRef::sib(Some(base), Some(idx), 8, 0x4020, 8);
+        assert_eq!(
+            SwitchRecovery::extract_absolute_table_base(&with_base),
+            None
+        );
+
+        // No index register => not a scaled table access (pins 2nd &&).
+        let no_index = MemoryRef::sib(None, None, 8, 0x4020, 8);
+        assert_eq!(SwitchRecovery::extract_absolute_table_base(&no_index), None);
+
+        // Displacement exactly at the 0x1000 floor is rejected (pins `>` vs `>=`).
+        let at_floor = MemoryRef::sib(None, Some(idx), 8, 0x1000, 8);
+        assert_eq!(SwitchRecovery::extract_absolute_table_base(&at_floor), None);
+        let just_above = MemoryRef::sib(None, Some(idx), 8, 0x1001, 8);
+        assert_eq!(
+            SwitchRecovery::extract_absolute_table_base(&just_above),
+            Some(0x1001)
+        );
+
+        // Displacement at i64::MAX is rejected (pins `<` vs `<=`).
+        let at_ceiling = MemoryRef::sib(None, Some(idx), 8, i64::MAX, 8);
+        assert_eq!(
+            SwitchRecovery::extract_absolute_table_base(&at_ceiling),
+            None
+        );
+    }
+
+    /// Build a CFG with target blocks at `targets` (ids 1..) plus a binary section
+    /// at `table_base` holding `data`, and read `info` through it.
+    fn read_table_with(
+        table_base: u64,
+        data: Vec<u8>,
+        targets: &[u64],
+        info: JumpTableInfo,
+    ) -> Option<Vec<(Vec<i128>, BasicBlockId)>> {
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        for (i, &addr) in targets.iter().enumerate() {
+            let mut b = BasicBlock::new(BasicBlockId::new(i as u32 + 1), addr);
+            b.end = addr + 1;
+            cfg.add_block(b);
+        }
+        let mut ctx = super::super::BinaryDataContext::new();
+        ctx.add_section(table_base, data);
+        let recovery = SwitchRecovery::new(&cfg).with_binary_context(&ctx);
+        recovery.read_jump_table(&info)
+    }
+
+    #[test]
+    fn test_read_jump_table_relative_4byte() {
+        // 4-byte relative table: target = table_base.wrapping_add(rel_i32).
+        let table_base = 0x402008u64;
+        let (t0, t1) = (0x500000u64, 0x500010u64);
+        let rel0 = (t0 as i64 - table_base as i64) as i32;
+        let rel1 = (t1 as i64 - table_base as i64) as i32;
+        let mut data = Vec::new();
+        data.extend_from_slice(&rel0.to_le_bytes());
+        data.extend_from_slice(&rel1.to_le_bytes());
+
+        let info = JumpTableInfo {
+            table_base,
+            entry_size: 4,
+            entry_count: 2,
+            is_relative: true,
+            min_value: 0,
+            max_value: 1,
+        };
+        let cases = read_table_with(table_base, data, &[t0, t1], info)
+            .expect("4-byte relative table must resolve");
+        let labels: usize = cases.iter().map(|(v, _)| v.len()).sum();
+        assert_eq!(labels, 2, "both relative entries must resolve to blocks");
+    }
+
+    #[test]
+    fn test_read_jump_table_relative_1byte() {
+        // 1-byte relative (compact) table: i8 offsets from table_base.
+        let table_base = 0x402008u64;
+        let data = vec![0x10u8, 0x20u8];
+        let (t0, t1) = (table_base + 0x10, table_base + 0x20);
+
+        let info = JumpTableInfo {
+            table_base,
+            entry_size: 1,
+            entry_count: 2,
+            is_relative: true,
+            min_value: 0,
+            max_value: 1,
+        };
+        let cases = read_table_with(table_base, data, &[t0, t1], info)
+            .expect("1-byte relative table must resolve");
+        let labels: usize = cases.iter().map(|(v, _)| v.len()).sum();
+        assert_eq!(labels, 2, "both compact entries must resolve to blocks");
+    }
+
+    #[test]
+    fn test_read_jump_table_declines_table_base_below_data_base() {
+        // table_base below the data base is out of range: must decline, never
+        // underflow the offset computation.
+        let data = vec![0u8; 16];
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg).with_binary_data(&data, 0x402008);
+        let info = JumpTableInfo {
+            table_base: 0x402000,
+            entry_size: 4,
+            entry_count: 2,
+            is_relative: true,
+            min_value: 0,
+            max_value: 1,
+        };
+        assert!(
+            recovery.read_jump_table(&info).is_none(),
+            "a table_base below data_base must decline"
+        );
+    }
+
     #[test]
     fn test_extract_comparison_requires_immediate_rhs() {
         use hexray_core::{Architecture, Condition, Instruction, Register, RegisterClass};
