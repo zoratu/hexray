@@ -1760,6 +1760,160 @@ mod tests {
         assert_eq!(switch_var_for_cmp_reg(x86(3)), "ebx");
     }
 
+    // ---------------------------------------------------------------------
+    // analyze_jump_table_block: table-base discovery (LEA / PC-relative), entry
+    // size from the scaled table load, and the comparison-register traceback that
+    // names the switch value. These PIC-path arms survived the whole suite.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_analyze_jump_table_rip_relative_lea_base() {
+        use hexray_core::{Architecture, Instruction, MemoryRef, Register, RegisterClass};
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, 16, 64);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let rcx = Register::new(Architecture::X86_64, RegisterClass::General, 1, 64);
+        let edx = Register::new(Architecture::X86_64, RegisterClass::General, 2, 32);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        // lea rax, [rip + 0x200]  (7 bytes) => base = (0x1000 + 7) + 0x200 = 0x1207
+        block.push_instruction(
+            Instruction::new(0x1000, 7, vec![0u8; 7], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x200, 8)),
+                ]),
+        );
+        // mov edx, [rax + rcx*8]  => entry_size = 8 (distinct from the 4 default)
+        block.push_instruction(
+            Instruction::new(0x1007, 4, vec![0u8; 4], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(edx),
+                    Operand::Memory(MemoryRef::sib(Some(rax), Some(rcx), 8, 0, 8)),
+                ]),
+        );
+        block.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+        let (_, _, info, _) = recovery
+            .analyze_jump_table_block(&block)
+            .expect("rip-relative LEA table must be recognized");
+        assert_eq!(info.table_base, 0x1207, "inst_end + displacement");
+        assert_eq!(info.entry_size, 8, "scaled index gives 8-byte entries");
+        assert!(info.is_relative);
+    }
+
+    #[test]
+    fn test_analyze_jump_table_pcrelative_operand_base() {
+        use hexray_core::{Architecture, Instruction, Register, RegisterClass};
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        // lea rax, <pcrel target=0x1207>
+        block.push_instruction(
+            Instruction::new(0x1000, 7, vec![0u8; 7], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::PcRelative {
+                        offset: 0,
+                        target: 0x1207,
+                    },
+                ]),
+        );
+        block.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+        let (_, _, info, _) = recovery
+            .analyze_jump_table_block(&block)
+            .expect("PC-relative operand table must be recognized");
+        assert_eq!(info.table_base, 0x1207, "Pc-relative target used directly");
+    }
+
+    /// Build a jump block whose bounds check compares `cmp_reg` and whose `def_reg`
+    /// is loaded from `[rbp-8]`, then return the recovered switch-value rendering.
+    fn traceback_switch_var(cmp_reg: hexray_core::Register, def_reg: hexray_core::Register) -> String {
+        use hexray_core::{Architecture, Instruction, MemoryRef, Register, RegisterClass};
+        let rip = Register::new(Architecture::X86_64, RegisterClass::General, 16, 64);
+        let rbp = Register::new(Architecture::X86_64, RegisterClass::General, 5, 64);
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        // lea rax, [rip + 0x200]  (table base, so analysis proceeds)
+        block.push_instruction(
+            Instruction::new(0x1000, 7, vec![0u8; 7], "lea")
+                .with_operation(Operation::LoadEffectiveAddress)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(Some(rip), None, 1, 0x200, 8)),
+                ]),
+        );
+        // mov def_reg, [rbp - 8]   (defines the compared register => switch value)
+        block.push_instruction(
+            Instruction::new(0x1007, 3, vec![0u8; 3], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(def_reg),
+                    Operand::Memory(MemoryRef::base_disp(rbp, -8, 4)),
+                ]),
+        );
+        // cmp cmp_reg, 3           (bounds check)
+        block.push_instruction(
+            Instruction::new(0x100a, 3, vec![0u8; 3], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Register(cmp_reg),
+                    Operand::imm_unsigned(3, 32),
+                ]),
+        );
+        block.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+
+        let cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let recovery = SwitchRecovery::new(&cfg);
+        let (switch_var, _, _, _) = recovery
+            .analyze_jump_table_block(&block)
+            .expect("table recognized");
+        format!("{switch_var}")
+    }
+
+    #[test]
+    fn test_analyze_jump_table_traces_switch_value_through_def() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+        let r = |id: u16, bits: u16| Register::new(Architecture::X86_64, RegisterClass::General, id, bits);
+
+        // Direct match: cmp eax; mov eax, [rbp-8] -> switch value is the stack load,
+        // NOT the fallback "arg0" naming.
+        let direct = traceback_switch_var(r(0, 32), r(0, 32));
+        assert!(
+            direct.contains("rbp") && !direct.starts_with("arg"),
+            "expected a stack-slot switch value, got {direct:?}"
+        );
+        // eax/rax aliasing arm: cmp rax; mov eax, [rbp-8].
+        let alias_lo = traceback_switch_var(r(0, 64), r(0, 32));
+        assert!(
+            alias_lo.contains("rbp") && !alias_lo.starts_with("arg"),
+            "eax-defines-rax aliasing must be traced, got {alias_lo:?}"
+        );
+        // rax/eax aliasing arm: cmp eax; mov rax, [rbp-8].
+        let alias_hi = traceback_switch_var(r(0, 32), r(0, 64));
+        assert!(
+            alias_hi.contains("rbp") && !alias_hi.starts_with("arg"),
+            "rax-defines-eax aliasing must be traced, got {alias_hi:?}"
+        );
+    }
+
     #[test]
     fn test_extract_comparison_requires_immediate_rhs() {
         use hexray_core::{Architecture, Condition, Instruction, Register, RegisterClass};
