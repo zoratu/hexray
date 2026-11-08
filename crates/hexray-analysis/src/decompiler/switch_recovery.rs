@@ -1001,6 +1001,14 @@ mod tests {
             get_stack_slot_key(&local_addr),
             Some("stack_-32".to_string())
         );
+
+        // A bare frame register (no displacement) is slot 0 (pins the Var arm).
+        assert_eq!(
+            get_stack_slot_key(&Expr::var(Variable::reg("rbp", 8))),
+            Some("stack_0".to_string())
+        );
+        // A non-frame register is not a stack slot at all.
+        assert_eq!(get_stack_slot_key(&Expr::var(Variable::reg("rax", 8))), None);
     }
 
     #[test]
@@ -1313,6 +1321,129 @@ mod tests {
             .expect("complete bounded table should resolve");
         let labels: usize = info.cases.iter().map(|(v, _)| v.len()).sum();
         assert_eq!(labels, 3, "all three bounded entries must be present");
+    }
+
+    // ---------------------------------------------------------------------
+    // Binary-search switch detection (try_detect_binary_search / collect_comparisons
+    // / find_switch_candidates). These whole-function paths survived the entire
+    // suite — a `-> None` / `-> vec![]` stub made binary-search switches silently
+    // vanish. Build a real comparison-tree CFG and assert the recovered switch.
+    // ---------------------------------------------------------------------
+
+    /// Build a CFG of `n` `cmp eax, k; je case_k` equality blocks chained on their
+    /// false edges, ending at a shared default. Returns the CFG; start block is 0.
+    fn equality_tree_cfg(n: u32) -> ControlFlowGraph {
+        use hexray_core::{Architecture, Instruction, Register, RegisterClass};
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let default_id = 200u32;
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        for i in 0..n {
+            let addr = 0x1000 + u64::from(i) * 0x10;
+            let mut b = BasicBlock::new(BasicBlockId::new(i), addr);
+            b.push_instruction(
+                Instruction::new(addr, 3, vec![], "cmp")
+                    .with_operation(Operation::Compare)
+                    .with_operands(vec![
+                        Operand::Register(eax),
+                        Operand::imm_unsigned(u64::from(i) + 1, 32),
+                    ]),
+            );
+            let false_target = if i + 1 < n {
+                BasicBlockId::new(i + 1)
+            } else {
+                BasicBlockId::new(default_id)
+            };
+            b.terminator = BlockTerminator::ConditionalBranch {
+                condition: hexray_core::Condition::Equal,
+                true_target: BasicBlockId::new(100 + i),
+                false_target,
+            };
+            cfg.add_block(b);
+        }
+        // Case + default leaf blocks.
+        for id in (100..100 + n).chain(std::iter::once(default_id)) {
+            let mut leaf = BasicBlock::new(BasicBlockId::new(id), 0x5000 + u64::from(id));
+            leaf.terminator = BlockTerminator::Return;
+            cfg.add_block(leaf);
+        }
+        cfg
+    }
+
+    #[test]
+    fn test_detect_binary_search_two_equality_cases() {
+        let cfg = equality_tree_cfg(2);
+        let recovery = SwitchRecovery::new(&cfg);
+        let info = recovery
+            .try_detect_binary_search(BasicBlockId::new(0))
+            .expect("two equality comparisons on one var must form a switch");
+        assert_eq!(info.kind, SwitchKind::BinarySearch);
+        let labels: Vec<i128> = info.cases.iter().flat_map(|(v, _)| v.clone()).collect();
+        assert_eq!(labels, vec![1, 2], "both case values recovered and sorted");
+        assert_eq!(
+            info.default,
+            Some(BasicBlockId::new(200)),
+            "fallthrough default must be recovered"
+        );
+        // The 32-bit index is normalized to its 64-bit parent register.
+        assert_eq!(format!("{}", info.switch_value), "rax");
+    }
+
+    #[test]
+    fn test_detect_binary_search_three_equality_cases() {
+        // A 3-case tree pins the `comparisons.len() < 2` / `cases.len() < 2` bounds
+        // against the `>` mutation (which only differs from `<` when len > 2).
+        let cfg = equality_tree_cfg(3);
+        let recovery = SwitchRecovery::new(&cfg);
+        let info = recovery
+            .try_detect_binary_search(BasicBlockId::new(0))
+            .expect("three equality comparisons must form a switch");
+        let labels: Vec<i128> = info.cases.iter().flat_map(|(v, _)| v.clone()).collect();
+        assert_eq!(labels, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_find_switch_candidates_detects_binary_search() {
+        let cfg = equality_tree_cfg(2);
+        let candidates = find_switch_candidates(&cfg);
+        assert!(
+            !candidates.is_empty(),
+            "find_switch_candidates must surface the binary-search switch"
+        );
+        assert!(candidates.iter().any(|(id, _)| *id == BasicBlockId::new(0)));
+    }
+
+    #[test]
+    fn test_extract_comparison_guards_operand_count() {
+        // A one-operand compare is not a bounds comparison: extract (via a tree)
+        // must decline, never index a missing operand.
+        use hexray_core::{Architecture, Instruction, Register, RegisterClass};
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut b = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        b.push_instruction(
+            Instruction::new(0x1000, 2, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(eax)]),
+        );
+        b.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(b);
+        let recovery = SwitchRecovery::new(&cfg);
+        assert!(
+            recovery
+                .extract_comparison(
+                    cfg.block(BasicBlockId::new(0)).unwrap(),
+                    hexray_core::Condition::Equal,
+                    BasicBlockId::new(1),
+                    BasicBlockId::new(2),
+                )
+                .is_none(),
+            "a one-operand compare must be rejected"
+        );
     }
 
     #[test]
