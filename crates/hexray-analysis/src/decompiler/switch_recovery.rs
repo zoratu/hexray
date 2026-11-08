@@ -1330,24 +1330,24 @@ mod tests {
     // vanish. Build a real comparison-tree CFG and assert the recovered switch.
     // ---------------------------------------------------------------------
 
-    /// Build a CFG of `n` `cmp eax, k; je case_k` equality blocks chained on their
-    /// false edges, ending at a shared default. Returns the CFG; start block is 0.
-    fn equality_tree_cfg(n: u32) -> ControlFlowGraph {
+    /// Build a CFG of `cmp eax, v; je case_v` equality blocks (one per value in
+    /// `vals`, in order) chained on their false edges, ending at a shared default.
+    /// Start block is 0; case leaf for value index i is block 100+i.
+    fn equality_tree_values(vals: &[u64]) -> ControlFlowGraph {
         use hexray_core::{Architecture, Instruction, Register, RegisterClass};
         let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
         let default_id = 200u32;
+        let n = vals.len() as u32;
         let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
 
-        for i in 0..n {
+        for (i, &val) in vals.iter().enumerate() {
+            let i = i as u32;
             let addr = 0x1000 + u64::from(i) * 0x10;
             let mut b = BasicBlock::new(BasicBlockId::new(i), addr);
             b.push_instruction(
                 Instruction::new(addr, 3, vec![], "cmp")
                     .with_operation(Operation::Compare)
-                    .with_operands(vec![
-                        Operand::Register(eax),
-                        Operand::imm_unsigned(u64::from(i) + 1, 32),
-                    ]),
+                    .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(val, 32)]),
             );
             let false_target = if i + 1 < n {
                 BasicBlockId::new(i + 1)
@@ -1361,13 +1361,61 @@ mod tests {
             };
             cfg.add_block(b);
         }
-        // Case + default leaf blocks.
         for id in (100..100 + n).chain(std::iter::once(default_id)) {
             let mut leaf = BasicBlock::new(BasicBlockId::new(id), 0x5000 + u64::from(id));
             leaf.terminator = BlockTerminator::Return;
             cfg.add_block(leaf);
         }
         cfg
+    }
+
+    /// `n` equality blocks comparing against 1..=n (ascending).
+    fn equality_tree_cfg(n: u32) -> ControlFlowGraph {
+        let vals: Vec<u64> = (1..=u64::from(n)).collect();
+        equality_tree_values(&vals)
+    }
+
+    #[test]
+    fn test_detect_binary_search_sorts_cases_by_value() {
+        // Values encountered out of order must be sorted ascending in the result.
+        let cfg = equality_tree_values(&[7, 3, 5]);
+        let recovery = SwitchRecovery::new(&cfg);
+        let info = recovery
+            .try_detect_binary_search(BasicBlockId::new(0))
+            .expect("three equality comparisons must form a switch");
+        let labels: Vec<i128> = info.cases.iter().flat_map(|(v, _)| v.clone()).collect();
+        assert_eq!(labels, vec![3, 5, 7], "cases must be sorted by value");
+    }
+
+    #[test]
+    fn test_extract_comparison_accepts_sub_operation() {
+        // A `sub reg, imm` that sets flags is also a comparison source (pins the
+        // Sub arm of the compare-instruction finder).
+        use hexray_core::{Architecture, Instruction, Register, RegisterClass};
+        let eax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 32);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+        let mut b = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        b.push_instruction(
+            Instruction::new(0x1000, 3, vec![], "sub")
+                .with_operation(Operation::Sub)
+                .with_operands(vec![Operand::Register(eax), Operand::imm_unsigned(7, 32)]),
+        );
+        b.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Equal,
+            true_target: BasicBlockId::new(1),
+            false_target: BasicBlockId::new(2),
+        };
+        cfg.add_block(b);
+        let recovery = SwitchRecovery::new(&cfg);
+        let info = recovery
+            .extract_comparison(
+                cfg.block(BasicBlockId::new(0)).unwrap(),
+                hexray_core::Condition::Equal,
+                BasicBlockId::new(1),
+                BasicBlockId::new(2),
+            )
+            .expect("sub-based compare must be extracted");
+        assert!(matches!(info.comparison, ComparisonType::Equal(7)));
     }
 
     #[test]
