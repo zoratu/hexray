@@ -1937,4 +1937,261 @@ mod tests {
         let writeback = generate_writeback_expr(&inst).expect("rep stos writeback");
         assert_eq!(writeback.to_string(), "rcx = 0");
     }
+
+    // ---------------------------------------------------------------------
+    // Condition / flag lifting tables.
+    //
+    // These pure mappings turn a condition code into a comparison operator or a
+    // readable placeholder. A swapped or dropped arm is a *wrong operator in the
+    // emitted pseudo-C* — e.g. an inverted branch — which the end-to-end suites do
+    // not catch (confirmed by mutation testing: these functions accounted for the
+    // largest surviving-mutant cluster). The exhaustive table + involution tests
+    // below pin every arm so any mutation flips a test red.
+    // ---------------------------------------------------------------------
+
+    /// Extract the `BinOpKind` from a comparison expression, or panic.
+    fn binop_kind(expr: &Expr) -> BinOpKind {
+        match &expr.kind {
+            ExprKind::BinOp { op, .. } => *op,
+            other => panic!("expected a comparison BinOp, got {other:?}"),
+        }
+    }
+
+    /// Extract the placeholder string from an `Unknown` expression, or panic.
+    fn unknown_text(expr: &Expr) -> String {
+        match &expr.kind {
+            ExprKind::Unknown(s) => s.clone(),
+            other => panic!("expected an Unknown placeholder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_negate_condition_comparison_table() {
+        // Each comparison operator negates to its exact logical complement.
+        let cases = [
+            (BinOpKind::Eq, BinOpKind::Ne),
+            (BinOpKind::Ne, BinOpKind::Eq),
+            (BinOpKind::Lt, BinOpKind::Ge),
+            (BinOpKind::Le, BinOpKind::Gt),
+            (BinOpKind::Gt, BinOpKind::Le),
+            (BinOpKind::Ge, BinOpKind::Lt),
+            (BinOpKind::ULt, BinOpKind::UGe),
+            (BinOpKind::ULe, BinOpKind::UGt),
+            (BinOpKind::UGt, BinOpKind::ULe),
+            (BinOpKind::UGe, BinOpKind::ULt),
+        ];
+        for (op, expected) in cases {
+            let input = Expr::binop(op, Expr::int(1), Expr::int(2));
+            let got = binop_kind(&negate_condition(input));
+            assert_eq!(
+                got, expected,
+                "negate_condition({op:?}) must yield {expected:?}, got {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negate_condition_is_involution() {
+        // Property witness: negating a comparison twice is the identity. This pins
+        // the pairing (if Lt->Ge then Ge->Lt), not just each arm in isolation.
+        for op in [
+            BinOpKind::Eq,
+            BinOpKind::Ne,
+            BinOpKind::Lt,
+            BinOpKind::Le,
+            BinOpKind::Gt,
+            BinOpKind::Ge,
+            BinOpKind::ULt,
+            BinOpKind::ULe,
+            BinOpKind::UGt,
+            BinOpKind::UGe,
+        ] {
+            let input = Expr::binop(op, Expr::int(1), Expr::int(2));
+            let twice = negate_condition(negate_condition(input));
+            assert_eq!(
+                binop_kind(&twice),
+                op,
+                "double negation must be the identity for {op:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negate_condition_placeholder_table() {
+        let cases = [
+            ("/* equal */", "/* not_equal */"),
+            ("/* not_equal */", "/* equal */"),
+            ("/* signed_lt */", "/* signed_ge */"),
+            ("/* signed_le */", "/* signed_gt */"),
+            ("/* signed_gt */", "/* signed_le */"),
+            ("/* signed_ge */", "/* signed_lt */"),
+            ("/* unsigned_lt */", "/* unsigned_ge */"),
+            ("/* unsigned_le */", "/* unsigned_gt */"),
+            ("/* unsigned_gt */", "/* unsigned_le */"),
+            ("/* unsigned_ge */", "/* unsigned_lt */"),
+            ("/* negative */", "/* non_negative */"),
+            ("/* non_negative */", "/* negative */"),
+            ("/* overflow */", "/* no_overflow */"),
+            ("/* no_overflow */", "/* overflow */"),
+            ("/* parity_even */", "/* parity_odd */"),
+            ("/* parity_odd */", "/* parity_even */"),
+        ];
+        for (input_s, expected_s) in cases {
+            let got = unknown_text(&negate_condition(Expr::unknown(input_s)));
+            assert_eq!(got, expected_s, "negate_condition({input_s}) => {expected_s}");
+        }
+    }
+
+    #[test]
+    fn test_negate_condition_non_comparison_wraps_in_logical_not() {
+        // A non-comparison operand must be wrapped in LogicalNot, never rewritten.
+        let add = Expr::binop(BinOpKind::Add, Expr::int(1), Expr::int(2));
+        assert!(
+            matches!(
+                negate_condition(add).kind,
+                ExprKind::UnaryOp {
+                    op: UnaryOpKind::LogicalNot,
+                    ..
+                }
+            ),
+            "negating a non-comparison must wrap in LogicalNot"
+        );
+        // An unrecognised placeholder comment also falls back to LogicalNot.
+        assert!(
+            matches!(
+                negate_condition(Expr::unknown("/* condition */")).kind,
+                ExprKind::UnaryOp {
+                    op: UnaryOpKind::LogicalNot,
+                    ..
+                }
+            ),
+            "negating an unknown placeholder must wrap in LogicalNot"
+        );
+    }
+
+    #[test]
+    fn test_condition_to_expr_table() {
+        // Exhaustive over every Condition variant (incl. the counter-based ones
+        // that fall back to the generic placeholder).
+        let cases = [
+            (Condition::Equal, "/* equal */"),
+            (Condition::NotEqual, "/* not_equal */"),
+            (Condition::Less, "/* signed_lt */"),
+            (Condition::LessOrEqual, "/* signed_le */"),
+            (Condition::Greater, "/* signed_gt */"),
+            (Condition::GreaterOrEqual, "/* signed_ge */"),
+            (Condition::Below, "/* unsigned_lt */"),
+            (Condition::BelowOrEqual, "/* unsigned_le */"),
+            (Condition::Above, "/* unsigned_gt */"),
+            (Condition::AboveOrEqual, "/* unsigned_ge */"),
+            (Condition::Sign, "/* negative */"),
+            (Condition::NotSign, "/* non_negative */"),
+            (Condition::Overflow, "/* overflow */"),
+            (Condition::NotOverflow, "/* no_overflow */"),
+            (Condition::Parity, "/* parity_even */"),
+            (Condition::NotParity, "/* parity_odd */"),
+            (Condition::CounterZero, "/* condition */"),
+            (Condition::CounterNotZero, "/* condition */"),
+        ];
+        for (cond, expected) in cases {
+            let got = unknown_text(&condition_to_expr(cond));
+            assert_eq!(got, expected, "condition_to_expr({cond:?}) => {expected}");
+        }
+    }
+
+    #[test]
+    fn test_parse_condition_from_mnemonic_x86_table() {
+        let cases = [
+            ("sete", Condition::Equal),
+            ("setz", Condition::Equal),
+            ("setne", Condition::NotEqual),
+            ("setnz", Condition::NotEqual),
+            ("setl", Condition::Less),
+            ("setnge", Condition::Less),
+            ("setle", Condition::LessOrEqual),
+            ("setng", Condition::LessOrEqual),
+            ("setg", Condition::Greater),
+            ("setnle", Condition::Greater),
+            ("setge", Condition::GreaterOrEqual),
+            ("setnl", Condition::GreaterOrEqual),
+            ("setb", Condition::Below),
+            ("setc", Condition::Below),
+            ("setnae", Condition::Below),
+            ("setbe", Condition::BelowOrEqual),
+            ("setna", Condition::BelowOrEqual),
+            ("seta", Condition::Above),
+            ("setnbe", Condition::Above),
+            ("setae", Condition::AboveOrEqual),
+            ("setnc", Condition::AboveOrEqual),
+            ("setnb", Condition::AboveOrEqual),
+            ("sets", Condition::Sign),
+            ("setns", Condition::NotSign),
+            ("seto", Condition::Overflow),
+            ("setno", Condition::NotOverflow),
+            ("setp", Condition::Parity),
+            ("setpe", Condition::Parity),
+            ("setnp", Condition::NotParity),
+            ("setpo", Condition::NotParity),
+            // `cmov` shares the same suffix table.
+            ("cmovne", Condition::NotEqual),
+            ("cmovge", Condition::GreaterOrEqual),
+            ("cmovb", Condition::Below),
+        ];
+        for (mnem, expected) in cases {
+            assert_eq!(
+                parse_condition_from_mnemonic(mnem),
+                Some(expected),
+                "parse_condition_from_mnemonic({mnem})"
+            );
+        }
+        // Non-conditional / unrecognised mnemonics yield None.
+        assert_eq!(parse_condition_from_mnemonic("mov"), None);
+        assert_eq!(parse_condition_from_mnemonic("setxx"), None);
+        assert_eq!(parse_condition_from_mnemonic("cmovxx"), None);
+    }
+
+    #[test]
+    fn test_parse_arm64_condition_table() {
+        let cases = [
+            ("eq", Condition::Equal),
+            ("ne", Condition::NotEqual),
+            ("lt", Condition::Less),
+            ("le", Condition::LessOrEqual),
+            ("gt", Condition::Greater),
+            ("ge", Condition::GreaterOrEqual),
+            ("lo", Condition::Below),
+            ("cc", Condition::Below),
+            ("ls", Condition::BelowOrEqual),
+            ("hi", Condition::Above),
+            ("hs", Condition::AboveOrEqual),
+            ("cs", Condition::AboveOrEqual),
+            ("mi", Condition::Sign),
+            ("pl", Condition::NotSign),
+            ("vs", Condition::Overflow),
+            ("vc", Condition::NotOverflow),
+        ];
+        for (suffix, expected) in cases {
+            assert_eq!(
+                parse_arm64_condition(suffix),
+                Some(expected),
+                "parse_arm64_condition({suffix})"
+            );
+        }
+        // `al` (always) and unknown suffixes are not conditions.
+        assert_eq!(parse_arm64_condition("al"), None);
+        assert_eq!(parse_arm64_condition("zz"), None);
+        // ARM64 conditional mnemonics dispatch through the `.` suffix.
+        assert_eq!(
+            parse_condition_from_mnemonic("cset.eq"),
+            Some(Condition::Equal)
+        );
+        assert_eq!(
+            parse_condition_from_mnemonic("csinc.ge"),
+            Some(Condition::GreaterOrEqual)
+        );
+        assert_eq!(
+            parse_condition_from_mnemonic("cneg.mi"),
+            Some(Condition::Sign)
+        );
+    }
 }
