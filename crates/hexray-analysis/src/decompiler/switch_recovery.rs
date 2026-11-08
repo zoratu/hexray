@@ -1552,6 +1552,83 @@ mod tests {
         );
     }
 
+    /// Resolve the switch variable for a jump table whose bounds check compares
+    /// `cmp_reg` and whose dispatch block never redefines it — so analysis falls
+    /// through to the calling-convention `argN` naming of the index register.
+    fn switch_var_for_cmp_reg(cmp_reg: hexray_core::Register) -> String {
+        use hexray_core::{Architecture, Instruction, MemoryRef, Register, RegisterClass};
+
+        let rax = Register::new(Architecture::X86_64, RegisterClass::General, 0, 64);
+        let mut cfg = ControlFlowGraph::new(BasicBlockId::new(0));
+
+        // pred: cmp <cmp_reg>, 3 ; ja default
+        let mut pred = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        pred.push_instruction(
+            Instruction::new(0x1000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Register(cmp_reg),
+                    Operand::imm_unsigned(3, 32),
+                ]),
+        );
+        pred.terminator = BlockTerminator::ConditionalBranch {
+            condition: hexray_core::Condition::Above,
+            true_target: BasicBlockId::new(2),
+            false_target: BasicBlockId::new(1),
+        };
+        cfg.add_block(pred);
+
+        // jump: mov rax, [0x402008 + rax*8] ; jmp rax  (never defines cmp_reg)
+        let mut jump = BasicBlock::new(BasicBlockId::new(1), 0x1010);
+        jump.push_instruction(
+            Instruction::new(0x1010, 8, vec![], "mov")
+                .with_operation(Operation::Move)
+                .with_operands(vec![
+                    Operand::Register(rax),
+                    Operand::Memory(MemoryRef::sib(None, Some(rax), 8, 0x402008, 8)),
+                ]),
+        );
+        jump.terminator = BlockTerminator::IndirectJump {
+            target: Operand::Register(rax),
+            possible_targets: vec![],
+        };
+        cfg.add_block(jump);
+
+        let mut default = BasicBlock::new(BasicBlockId::new(2), 0x2000);
+        default.terminator = BlockTerminator::Return;
+        cfg.add_block(default);
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(1));
+        cfg.add_edge(BasicBlockId::new(0), BasicBlockId::new(2));
+
+        let recovery = SwitchRecovery::new(&cfg);
+        let (switch_var, _, _, _) = recovery
+            .analyze_jump_table_block(cfg.block(BasicBlockId::new(1)).unwrap())
+            .expect("jump table recognized");
+        format!("{switch_var}")
+    }
+
+    #[test]
+    fn test_analyze_jump_table_index_register_argn_naming() {
+        use hexray_core::{Architecture, Register, RegisterClass};
+        let x86 = |id: u16| Register::new(Architecture::X86_64, RegisterClass::General, id, 32);
+        let arm = |id: u16| Register::new(Architecture::Arm64, RegisterClass::General, id, 32);
+
+        // SysV / x86-64 integer argument registers map to arg0..arg5.
+        assert_eq!(switch_var_for_cmp_reg(x86(7)), "arg0"); // edi
+        assert_eq!(switch_var_for_cmp_reg(x86(6)), "arg1"); // esi
+        assert_eq!(switch_var_for_cmp_reg(x86(2)), "arg2"); // edx
+        assert_eq!(switch_var_for_cmp_reg(x86(1)), "arg3"); // ecx
+        assert_eq!(switch_var_for_cmp_reg(x86(8)), "arg4"); // r8d
+        assert_eq!(switch_var_for_cmp_reg(x86(9)), "arg5"); // r9d
+
+        // AArch64 argument registers map to arg0/arg1.
+        assert_eq!(switch_var_for_cmp_reg(arm(0)), "arg0"); // w0
+        assert_eq!(switch_var_for_cmp_reg(arm(1)), "arg1"); // w1
+
+        // A non-argument register keeps its own name (fallback arm).
+        assert_eq!(switch_var_for_cmp_reg(x86(3)), "ebx");
+    }
+
     #[test]
     fn test_extract_comparison_requires_immediate_rhs() {
         use hexray_core::{Architecture, Condition, Instruction, Register, RegisterClass};
