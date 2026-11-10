@@ -1558,6 +1558,50 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_constant_indices_recurses_into_containers() {
+        use crate::decompiler::expression::CallTarget;
+        // `arr[3]` buried inside each container kind must still yield arr size >= 4.
+        // Each case pins the corresponding recursive-descent match arm of
+        // scan_expr_for_constant_indices (deleting any arm hides the nested bound).
+        let nested = || arr_access("arr", Expr::int(3));
+        let cases: Vec<(&str, Expr)> = vec![
+            ("BinOp", add(var("y"), nested())),
+            ("UnaryOp", Expr::unary(UnaryOpKind::Neg, nested())),
+            ("Deref", Expr::deref(nested(), 4)),
+            (
+                "Call",
+                Expr::call(CallTarget::Named("f".into()), vec![nested()]),
+            ),
+            (
+                "Cast",
+                Expr {
+                    kind: ExprKind::Cast {
+                        expr: Box::new(nested()),
+                        to_size: 8,
+                        signed: false,
+                    },
+                },
+            ),
+            ("Assign", Expr::assign(var("z"), nested())),
+        ];
+        for (label, expr) in cases {
+            let node = block(vec![expr]);
+            let bounds = infer_array_bounds(&[node]);
+            let info = bounds
+                .get_bounds("arr")
+                .unwrap_or_else(|| panic!("{label}: nested arr[3] bound must be found"));
+            assert_eq!(
+                info[0].min_size.to_string(),
+                "4",
+                "{label}: arr[3] => size >= 4"
+            );
+        }
+        // A negative constant index yields no bound (pins `idx >= 0`).
+        let neg = block(vec![arr_access("arr", Expr::int(-1))]);
+        assert!(infer_array_bounds(&[neg]).get_bounds("arr").is_none());
+    }
+
+    #[test]
     fn test_expr_uses_var_recurses_all_arms() {
         // Positive through BinOp, UnaryOp, Cast, ArrayAccess-index recursion.
         assert!(expr_uses_var(&add(var("a"), var("x")), "x"));
