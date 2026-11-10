@@ -164,13 +164,30 @@ id), so no input can distinguish the original from the mutant. Correctly unkilla
 > re-measured end-to-end with `cargo-mutants` on a spot (69 → 11 after batches 1–5,
 > → 3 equivalent after batch 6).
 
+### ✅ Done — array_detection.rs (COMPLETE: 77 → 3 equivalent)
+Commits `7704c2489`, `378422a1e`, `062b4bbe1`. Four batches of fixtures + tests
+across the whole file:
+- detection helpers (`extract_mul_by_constant` / `extract_shift_left_by_constant`
+  bounds, `is_likely_array_base` arms, scaled / shift / constant-offset / struct-array
+  detectors with exact base/index/element-size, size gates, commutativity, alignment
+  and zero/unaligned rejection, struct field-offset math incl. const-first/shift paths)
+- bounds inference (`infer_array_bounds` for `<` / `<=` / constant-index / non-unit
+  stride; `is_simple_increment_for_inference` Assign + CompoundAssign arms;
+  `expr_to_bound` IntLit/Product/Sum; `expr_uses_var` recursion incl. Cast)
+- the loop-bound tree walkers (`collect_bounds_from_node`,
+  `collect_array_accesses_in_loop`, `collect_array_accesses_from_expr`,
+  `scan_expr_for_constant_indices`) across every container/expr arm
+
+**Spot-measured (c7g.4xlarge aarch64, package-scoped): 213 mutants, 77 → 35 → 3.**
+Final run: `213 mutants tested: 3 missed, 187 caught, 23 unviable`. The 3 survivors
+are **equivalent mutants**: `element_size > 0` at lines 131/143/249, where the
+element size comes from `extract_mul_by_constant` / `infer_element_size` /
+`expected_size>0` and is provably always ≥ 1, so `> 0` and `>= 0` can never differ.
+
 ## Remaining work (other files, ranked)
 
-1. **Array-detection shape tests** — `try_detect_struct_array_access`,
-   `try_detect_scaled_access`, `extract_mul_by_constant` (77 crate-local survivors
-   in `array_detection.rs`, not yet closed).
-2. **`condition.rs` re-measure** — the condition/flag-lifting tables were closed by
+1. **`condition.rs` re-measure** — the condition/flag-lifting tables were closed by
    injection-verification but not yet re-measured end-to-end with `cargo-mutants`
    (223 crate-local survivors before the tests; expect a large drop).
-3. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
+2. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
    must ship with tests that catch its mutants, without re-sweeping the whole tree.
