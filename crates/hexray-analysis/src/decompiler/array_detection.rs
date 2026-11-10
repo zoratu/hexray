@@ -1313,4 +1313,260 @@ mod tests {
         assert!(bounds1.get_bounds("arr1").is_some());
         assert!(bounds1.get_bounds("arr2").is_some());
     }
+
+    // =====================================================================
+    // Mutation-testing coverage: these pin the pure pattern-detection helpers
+    // and the bounds-inference tree walkers, where a swapped operator or a
+    // dropped match arm silently mis-decodes an array access or loses a bound.
+    // =====================================================================
+
+    fn mul(a: Expr, b: Expr) -> Expr {
+        Expr::binop(BinOpKind::Mul, a, b)
+    }
+    fn add(a: Expr, b: Expr) -> Expr {
+        Expr::binop(BinOpKind::Add, a, b)
+    }
+
+    #[test]
+    fn test_extract_mul_by_constant_bounds() {
+        // operand * const and const * operand, within (0, 1024].
+        assert_eq!(extract_mul_by_constant(&mul(var("x"), Expr::int(4))).unwrap().1, 4);
+        assert_eq!(extract_mul_by_constant(&mul(Expr::int(8), var("x"))).unwrap().1, 8);
+        assert_eq!(extract_mul_by_constant(&mul(var("x"), Expr::int(1024))).unwrap().1, 1024);
+        // Boundaries: 0 and negatives are not element sizes (pins `> 0`); >1024 rejected.
+        assert!(extract_mul_by_constant(&mul(var("x"), Expr::int(0))).is_none());
+        assert!(extract_mul_by_constant(&mul(Expr::int(0), var("x"))).is_none());
+        assert!(extract_mul_by_constant(&mul(var("x"), Expr::int(-4))).is_none());
+        assert!(extract_mul_by_constant(&mul(var("x"), Expr::int(1025))).is_none());
+        // Not a multiply.
+        assert!(extract_mul_by_constant(&add(var("x"), Expr::int(4))).is_none());
+    }
+
+    #[test]
+    fn test_extract_shift_left_by_constant_bounds() {
+        let shl = |a: Expr, b: Expr| Expr::binop(BinOpKind::Shl, a, b);
+        assert_eq!(extract_shift_left_by_constant(&shl(var("x"), Expr::int(3))).unwrap().1, 3);
+        // Boundaries 0..=6 inclusive; outside rejected (pins `>= 0` and `<= 6`).
+        assert_eq!(extract_shift_left_by_constant(&shl(var("x"), Expr::int(0))).unwrap().1, 0);
+        assert_eq!(extract_shift_left_by_constant(&shl(var("x"), Expr::int(6))).unwrap().1, 6);
+        assert!(extract_shift_left_by_constant(&shl(var("x"), Expr::int(7))).is_none());
+        assert!(extract_shift_left_by_constant(&shl(var("x"), Expr::int(-1))).is_none());
+    }
+
+    #[test]
+    fn test_is_likely_array_base_variants() {
+        // Each accepted ExprKind arm.
+        assert!(is_likely_array_base(&var("p")));
+        assert!(is_likely_array_base(&Expr::deref(var("p"), 8)));
+        assert!(is_likely_array_base(&Expr::got_ref(0x1000, 0x10, 8, var("g"))));
+        assert!(is_likely_array_base(&Expr::address_of(var("p"))));
+        assert!(is_likely_array_base(&Expr::array_access(var("p"), Expr::int(0), 4)));
+        // A bare integer / arithmetic is not an array base (the `_ => false` arm).
+        assert!(!is_likely_array_base(&Expr::int(5)));
+        assert!(!is_likely_array_base(&add(var("a"), var("b"))));
+    }
+
+    #[test]
+    fn test_scaled_access_exact_values_and_size_gate() {
+        // base + index*4, deref size 4 => rbx[rcx], base rbx, element 4, not addr-of.
+        let addr = add(var("rbx"), mul(var("rcx"), Expr::int(4)));
+        let info = detect_array_access(&addr, 4).expect("scaled access");
+        assert_eq!(info.element_size, 4);
+        assert_eq!(info.base.to_string(), "rbx");
+        assert_eq!(info.index.to_string(), "rcx");
+        assert!(!info.is_address_of);
+        assert_eq!(try_transform_deref_to_array_access(&addr, 4).unwrap().to_string(), "rbx[rcx]");
+        // Element size must MATCH the expected deref size (pins `== expected_size`
+        // and the `&&`): a *4 pattern with deref size 8 is not this array access.
+        assert!(try_detect_scaled_access(&addr, 8).is_none());
+        // expected_size 0 means "any" — still detected.
+        assert!(try_detect_scaled_access(&addr, 0).is_some());
+        // Commutative: (index*8) + base.
+        let comm = add(mul(var("rcx"), Expr::int(8)), var("rbx"));
+        let ci = detect_array_access(&comm, 8).expect("commutative scaled access");
+        assert_eq!(ci.base.to_string(), "rbx");
+        assert_eq!(ci.element_size, 8);
+    }
+
+    #[test]
+    fn test_shift_pattern_exact_and_size_gate() {
+        let shl = |a: Expr, b: Expr| Expr::binop(BinOpKind::Shl, a, b);
+        // rbx + (rcx << 2) == rbx + rcx*4.
+        let addr = add(var("rbx"), shl(var("rcx"), Expr::int(2)));
+        let info = detect_array_access(&addr, 4).expect("shift pattern");
+        assert_eq!(info.element_size, 4, "1 << 2 == 4");
+        // Size gate: << 2 (==4) with deref size 8 must not match.
+        assert!(try_detect_shift_pattern(&addr, 8).is_none());
+        // Commutative order.
+        let comm = add(shl(var("rcx"), Expr::int(3)), var("rbx"));
+        assert_eq!(detect_array_access(&comm, 8).expect("commutative shift").element_size, 8);
+    }
+
+    #[test]
+    fn test_constant_offset_alignment_and_zero_guard() {
+        // rbx + 0x10, 4-byte elements => index 0x10/4 = 4.
+        let addr = add(var("rbx"), Expr::int(0x10));
+        let info = detect_array_access(&addr, 4).expect("constant offset");
+        assert_eq!(info.index.to_string(), "4");
+        assert_eq!(info.element_size, 4);
+        // Unaligned offset (0x11 % 4 != 0) is rejected (pins `offset % size == 0`).
+        assert!(detect_array_access(&add(var("rbx"), Expr::int(0x11)), 4).is_none());
+        // A zero offset is not a constant-index access (pins `offset != 0`).
+        assert!(detect_array_access(&add(var("rbx"), Expr::int(0)), 4).is_none());
+        // Subtraction: rbx - 8 (4-byte) => index -2.
+        let sub = Expr::binop(BinOpKind::Sub, var("rbx"), Expr::int(8));
+        assert_eq!(detect_array_access(&sub, 4).expect("neg index").index.to_string(), "-0x2");
+    }
+
+    #[test]
+    fn test_struct_array_access_field_offset_math() {
+        // (rbx + rcx*8) + 16 with 8-byte stride => base rbx, index rcx + (16/8) = rcx + 2.
+        // Called directly: through the public pipeline the constant-offset detector
+        // shadows this path, so the struct-specific field math is exercised here.
+        let scaled = add(var("rbx"), mul(var("rcx"), Expr::int(8)));
+        let addr = add(scaled.clone(), Expr::int(16));
+        let info = try_detect_struct_array_access(&addr, 8).expect("struct array");
+        assert_eq!(info.base.to_string(), "rbx");
+        assert_eq!(info.index.to_string(), "rcx + 2", "additional index = field_offset / stride");
+        assert_eq!(info.element_size, 8);
+        // Unaligned field offset (4 % 8 != 0) does not form a struct-array access.
+        assert!(try_detect_struct_array_access(&add(scaled, Expr::int(4)), 8).is_none());
+    }
+
+    // ---- Bounds inference ----
+
+    use crate::decompiler::expression::UnaryOpKind;
+    use crate::decompiler::structurer::StructuredNode;
+    use hexray_core::BasicBlockId;
+
+    /// `arr[i]` as an array-access expression (4-byte elements).
+    fn arr_access(array: &str, index: Expr) -> Expr {
+        Expr::array_access(var(array), index, 4)
+    }
+
+    /// A `for (i = <start>; i <cmp> <bound>; i <upd>) { <body> }` node.
+    fn for_loop(init: Expr, condition: Expr, update: Expr, body: Vec<StructuredNode>) -> StructuredNode {
+        StructuredNode::For {
+            init: Some(init),
+            condition,
+            update: Some(update),
+            body,
+            header: None,
+            exit_block: None,
+        }
+    }
+
+    fn block(statements: Vec<Expr>) -> StructuredNode {
+        StructuredNode::Block {
+            id: BasicBlockId::new(0),
+            statements,
+            address_range: (0, 0),
+        }
+    }
+
+    fn compound_add(v: &str, op: BinOpKind, k: i128) -> Expr {
+        Expr {
+            kind: ExprKind::CompoundAssign {
+                op,
+                lhs: Box::new(var(v)),
+                rhs: Box::new(Expr::int(k)),
+            },
+        }
+    }
+
+    #[test]
+    fn test_infer_bounds_variable_from_for_lt() {
+        // for (i = 0; i < n; i = i + 1) arr[i] => arr has min_size n, High confidence.
+        let node = for_loop(
+            Expr::assign(var("i"), Expr::int(0)),
+            Expr::binop(BinOpKind::Lt, var("i"), var("n")),
+            Expr::assign(var("i"), add(var("i"), Expr::int(1))),
+            vec![StructuredNode::Expr(arr_access("arr", var("i")))],
+        );
+        let bounds = infer_array_bounds(&[node]);
+        let info = bounds.get_bounds("arr").expect("arr bound inferred");
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].min_size.to_string(), "n");
+        assert_eq!(info[0].confidence, BoundConfidence::High);
+        // arrays() must surface the array name (pins ArrayBounds::arrays).
+        assert_eq!(bounds.arrays().collect::<Vec<_>>(), vec!["arr"]);
+    }
+
+    #[test]
+    fn test_infer_bounds_le_adds_one() {
+        // for (i = 0; i <= n; i += 1) arr[i] => bound is (n + 1).
+        let node = for_loop(
+            Expr::assign(var("i"), Expr::int(0)),
+            Expr::binop(BinOpKind::Le, var("i"), var("n")),
+            compound_add("i", BinOpKind::Add, 1),
+            vec![StructuredNode::Expr(arr_access("arr", var("i")))],
+        );
+        let bounds = infer_array_bounds(&[node]);
+        let info = bounds.get_bounds("arr").expect("arr bound inferred");
+        assert_eq!(info[0].min_size.to_string(), "(n + 1)", "var <= N means bound N+1");
+    }
+
+    #[test]
+    fn test_infer_bounds_requires_simple_increment() {
+        // A non-unit stride (i = i + 2) must NOT produce a loop-variable bound.
+        let node = for_loop(
+            Expr::assign(var("i"), Expr::int(0)),
+            Expr::binop(BinOpKind::Lt, var("i"), var("n")),
+            Expr::assign(var("i"), add(var("i"), Expr::int(2))),
+            vec![StructuredNode::Expr(arr_access("arr", var("i")))],
+        );
+        assert!(
+            infer_array_bounds(&[node]).get_bounds("arr").is_none(),
+            "i = i + 2 is not a simple increment"
+        );
+    }
+
+    #[test]
+    fn test_infer_bounds_constant_index() {
+        // A Block statement `arr[3]` implies arr has at least 4 elements.
+        let node = block(vec![arr_access("arr", Expr::int(3))]);
+        let bounds = infer_array_bounds(&[node]);
+        let info = bounds.get_bounds("arr").expect("constant-index bound");
+        assert_eq!(info[0].min_size.to_string(), "4", "arr[3] => size >= 4");
+        assert_eq!(info[0].confidence, BoundConfidence::Medium);
+    }
+
+    #[test]
+    fn test_is_simple_increment_for_inference_cases() {
+        let assign_add = |v: &str, k: i128| {
+            Expr::assign(var(v), add(var(v), Expr::int(k)))
+        };
+        // i = i + 1 is a simple increment of i.
+        assert!(is_simple_increment_for_inference(&assign_add("i", 1), "i"));
+        // Wrong constant, wrong variable, wrong loop var all reject.
+        assert!(!is_simple_increment_for_inference(&assign_add("i", 2), "i"));
+        assert!(!is_simple_increment_for_inference(&Expr::assign(var("i"), add(var("j"), Expr::int(1))), "i"));
+        assert!(!is_simple_increment_for_inference(&assign_add("j", 1), "i"));
+        // Compound form i += 1 (pins the CompoundAssign arm + its && and == checks).
+        assert!(is_simple_increment_for_inference(
+            &compound_add("i", BinOpKind::Add, 1),
+            "i"
+        ));
+        assert!(!is_simple_increment_for_inference(
+            &compound_add("i", BinOpKind::Add, 2),
+            "i"
+        ));
+        assert!(!is_simple_increment_for_inference(
+            &compound_add("i", BinOpKind::Sub, 1),
+            "i"
+        ));
+    }
+
+    #[test]
+    fn test_expr_uses_var_recurses_all_arms() {
+        // Positive through BinOp, UnaryOp, Cast, ArrayAccess-index recursion.
+        assert!(expr_uses_var(&add(var("a"), var("x")), "x"));
+        assert!(expr_uses_var(&Expr::unary(UnaryOpKind::Neg, var("x")), "x"));
+        assert!(expr_uses_var(&Expr::array_access(var("arr"), var("x"), 4), "x"));
+        // Negative: the var appears nowhere.
+        assert!(!expr_uses_var(&add(var("a"), var("b")), "x"));
+        // ArrayAccess uses `||` over base/index: base-only match still counts, and a
+        // miss in both is false (pins the `||`, which a `&&` mutation would break).
+        assert!(expr_uses_var(&Expr::array_access(var("x"), Expr::int(0), 4), "x"));
+    }
 }
