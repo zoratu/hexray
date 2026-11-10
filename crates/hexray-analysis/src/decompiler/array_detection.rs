@@ -1601,6 +1601,213 @@ mod tests {
         assert!(infer_array_bounds(&[neg]).get_bounds("arr").is_none());
     }
 
+    /// A `for (i=0; i<n; i+=1) arr[i]` loop, with the body wrapped by `wrap`.
+    fn for_arr_loop(body: Vec<StructuredNode>) -> StructuredNode {
+        for_loop(
+            Expr::assign(var("i"), Expr::int(0)),
+            Expr::binop(BinOpKind::Lt, var("i"), var("n")),
+            Expr::assign(var("i"), add(var("i"), Expr::int(1))),
+            body,
+        )
+    }
+
+    #[test]
+    fn test_collect_bounds_recurses_into_containers() {
+        // A loop that establishes arr's bound, nested inside each container node,
+        // must still be found. Pins the recursive arms of collect_bounds_from_node.
+        let inner = || vec![for_arr_loop(vec![StructuredNode::Expr(arr_access("arr", var("i")))])];
+        let containers: Vec<(&str, StructuredNode)> = vec![
+            ("While", StructuredNode::While {
+                condition: Expr::int(1),
+                body: inner(),
+                header: None,
+                exit_block: None,
+            }),
+            ("If", StructuredNode::If {
+                condition: Expr::int(1),
+                then_body: inner(),
+                else_body: None,
+            }),
+            ("If-else", StructuredNode::If {
+                condition: Expr::int(1),
+                then_body: vec![],
+                else_body: Some(inner()),
+            }),
+            ("Switch", StructuredNode::Switch {
+                value: var("x"),
+                cases: vec![(vec![0], inner())],
+                default: None,
+            }),
+            ("Switch-default", StructuredNode::Switch {
+                value: var("x"),
+                cases: vec![],
+                default: Some(inner()),
+            }),
+            ("Sequence", StructuredNode::Sequence(inner())),
+            ("TryCatch", StructuredNode::TryCatch {
+                try_body: inner(),
+                catch_handlers: vec![],
+            }),
+            ("TryCatch-handler", StructuredNode::TryCatch {
+                try_body: vec![],
+                catch_handlers: vec![crate::decompiler::structurer::CatchHandler {
+                    exception_type: None,
+                    variable_name: None,
+                    body: inner(),
+                    landing_pad: 0,
+                }],
+            }),
+        ];
+        for (label, node) in containers {
+            assert!(
+                infer_array_bounds(&[node]).get_bounds("arr").is_some(),
+                "{label}: loop bound nested in this container must be collected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_loop_accesses_recurses_into_body_containers() {
+        // arr[i] nested inside Block / Sequence / If within the loop body must be
+        // collected. Pins the arms of collect_array_accesses_in_loop.
+        let acc = || StructuredNode::Expr(arr_access("arr", var("i")));
+        let bodies: Vec<(&str, Vec<StructuredNode>)> = vec![
+            ("Block", vec![block(vec![arr_access("arr", var("i"))])]),
+            ("Sequence", vec![StructuredNode::Sequence(vec![acc()])]),
+            ("If", vec![StructuredNode::If {
+                condition: Expr::int(1),
+                then_body: vec![acc()],
+                else_body: None,
+            }]),
+            ("If-else", vec![StructuredNode::If {
+                condition: Expr::int(1),
+                then_body: vec![],
+                else_body: Some(vec![acc()]),
+            }]),
+        ];
+        for (label, body) in bodies {
+            let node = for_arr_loop(body);
+            assert!(
+                infer_array_bounds(&[node]).get_bounds("arr").is_some(),
+                "{label}: arr[i] nested in loop body must be collected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_collect_loop_accesses_recurses_into_container_exprs() {
+        use crate::decompiler::expression::CallTarget;
+        // arr[i] nested inside a container EXPRESSION within the loop body. Pins the
+        // arms of collect_array_accesses_from_expr.
+        let acc = || arr_access("arr", var("i"));
+        let exprs: Vec<(&str, Expr)> = vec![
+            ("Assign", Expr::assign(var("z"), acc())),
+            ("BinOp", add(var("y"), acc())),
+            ("UnaryOp", Expr::unary(UnaryOpKind::Neg, acc())),
+            ("Deref", Expr::deref(acc(), 4)),
+            ("Call", Expr::call(CallTarget::Named("f".into()), vec![acc()])),
+            ("Cast", Expr {
+                kind: ExprKind::Cast { expr: Box::new(acc()), to_size: 8, signed: false },
+            }),
+        ];
+        for (label, e) in exprs {
+            let node = for_arr_loop(vec![StructuredNode::Expr(e)]);
+            assert!(
+                infer_array_bounds(&[node]).get_bounds("arr").is_some(),
+                "{label}: arr[i] in this expr must be collected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_expr_to_bound_shapes() {
+        // The loop bound expression shape flows into min_size. Pins the IntLit / Mul
+        // / Add arms of expr_to_bound (and the Variable arm via earlier tests).
+        let bound_for = |cond_rhs: Expr| {
+            let node = for_loop(
+                Expr::assign(var("i"), Expr::int(0)),
+                Expr::binop(BinOpKind::Lt, var("i"), cond_rhs),
+                Expr::assign(var("i"), add(var("i"), Expr::int(1))),
+                vec![StructuredNode::Expr(arr_access("arr", var("i")))],
+            );
+            infer_array_bounds(&[node])
+                .get_bounds("arr")
+                .map(|b| b[0].min_size.to_string())
+        };
+        assert_eq!(bound_for(Expr::int(10)).as_deref(), Some("10")); // IntLit
+        assert_eq!(
+            bound_for(Expr::binop(BinOpKind::Mul, var("n"), Expr::int(2))).as_deref(),
+            Some("(n * 2)")
+        ); // Product
+        assert_eq!(
+            bound_for(Expr::binop(BinOpKind::Add, var("n"), Expr::int(1))).as_deref(),
+            Some("(n + 1)")
+        ); // Sum
+    }
+
+    #[test]
+    fn test_expr_uses_var_cast_arm() {
+        // The loop index reached through a Cast still counts as using the loop var,
+        // so the bound is collected. Pins the Cast arm of expr_uses_var.
+        let cast_i = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(var("i")),
+                to_size: 8,
+                signed: true,
+            },
+        };
+        let node = for_arr_loop(vec![StructuredNode::Expr(Expr::array_access(
+            var("arr"),
+            cast_i,
+            4,
+        ))]);
+        assert!(
+            infer_array_bounds(&[node]).get_bounds("arr").is_some(),
+            "arr[(cast)i] must be recognised as using the loop variable"
+        );
+    }
+
+    #[test]
+    fn test_struct_array_commutative_and_shift_paths() {
+        // const + (base + index*stride): index becomes (offset/stride) + old_index.
+        let scaled = add(var("rbx"), mul(var("rcx"), Expr::int(8)));
+        let const_first = add(Expr::int(16), scaled);
+        let info = try_detect_struct_array_access(&const_first, 8).expect("const + scaled");
+        assert_eq!(info.index.to_string(), "2 + rcx", "offset/stride prepended");
+
+        // (base + index<<shift) + const: index becomes old_index + offset/stride.
+        let shl = Expr::binop(BinOpKind::Shl, var("rcx"), Expr::int(3)); // <<3 => stride 8
+        let shift_struct = add(add(var("rbx"), shl), Expr::int(16));
+        let info2 = try_detect_struct_array_access(&shift_struct, 8).expect("shift + const");
+        assert_eq!(info2.index.to_string(), "rcx + 2");
+    }
+
+    #[test]
+    fn test_scaled_and_shift_commutative_size_gate() {
+        // Commutative (index*4)+base with a MISMATCHED expected size must decline.
+        let comm_mul = add(mul(var("rcx"), Expr::int(4)), var("rbx"));
+        assert!(try_detect_scaled_access(&comm_mul, 8).is_none());
+        assert!(try_detect_scaled_access(&comm_mul, 4).is_some());
+        // Commutative (index<<2)+base with a mismatched expected size must decline.
+        let comm_shl = add(Expr::binop(BinOpKind::Shl, var("rcx"), Expr::int(2)), var("rbx"));
+        assert!(try_detect_shift_pattern(&comm_shl, 8).is_none());
+        assert!(try_detect_shift_pattern(&comm_shl, 4).is_some());
+    }
+
+    #[test]
+    fn test_constant_offset_const_first_and_inferred_size() {
+        // const + base (constant on the left) is a valid constant-offset access.
+        let const_first = add(Expr::int(0x10), var("rbx"));
+        let info = detect_array_access(&const_first, 4).expect("const + base");
+        assert_eq!(info.index.to_string(), "4"); // 0x10 / 4
+        // With expected_size 0 the element size is inferred from offset alignment
+        // (0x10 => 8), so the access is still formed (pins `expected_size > 0`).
+        let inferred = try_detect_constant_offset(&add(var("rbx"), Expr::int(0x10)), 0)
+            .expect("inferred element size");
+        assert_eq!(inferred.element_size, 8);
+        assert_eq!(inferred.index.to_string(), "2"); // 16 / 8
+    }
+
     #[test]
     fn test_expr_uses_var_recurses_all_arms() {
         // Positive through BinOp, UnaryOp, Cast, ArrayAccess-index recursion.
