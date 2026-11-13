@@ -2541,4 +2541,120 @@ mod tests {
             "cmovl must lower to a ternary using the < predicate, got {rendered}"
         );
     }
+
+    // =====================================================================
+    // Lock-prefix / cmpxchg helpers, ARM64 branch conditions, ARM64 writeback,
+    // and ALU-update tracking in the register-value map.
+    // =====================================================================
+
+    #[test]
+    fn test_is_lock_prefixed_and_cmpxchg() {
+        let locked = Instruction::new(0x10, 3, vec![0xf0, 0x0f, 0xb1], "cmpxchg");
+        let plain = Instruction::new(0x10, 2, vec![0x0f, 0xb1], "cmpxchg");
+        assert!(is_lock_prefixed(&locked));
+        assert!(!is_lock_prefixed(&plain), "no 0xf0 prefix => not lock-prefixed");
+        assert!(is_cmpxchg_instruction(&plain));
+        assert!(is_cmpxchg_instruction(&Instruction::new(0x10, 2, vec![], "CMPXCHG")));
+        assert!(is_cmpxchg_instruction(&Instruction::new(0x10, 2, vec![], "lock cmpxchg")));
+        assert!(!is_cmpxchg_instruction(&Instruction::new(0x10, 2, vec![], "xchg")));
+    }
+
+    #[test]
+    fn test_arm64_branch_condition_cbz_tbz() {
+        let w0 = Register::new(Architecture::Arm64, RegisterClass::General, 0, 32);
+        let empty = HashMap::new();
+        let make = |mnem: &str, ops: Vec<Operand>| {
+            let mut b = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+            b.instructions.push(
+                Instruction::new(0x1000, 4, vec![], mnem)
+                    .with_operation(Operation::ConditionalJump)
+                    .with_operands(ops),
+            );
+            b
+        };
+        // CBZ w0  => (w0 == 0) when invoked with Eq. (int 0 renders as '\0' at
+        // char width, so assert on the operator + register, not the literal.)
+        let cbz = make("cbz", vec![Operand::Register(w0), Operand::imm_unsigned(0x2000, 64)]);
+        let r_cbz = format!("{}", try_extract_arm64_branch_condition(&cbz, BinOpKind::Eq, &empty).unwrap());
+        assert!(r_cbz.starts_with("w0 =="), "got {r_cbz}");
+        // TBZ w0, #31 (sign bit) => w0 >= 0; TBNZ => w0 < 0.
+        let tbz = make("tbz", vec![
+            Operand::Register(w0),
+            Operand::imm_unsigned(31, 32),
+            Operand::imm_unsigned(0x2000, 64),
+        ]);
+        let r_tbz = format!("{}", try_extract_arm64_branch_condition(&tbz, BinOpKind::Eq, &empty).unwrap());
+        assert!(r_tbz.starts_with("w0 >="), "tbz sign-bit => >=, got {r_tbz}");
+        let tbnz = make("tbnz", vec![
+            Operand::Register(w0),
+            Operand::imm_unsigned(31, 32),
+            Operand::imm_unsigned(0x2000, 64),
+        ]);
+        let r_tbnz = format!("{}", try_extract_arm64_branch_condition(&tbnz, BinOpKind::Ne, &empty).unwrap());
+        assert!(r_tbnz.starts_with("w0 <") && !r_tbnz.starts_with("w0 <="), "tbnz sign-bit => <, got {r_tbnz}");
+        // TBZ w0, #3 (non-sign bit) => bit test ((w0 >> 3) & 1) == 0.
+        let tbz_bit = make("tbz", vec![
+            Operand::Register(w0),
+            Operand::imm_unsigned(3, 32),
+            Operand::imm_unsigned(0x2000, 64),
+        ]);
+        let r = format!("{}", try_extract_arm64_branch_condition(&tbz_bit, BinOpKind::Eq, &empty).unwrap());
+        assert!(r.contains(">> 3") && r.contains("& 1") && r.contains("=="), "got {r}");
+        // A block with no conditional-jump yields None.
+        let none_block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        assert!(try_extract_arm64_branch_condition(&none_block, BinOpKind::Eq, &empty).is_none());
+    }
+
+    #[test]
+    fn test_generate_writeback_post_pre_indexed() {
+        let x8 = Register::new(Architecture::Arm64, RegisterClass::General, 8, 64);
+        let w9 = Register::new(Architecture::Arm64, RegisterClass::General, 9, 32);
+        let mut mem = MemoryRef::base_disp(x8, 1, 1);
+        mem.index_mode = hexray_core::IndexMode::Post;
+        // ldr w9, [x8], #1  => writeback x8 = x8 + 1.
+        let ldr = Instruction::new(0x1000, 4, vec![], "ldr")
+            .with_operation(Operation::Load)
+            .with_operands(vec![Operand::Register(w9), Operand::Memory(mem.clone())]);
+        assert_eq!(generate_writeback_expr(&ldr).unwrap().to_string(), "x8 = x8 + 1");
+        // Pre-indexed also writes back.
+        let mut mem_pre = MemoryRef::base_disp(x8, 4, 8);
+        mem_pre.index_mode = hexray_core::IndexMode::Pre;
+        let ldr_pre = Instruction::new(0x1000, 4, vec![], "ldr")
+            .with_operation(Operation::Load)
+            .with_operands(vec![Operand::Register(w9), Operand::Memory(mem_pre)]);
+        assert_eq!(generate_writeback_expr(&ldr_pre).unwrap().to_string(), "x8 = x8 + 4");
+        // A plain (non-indexed) load has no writeback.
+        let plain = Instruction::new(0x1000, 4, vec![], "ldr")
+            .with_operation(Operation::Load)
+            .with_operands(vec![Operand::Register(w9), Operand::Memory(MemoryRef::base_disp(x8, 0, 4))]);
+        assert!(generate_writeback_expr(&plain).is_none());
+        // A non-load/store op => None.
+        let mov = Instruction::new(0x1000, 3, vec![], "mov")
+            .with_operation(Operation::Move)
+            .with_operands(vec![Operand::Register(w9), Operand::Register(x8)]);
+        assert!(generate_writeback_expr(&mov).is_none());
+    }
+
+    #[test]
+    fn test_register_value_map_tracks_alu_update() {
+        // add eax, 3 ; cmp eax, 5 ; je  => condition sees (rax + 3) == 5, i.e. the
+        // ALU update is folded into the compared value. Pins the ALU-tracking path.
+        let eax = Operand::Register(reg32(0));
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(
+            Instruction::new(0x1000, 3, vec![], "add")
+                .with_operation(Operation::Add)
+                .with_operands(vec![eax.clone(), Operand::imm_unsigned(3, 32)]),
+        );
+        block.instructions.push(
+            Instruction::new(0x1003, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![eax, Operand::imm_unsigned(5, 32)]),
+        );
+        let rendered = format!("{}", condition_to_expr_with_block(Condition::Equal, &block));
+        assert!(
+            rendered.contains("rax + 3") && rendered.contains("== 5"),
+            "ALU update must be folded into the compared value, got {rendered}"
+        );
+    }
 }
