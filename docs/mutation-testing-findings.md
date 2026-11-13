@@ -184,10 +184,45 @@ are **equivalent mutants**: `element_size > 0` at lines 131/143/249, where the
 element size comes from `extract_mul_by_constant` / `infer_element_size` /
 `expected_size>0` and is provably always ≥ 1, so `> 0` and `>= 0` can never differ.
 
-## Remaining work (other files, ranked)
+### ✅ Done — condition.rs (148 → 28; 91% of viable caught)
+Commits `6cdfef955`, `c1676443c`, `449e7857b`, `6e49000e3`, `3e9fb547e`. Six batches
+(beyond the earlier table batch `aa228e68b`). First full measure found **333 mutants,
+148 missed** — the earlier batch had covered only 4 of ~22 functions. The batches
+closed the pure helpers (`x86_float_compare_binop`, `is_flag_setting_instruction`,
+`binop_for_register_update`, `register_aliases`, `substitute_register_in_expr`,
+`expr_known_bit_width`, `expr_is_boolean_wrapper`, `expr_requires_single_evaluation`),
+the big `condition_to_expr_before_address_with_fallback` lowering (operator table +
+neg/inc/dec/test/xor/sub/add instruction shapes) and setcc/cmovcc, the lock/cmpxchg
++ ARM64 branch (CBZ/TBZ/TBNZ) + ARM64 writeback + ALU-update tracking, the fallback
+placeholder table, logical-op compares, the ARM64 conditional-select family
+(csel/cinc/cinv/cneg/cset/csetm) and rdtsc/rdtscp.
 
-1. **`condition.rs` re-measure** — the condition/flag-lifting tables were closed by
-   injection-verification but not yet re-measured end-to-end with `cargo-mutants`
-   (223 crate-local survivors before the tests; expect a large drop).
-2. **Adopt `scripts/check-mutants --in-diff origin/main` as a CI gate** so new code
-   must ship with tests that catch its mutants, without re-sweeping the whole tree.
+**Spot-measured (c7g.4xlarge aarch64, package-scoped): 333 mutants, 148 → 70 → 31 →
+28.** Final: `333 mutants tested: 28 missed, 280 caught, 25 unviable` (91% of the 308
+viable). The remaining **28 are the intricate internal-dataflow tail** — deferred as
+below-the-value-line, not equivalent:
+- `build_register_value_map_with_options` (9): multi-instruction register tracking,
+  each mutant needs a bespoke dataflow fixture
+- `condition_to_expr_before_address_with_fallback` (6): deep edge cases
+- `try_lift_lock_prefixed_zero_flag_condition` (5): the lock-atomic exchange lifter
+- `lift_setcc_with_context` (3): internal `&&` guard conjunctions
+- `generate_writeback_expr` (2) and `find_flag_setting_instruction` (1) are
+  near-equivalent (a var `size` field / a before-address filter not reflected in
+  rendered output); `expr_requires_single_evaluation` (2)
+
+### ✅ Done — CI gate (`scripts/check-mutants --in-diff` + `ci-local --mutants`)
+Commit `f9392e8f2`. `check-mutants --in-diff <ref>` now resolves a git ref to a
+merge-base diff of the working tree (uncommitted changes included) and feeds it to
+cargo-mutants; a ready-made `.diff` file still works. `ci-local --tier full
+--mutants` runs the gate over only the lines changed vs `--mutants-base` (default
+`origin/main`), requiring every mutant on new code be caught — off by default since
+it is heavy. Verified: `--in-diff origin/main` lists exactly the mutants of a changed
+source line and nothing else.
+
+## Remaining work (optional)
+
+1. **condition.rs deep tail (28)** — the internal-dataflow functions above. Needs
+   bespoke multi-instruction fixtures; low ROI vs the 48%→91% already gained.
+2. **Other hot-path files** — `emitter/mod.rs`, `structurer/simplify.rs`,
+   `signature/mod.rs` are large and unmeasured; `short_circuit.rs` had only 3
+   crate-local survivors.
