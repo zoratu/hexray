@@ -2720,6 +2720,17 @@ mod tests {
             .with_operands(vec![reg(0), reg(6)]);
         let r = cond_over(Condition::Equal, and2);
         assert!(has(&r, &["rax & rsi", "=="]), "and2 => (rax & rsi) == 0, got {r}");
+        // 2-operand or / xor (pins the Or/Xor arms of the 2-operand logical branch).
+        let or2 = Instruction::new(0x1000, 3, vec![], "or")
+            .with_operation(Operation::Or)
+            .with_operands(vec![reg(0), reg(6)]);
+        let r = cond_over(Condition::Equal, or2);
+        assert!(has(&r, &["rax | rsi", "=="]), "or2 => (rax | rsi) == 0, got {r}");
+        let xor2 = Instruction::new(0x1000, 3, vec![], "xor")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![reg(0), reg(6)]);
+        let r = cond_over(Condition::Equal, xor2);
+        assert!(has(&r, &["rax ^ rsi", "=="]), "xor2 => (rax ^ rsi) == 0, got {r}");
     }
 
     #[test]
