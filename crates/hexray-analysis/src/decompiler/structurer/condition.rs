@@ -2389,4 +2389,156 @@ mod tests {
         // Non-register raw operand => false.
         assert!(!should_preserve_subregister_test_alias(&Operand::imm_unsigned(1, 32), &wide));
     }
+
+    // =====================================================================
+    // condition_to_expr_before_address_with_fallback — the big condition
+    // lowering function, reached via condition_to_expr_with_block. These pin
+    // its Condition->operator table and its per-instruction-shape branches.
+    // =====================================================================
+
+    /// A single-instruction block, returning the rendering of `cond` over it.
+    fn cond_over(cond: Condition, inst: Instruction) -> String {
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        block.instructions.push(inst);
+        format!("{}", condition_to_expr_with_block(cond, &block))
+    }
+
+    /// A `cmp eax, 5` block rendered under `cond`.
+    fn cmp_cond(cond: Condition) -> String {
+        cond_over(
+            cond,
+            Instruction::new(0x1000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![Operand::Register(reg32(0)), Operand::imm_unsigned(5, 32)]),
+        )
+    }
+
+    /// Assert the rendering of a `cmp`/shape condition uses exactly `op` (with a
+    /// space either side), which is what the Condition->operator mutations flip.
+    fn assert_op(rendered: &str, op: &str) {
+        assert!(
+            rendered.contains(&format!(" {op} ")),
+            "expected operator '{op}' in {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_condition_lowering_operator_table() {
+        // Each Condition maps to a specific comparison operator. (32-bit registers
+        // render as their 64-bit parent, so operand is rax.)
+        assert_op(&cmp_cond(Condition::Equal), "==");
+        assert_op(&cmp_cond(Condition::NotEqual), "!=");
+        assert_op(&cmp_cond(Condition::Less), "<");
+        assert_op(&cmp_cond(Condition::LessOrEqual), "<=");
+        assert_op(&cmp_cond(Condition::Greater), ">");
+        assert_op(&cmp_cond(Condition::GreaterOrEqual), ">=");
+        assert_op(&cmp_cond(Condition::Below), "<");
+        assert_op(&cmp_cond(Condition::BelowOrEqual), "<=");
+        assert_op(&cmp_cond(Condition::Above), ">");
+        assert_op(&cmp_cond(Condition::AboveOrEqual), ">=");
+        // Sign / NotSign become < / >= comparisons.
+        assert_op(&cmp_cond(Condition::Sign), "<");
+        assert_op(&cmp_cond(Condition::NotSign), ">=");
+        // Distinguish <= from < (a Le->Lt mutation would drop the '='): the LE
+        // rendering must contain "<=" literally, the LT one must not.
+        assert!(cmp_cond(Condition::LessOrEqual).contains("<="));
+        assert!(!cmp_cond(Condition::Less).contains("<="));
+        // All operate on the same widened register and constant 5.
+        assert!(cmp_cond(Condition::Equal).contains("rax") && cmp_cond(Condition::Equal).contains('5'));
+    }
+
+    #[test]
+    fn test_condition_lowering_neg_inc_dec_shapes() {
+        let reg = |id| Operand::Register(reg32(id));
+        // neg eax ; js  => operand tested with the neg-specific operator: Sign=>'>',
+        // NotSign=>'<=' (distinct from the plain Sign=>'<' mapping).
+        let neg = Instruction::new(0x1000, 2, vec![], "neg")
+            .with_operation(Operation::Neg)
+            .with_operands(vec![reg(0)]);
+        assert_op(&cond_over(Condition::Sign, neg.clone()), ">");
+        assert_op(&cond_over(Condition::NotSign, neg), "<=");
+        // inc eax ; je => (eax + 1) == 0.
+        let inc = Instruction::new(0x1000, 2, vec![], "inc")
+            .with_operation(Operation::Inc)
+            .with_operands(vec![reg(0)]);
+        let r_inc = cond_over(Condition::Equal, inc);
+        assert!(r_inc.contains("rax + 1") && r_inc.contains("=="), "got {r_inc}");
+        // dec eax ; je => (eax - 1) == 0 (adjustment -1).
+        let dec = Instruction::new(0x1000, 2, vec![], "dec")
+            .with_operation(Operation::Dec)
+            .with_operands(vec![reg(0)]);
+        let r_dec = cond_over(Condition::Equal, dec);
+        assert!(r_dec.contains("rax + -0x1") && r_dec.contains("=="), "got {r_dec}");
+    }
+
+    #[test]
+    fn test_condition_lowering_test_same_and_xor_zero() {
+        let reg = |id| Operand::Register(reg32(id));
+        // test eax, eax ; jne => eax != 0.
+        let test_same = Instruction::new(0x1000, 2, vec![], "test")
+            .with_operation(Operation::Test)
+            .with_operands(vec![reg(0), reg(0)]);
+        let r = cond_over(Condition::NotEqual, test_same);
+        assert!(r.contains("rax") && r.contains("!="), "got {r}");
+        // xor eax, eax ; je => self-xor zeroing recognised => 0 == 0.
+        let xor_self = Instruction::new(0x1000, 2, vec![], "xor")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![reg(0), reg(0)]);
+        let rx = cond_over(Condition::Equal, xor_self);
+        assert!(!rx.contains("rax") && rx.contains("=="), "self-xor must drop the reg, got {rx}");
+    }
+
+    #[test]
+    fn test_condition_lowering_sub_and_add_shapes() {
+        let reg = |id| Operand::Register(reg32(id));
+        // 3-operand sub (dst, a, b): a <op> b directly (operands 1 and 2).
+        let sub3 = Instruction::new(0x1000, 3, vec![], "sub")
+            .with_operation(Operation::Sub)
+            .with_operands(vec![reg(0), reg(6), reg(1)]);
+        assert_eq!(cond_over(Condition::Equal, sub3), "rsi == rcx");
+        // 2-operand add (dst, src): (dst + src) == 0.
+        let add2 = Instruction::new(0x1000, 3, vec![], "add")
+            .with_operation(Operation::Add)
+            .with_operands(vec![reg(0), reg(6)]);
+        let r = cond_over(Condition::Equal, add2);
+        assert!(r.contains("rax + rsi") && r.contains("=="), "got {r}");
+    }
+
+    #[test]
+    fn test_lift_setcc_and_cmovcc_use_preceding_compare() {
+        let reg = |id| Operand::Register(reg32(id));
+        let al = Operand::Register(Register::new(Architecture::X86_64, RegisterClass::General, 0, 8));
+        // cmp esi, 1 ; setg al  => al = (esi > 1)
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x5000);
+        block.instructions.push(
+            Instruction::new(0x5000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![reg(6), Operand::imm_unsigned(1, 32)]),
+        );
+        let setg = Instruction::new(0x5003, 3, vec![], "setg")
+            .with_operation(Operation::SetConditional)
+            .with_operands(vec![al]);
+        block.instructions.push(setg.clone());
+        assert!(
+            format!("{}", lift_setcc_with_context(&setg, &block)).contains("rsi > 1"),
+            "setg must lower using the preceding cmp with the > operator"
+        );
+
+        // cmp esi, 1 ; cmovl eax, ecx  => eax = (esi < 1) ? ecx : eax
+        let mut cblock = BasicBlock::new(BasicBlockId::new(0), 0x6000);
+        cblock.instructions.push(
+            Instruction::new(0x6000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![reg(6), Operand::imm_unsigned(1, 32)]),
+        );
+        let cmovl = Instruction::new(0x6003, 3, vec![], "cmovl")
+            .with_operation(Operation::ConditionalMove)
+            .with_operands(vec![reg(0), reg(1)]);
+        cblock.instructions.push(cmovl.clone());
+        let rendered = format!("{}", lift_cmovcc_with_context(&cmovl, &cblock));
+        assert!(
+            rendered.contains("rsi < 1") && rendered.contains('?'),
+            "cmovl must lower to a ternary using the < predicate, got {rendered}"
+        );
+    }
 }
