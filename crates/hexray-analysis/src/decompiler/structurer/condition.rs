@@ -2194,4 +2194,199 @@ mod tests {
             Some(Condition::Sign)
         );
     }
+
+    // =====================================================================
+    // Pure flag/condition helper functions. Mutation testing showed these
+    // under-tested: a swapped operator or dropped arm silently mis-lifts a
+    // condition. Reachable directly from this module's test scope.
+    // =====================================================================
+
+    use crate::decompiler::expression::Variable;
+
+    fn reg32(id: u16) -> Register {
+        Register::new(Architecture::X86_64, RegisterClass::General, id, 32)
+    }
+
+    #[test]
+    fn test_x86_float_compare_binop_table() {
+        let f = |c: Condition| {
+            x86_float_compare_binop(c, &Instruction::new(0x10, 4, vec![], "ucomiss"))
+        };
+        assert_eq!(f(Condition::Equal), Some(BinOpKind::Eq));
+        assert_eq!(f(Condition::NotEqual), Some(BinOpKind::Ne));
+        assert_eq!(f(Condition::Above), Some(BinOpKind::Gt));
+        assert_eq!(f(Condition::AboveOrEqual), Some(BinOpKind::Ge));
+        assert_eq!(f(Condition::Below), Some(BinOpKind::Lt));
+        assert_eq!(f(Condition::BelowOrEqual), Some(BinOpKind::Le));
+        assert_eq!(f(Condition::Greater), Some(BinOpKind::Gt));
+        assert_eq!(f(Condition::GreaterOrEqual), Some(BinOpKind::Ge));
+        assert_eq!(f(Condition::Less), Some(BinOpKind::Lt));
+        assert_eq!(f(Condition::LessOrEqual), Some(BinOpKind::Le));
+        // Non-comparison condition => None.
+        assert_eq!(f(Condition::Overflow), None);
+        // Every accepted float mnemonic, and a non-float one that must decline.
+        for m in ["comiss", "ucomiss", "comisd", "ucomisd", "vcomiss", "vucomiss", "vcomisd", "vucomisd"] {
+            assert_eq!(
+                x86_float_compare_binop(Condition::Equal, &Instruction::new(0x10, 4, vec![], m)),
+                Some(BinOpKind::Eq),
+                "mnemonic {m} must be recognised as a float compare"
+            );
+        }
+        assert_eq!(
+            x86_float_compare_binop(Condition::Equal, &Instruction::new(0x10, 3, vec![], "cmp")),
+            None,
+            "a non-float compare must decline"
+        );
+    }
+
+    #[test]
+    fn test_is_flag_setting_instruction_table() {
+        let i = |op: Operation, mnem: &str| {
+            is_flag_setting_instruction(&Instruction::new(0x10, 3, vec![], mnem).with_operation(op))
+        };
+        assert!(i(Operation::Compare, "cmp"));
+        assert!(i(Operation::Test, "test"));
+        assert!(i(Operation::Add, "add"));
+        assert!(i(Operation::Sub, "sub"));
+        assert!(i(Operation::Inc, "inc"));
+        assert!(i(Operation::Dec, "dec"));
+        assert!(i(Operation::Neg, "neg"));
+        assert!(i(Operation::Shl, "shl"));
+        assert!(i(Operation::Shr, "shr"));
+        assert!(i(Operation::Sar, "sar"));
+        // Logical ops only set flags for x86 (and/or/xor) or ARM 's'-suffixed.
+        assert!(i(Operation::And, "and"));
+        assert!(i(Operation::Or, "or"));
+        assert!(i(Operation::Xor, "xor"));
+        assert!(i(Operation::And, "ands"));
+        assert!(!i(Operation::And, "bic"), "a non-flag logical op must not set flags");
+        // Exchange only sets flags for cmpxchg.
+        assert!(i(Operation::Exchange, "cmpxchg"));
+        assert!(!i(Operation::Exchange, "xchg"));
+        // An unrelated op does not set flags.
+        assert!(!i(Operation::Move, "mov"));
+    }
+
+    #[test]
+    fn test_binop_for_register_update_table() {
+        assert_eq!(binop_for_register_update(Operation::Add), Some(BinOpKind::Add));
+        assert_eq!(binop_for_register_update(Operation::Sub), Some(BinOpKind::Sub));
+        assert_eq!(binop_for_register_update(Operation::And), Some(BinOpKind::And));
+        assert_eq!(binop_for_register_update(Operation::Or), Some(BinOpKind::Or));
+        assert_eq!(binop_for_register_update(Operation::Xor), Some(BinOpKind::Xor));
+        assert_eq!(binop_for_register_update(Operation::Move), None);
+        assert_eq!(binop_for_register_update(Operation::Mul), None);
+    }
+
+    #[test]
+    fn test_register_aliases_table() {
+        let a = |n: &str| register_aliases(n);
+        assert_eq!(a("eax"), vec!["al", "ax", "eax", "rax"]);
+        assert_eq!(a("rbx"), vec!["bl", "bx", "ebx", "rbx"]);
+        assert_eq!(a("cl"), vec!["cl", "cx", "ecx", "rcx"]);
+        assert_eq!(a("rdx"), vec!["dl", "dx", "edx", "rdx"]);
+        assert_eq!(a("esi"), vec!["sil", "si", "esi", "rsi"]);
+        assert_eq!(a("rdi"), vec!["dil", "di", "edi", "rdi"]);
+        assert_eq!(a("r8"), vec!["r8d", "r8"]);
+        assert_eq!(a("r9d"), vec!["r9d", "r9"]);
+        assert_eq!(a("r10"), vec!["r10d", "r10"]);
+        assert_eq!(a("r11d"), vec!["r11d", "r11"]);
+        // ARM64 w/x prefix pairing.
+        assert_eq!(a("w5"), vec!["w5", "x5"]);
+        assert_eq!(a("x5"), vec!["w5", "x5"]);
+        // Unknown name maps only to itself.
+        assert_eq!(a("zmm0"), vec!["zmm0"]);
+    }
+
+    #[test]
+    fn test_substitute_register_in_expr_recursion() {
+        let mut map: HashMap<String, Expr> = HashMap::new();
+        map.insert("eax".to_string(), Expr::int(7));
+        let v = |n: &str| Expr::var(Variable::reg(n, 4));
+        // Direct var substitution (case-insensitive).
+        assert_eq!(substitute_register_in_expr(v("eax"), &map).to_string(), "7");
+        assert_eq!(substitute_register_in_expr(v("EAX"), &map).to_string(), "7");
+        // Unmapped var is unchanged.
+        assert_eq!(substitute_register_in_expr(v("ebx"), &map).to_string(), "ebx");
+        // BinOp recurses into both sides.
+        let bin = Expr::binop(BinOpKind::Add, v("eax"), v("ebx"));
+        assert_eq!(substitute_register_in_expr(bin, &map).to_string(), "7 + ebx");
+        // UnaryOp recurses into operand.
+        let un = Expr::unary(UnaryOpKind::Neg, v("eax"));
+        assert_eq!(substitute_register_in_expr(un, &map).to_string(), "-7");
+        // Deref recurses into addr.
+        let d = Expr::deref(v("eax"), 4);
+        assert!(substitute_register_in_expr(d, &map).to_string().contains('7'));
+    }
+
+    #[test]
+    fn test_expr_known_bit_width_arms() {
+        assert_eq!(expr_known_bit_width(&Expr::var(Variable::reg("eax", 4))), Some(32));
+        assert_eq!(expr_known_bit_width(&Expr::deref(Expr::int(0), 2)), Some(16));
+        assert_eq!(
+            expr_known_bit_width(&Expr::array_access(Expr::var(Variable::reg("p", 8)), Expr::int(0), 4)),
+            Some(32)
+        );
+        let cast = Expr {
+            kind: ExprKind::Cast { expr: Box::new(Expr::int(0)), to_size: 8, signed: false },
+        };
+        assert_eq!(expr_known_bit_width(&cast), Some(64));
+        // A zero-size var is filtered out to None (pins the `> 0` filters).
+        assert_eq!(expr_known_bit_width(&Expr::var(Variable::reg("z", 0))), None);
+        // An unrelated expr has no known width.
+        assert_eq!(expr_known_bit_width(&Expr::int(5)), None);
+    }
+
+    #[test]
+    fn test_expr_is_boolean_wrapper_arms() {
+        let v = Expr::var(Variable::reg("x", 4));
+        assert!(expr_is_boolean_wrapper(&Expr::binop(BinOpKind::Lt, v.clone(), Expr::int(0))));
+        assert!(expr_is_boolean_wrapper(&Expr::binop(BinOpKind::LogicalAnd, v.clone(), v.clone())));
+        assert!(expr_is_boolean_wrapper(&Expr::unary(UnaryOpKind::LogicalNot, v.clone())));
+        let cast_cmp = Expr {
+            kind: ExprKind::Cast {
+                expr: Box::new(Expr::binop(BinOpKind::Eq, v.clone(), Expr::int(0))),
+                to_size: 1,
+                signed: false,
+            },
+        };
+        assert!(expr_is_boolean_wrapper(&cast_cmp), "Cast recurses into inner");
+        // A plain arithmetic binop or value is not a boolean wrapper.
+        assert!(!expr_is_boolean_wrapper(&Expr::binop(BinOpKind::Add, v.clone(), Expr::int(1))));
+        assert!(!expr_is_boolean_wrapper(&v));
+    }
+
+    #[test]
+    fn test_expr_requires_single_evaluation_arms() {
+        let v = Expr::var(Variable::reg("x", 4));
+        assert!(expr_requires_single_evaluation(&Expr::call(CallTarget::Named("f".into()), vec![])));
+        assert!(expr_requires_single_evaluation(&Expr::deref(v.clone(), 4)));
+        // BinOp is "single eval" iff either side is (pins the ||).
+        assert!(expr_requires_single_evaluation(&Expr::binop(
+            BinOpKind::Add,
+            v.clone(),
+            Expr::deref(v.clone(), 4)
+        )));
+        assert!(!expr_requires_single_evaluation(&Expr::binop(
+            BinOpKind::Add,
+            v.clone(),
+            Expr::int(1)
+        )));
+        // A plain var / int does not require single evaluation.
+        assert!(!expr_requires_single_evaluation(&v));
+        assert!(!expr_requires_single_evaluation(&Expr::int(3)));
+    }
+
+    #[test]
+    fn test_should_preserve_subregister_test_alias() {
+        // raw operand is a 32-bit reg; substituted value is 64-bit => preserve.
+        let raw = Operand::Register(reg32(0));
+        let wide = Expr::var(Variable::reg("rax", 8)); // 64 bits
+        assert!(should_preserve_subregister_test_alias(&raw, &wide));
+        // Same width => do not preserve (pins `<`, not `<=`).
+        let same = Expr::var(Variable::reg("eax", 4)); // 32 bits
+        assert!(!should_preserve_subregister_test_alias(&raw, &same));
+        // Non-register raw operand => false.
+        assert!(!should_preserve_subregister_test_alias(&Operand::imm_unsigned(1, 32), &wide));
+    }
 }
