@@ -28,6 +28,10 @@ RUN_SECURITY="yes"
 RUN_COVERAGE="yes"
 RUN_TLA="yes"
 RUN_MEMORY_SAFETY="yes"
+RUN_MUTANTS="no"
+# Git ref the mutation gate diffs against (only lines changed vs this ref are
+# mutated). Override with --mutants-base or the MUTANTS_BASE env var.
+MUTANTS_BASE="${MUTANTS_BASE:-origin/main}"
 
 usage() {
     cat <<'EOF'
@@ -54,6 +58,12 @@ Usage: scripts/ci-local [--tier fast|medium|full] [--cross] [--no-cross] [--perf
   --no-tla  Skip the TLA+ model/conformance gate during full tier
   --memory-safety     Run the Miri memory-safety gate during full tier (default)
   --no-memory-safety  Skip the Miri memory-safety gate during full tier
+  --mutants           Run the mutation-testing gate during full tier (changed
+                      lines vs --mutants-base must have every mutant caught).
+                      Heavy (a full test run per mutant); off by default — run on
+                      a disposable aarch64 spot, not a laptop (see CLAUDE.md).
+  --no-mutants        Skip the mutation-testing gate during full tier (default)
+  --mutants-base REF  Git ref the mutation gate diffs against (default origin/main)
   --help      Show this message
 EOF
 }
@@ -144,6 +154,18 @@ while [[ $# -gt 0 ]]; do
             RUN_MEMORY_SAFETY="no"
             shift
             ;;
+        --mutants)
+            RUN_MUTANTS="yes"
+            shift
+            ;;
+        --no-mutants)
+            RUN_MUTANTS="no"
+            shift
+            ;;
+        --mutants-base)
+            MUTANTS_BASE="${2:-}"
+            shift 2
+            ;;
         -h|--help)
             usage
             exit 0
@@ -216,6 +238,12 @@ run_full() {
 
     if [[ "$RUN_MEMORY_SAFETY" == "yes" ]]; then
         run "Memory-safety gate" "$ROOT_DIR/scripts/check-memory-safety"
+    fi
+
+    if [[ "$RUN_MUTANTS" == "yes" ]]; then
+        # Only mutate code changed vs MUTANTS_BASE and require every mutant be
+        # caught. Heavy (a full test run per mutant) — hence off by default.
+        run "Mutation-testing gate (changed lines)" "$ROOT_DIR/scripts/check-mutants" --in-diff "$MUTANTS_BASE"
     fi
 
     if [[ "$RUN_PERF" == "yes" ]]; then

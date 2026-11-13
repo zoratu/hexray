@@ -14,9 +14,13 @@
 #   scripts/check-mutants                     # sweep the curated hot-path files
 #   scripts/check-mutants -f <path> [-f ...]  # sweep specific file(s)
 #   scripts/check-mutants --package <crate>   # sweep an entire crate
-#   scripts/check-mutants --in-diff <ref>     # CI gate: only mutate lines changed
-#                                             # vs <ref> (e.g. origin/main) and
-#                                             # require every one be caught
+#   scripts/check-mutants --in-diff <ref|diff># CI gate: only mutate lines changed
+#                                             # vs a git ref (e.g. origin/main) and
+#                                             # require every one be caught. A git
+#                                             # ref is resolved to a diff vs the
+#                                             # merge-base with the working tree; a
+#                                             # path to an existing diff file is used
+#                                             # as-is (cargo-mutants' native form).
 #   scripts/check-mutants --list              # list mutants without running tests
 #
 # Any extra args are passed through to cargo-mutants. Results land in
@@ -32,6 +36,40 @@ if ! cargo mutants --version >/dev/null 2>&1; then
     echo "Install it with: cargo install cargo-mutants --locked" >&2
     exit 1
 fi
+
+# cargo-mutants' --in-diff takes a DIFF FILE, but for a CI gate it is far more
+# convenient to name a git ref (e.g. origin/main). Translate a ref into a diff
+# against the merge-base with the current working tree; pass an existing file
+# through untouched. The generated diff is cleaned up on exit.
+DIFF_TMP=""
+cleanup() { [[ -n "$DIFF_TMP" && -f "$DIFF_TMP" ]] && rm -f "$DIFF_TMP"; }
+trap cleanup EXIT
+
+translated_args=()
+while [[ $# -gt 0 ]]; do
+    if [[ "$1" == "--in-diff" && -n "${2:-}" && ! -f "$2" ]]; then
+        ref="$2"
+        if ! git rev-parse --verify --quiet "$ref" >/dev/null; then
+            echo "check-mutants: --in-diff '$ref' is neither a file nor a git ref" >&2
+            exit 2
+        fi
+        DIFF_TMP="$(mktemp "${TMPDIR:-/tmp}/check-mutants-diff.XXXXXX")"
+        # merge-base diff captures everything added on this branch, incl. the
+        # uncommitted working tree — exactly what a pre-push gate should check.
+        git diff --merge-base "$ref" > "$DIFF_TMP"
+        if [[ ! -s "$DIFF_TMP" ]]; then
+            echo "check-mutants: no changes vs '$ref' — nothing to mutate."
+            exit 0
+        fi
+        echo "check-mutants: --in-diff '$ref' -> $(grep -c '^+++' "$DIFF_TMP") changed file(s)"
+        translated_args+=(--in-diff "$DIFF_TMP")
+        shift 2
+    else
+        translated_args+=("$1")
+        shift
+    fi
+done
+set -- "${translated_args[@]}"
 
 # Memory is the binding constraint on small spots: cargo-mutants parallelises
 # whole test processes. Default to a conservative job count; override with -j.

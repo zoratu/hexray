@@ -101,14 +101,19 @@ For stable benchmark comparisons and parallelism tuning guidance, see [`PERFORMA
   "conceptual chaff" idea with a tool). Heavy (one test run per mutant),
   so run it on a disposable aarch64 spot, not a laptop, and scope it:
   `scripts/check-mutants -f <file>` sweeps one file; `--package <crate>`
-  a whole crate; `--in-diff <ref>` mutates only changed lines (the
-  sustainable CI gate — require every mutant on new code be caught).
-  Config lives in `mutants.toml`. Results land in `mutants.out/`
-  (`missed.txt` = gaps, `caught.txt`, `timeout.txt`, `unviable.txt`).
-  Tests default to the mutated package only; re-run survivors with
-  `--test-workspace true` to confirm they also evade the top-level
-  `hexray` integration/differential/swarm suites before calling them
-  true end-to-end gaps.
+  a whole crate; `--in-diff <ref>` mutates only the lines changed vs a
+  git ref (resolved to a merge-base diff of the working tree, so
+  uncommitted changes count) — the sustainable CI gate, requiring every
+  mutant on new code be caught. `--in-diff <file.diff>` also accepts a
+  ready-made diff (cargo-mutants' native form). Wired into
+  `scripts/ci-local --tier full --mutants` (off by default; diffs
+  against `--mutants-base`, default `origin/main`). Config lives in
+  `mutants.toml`. Results land in `mutants.out/` (`missed.txt` = gaps,
+  `caught.txt`, `timeout.txt`, `unviable.txt`). Tests default to the
+  mutated package only; re-run survivors with `--test-workspace true` to
+  confirm they also evade the top-level `hexray`
+  integration/differential/swarm suites before calling them true
+  end-to-end gaps.
 - **`scripts/check-tla`** — model-checks the incremental invalidation
   TLA+ spec with TLC, then runs the matching Rust conformance test
   so the formal model and implementation stay in lockstep.
