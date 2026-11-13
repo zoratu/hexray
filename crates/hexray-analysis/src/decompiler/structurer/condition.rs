@@ -2657,4 +2657,169 @@ mod tests {
             "ALU update must be folded into the compared value, got {rendered}"
         );
     }
+
+    // =====================================================================
+    // Fallback placeholder table, logical-op compares, expr_known_bit_width
+    // width arms, ARM64 conditional-select family, cmovcc arity guard, tsc.
+    // =====================================================================
+
+    #[test]
+    fn test_condition_fallback_placeholder_table() {
+        // With no flag-setting instruction, condition lowers to a readable
+        // placeholder — a distinct string per condition. Pins every arm of the
+        // tail cond_name match (a deleted arm collapses to "/* condition */").
+        let empty = BasicBlock::new(BasicBlockId::new(0), 0x1000);
+        let p = |c: Condition| format!("{}", condition_to_expr_with_block(c, &empty));
+        let expected = [
+            (Condition::Equal, "/* equal */"),
+            (Condition::NotEqual, "/* not_equal */"),
+            (Condition::Less, "/* signed_lt */"),
+            (Condition::LessOrEqual, "/* signed_le */"),
+            (Condition::Greater, "/* signed_gt */"),
+            (Condition::GreaterOrEqual, "/* signed_ge */"),
+            (Condition::Below, "/* unsigned_lt */"),
+            (Condition::BelowOrEqual, "/* unsigned_le */"),
+            (Condition::Above, "/* unsigned_gt */"),
+            (Condition::AboveOrEqual, "/* unsigned_ge */"),
+            (Condition::Sign, "/* negative */"),
+            (Condition::NotSign, "/* non_negative */"),
+            (Condition::Overflow, "/* overflow */"),
+            (Condition::NotOverflow, "/* no_overflow */"),
+            (Condition::Parity, "/* parity_even */"),
+            (Condition::NotParity, "/* parity_odd */"),
+        ];
+        for (c, want) in expected {
+            assert_eq!(p(c), want, "{c:?} fallback placeholder");
+        }
+    }
+
+    #[test]
+    fn test_condition_logical_op_compares() {
+        let reg = |id| Operand::Register(reg32(id));
+        let has = |r: &str, frags: &[&str]| frags.iter().all(|f| r.contains(f));
+        // 3-operand `and dst, esi, ecx` ; je => (esi & ecx) == 0.
+        let and3 = Instruction::new(0x1000, 3, vec![], "and")
+            .with_operation(Operation::And)
+            .with_operands(vec![reg(0), reg(6), reg(1)]);
+        let r = cond_over(Condition::Equal, and3);
+        assert!(has(&r, &["rsi & rcx", "=="]), "and3 => (rsi & rcx) == 0, got {r}");
+        // 3-operand or / xor.
+        let or3 = Instruction::new(0x1000, 3, vec![], "or")
+            .with_operation(Operation::Or)
+            .with_operands(vec![reg(0), reg(6), reg(1)]);
+        let r = cond_over(Condition::NotEqual, or3);
+        assert!(has(&r, &["rsi | rcx", "!="]), "or3 => (rsi | rcx) != 0, got {r}");
+        let xor3 = Instruction::new(0x1000, 3, vec![], "xor")
+            .with_operation(Operation::Xor)
+            .with_operands(vec![reg(0), reg(6), reg(1)]);
+        let r = cond_over(Condition::Equal, xor3);
+        assert!(has(&r, &["rsi ^ rcx", "=="]), "xor3 => (rsi ^ rcx) == 0, got {r}");
+        // 2-operand `and eax, esi` ; je => (eax & esi) == 0.
+        let and2 = Instruction::new(0x1000, 3, vec![], "and")
+            .with_operation(Operation::And)
+            .with_operands(vec![reg(0), reg(6)]);
+        let r = cond_over(Condition::Equal, and2);
+        assert!(has(&r, &["rax & rsi", "=="]), "and2 => (rax & rsi) == 0, got {r}");
+    }
+
+    #[test]
+    fn test_expr_known_bit_width_zero_size_and_bitfield() {
+        // Zero-size Deref and Cast are filtered to None (pins their `> 0` filters).
+        assert_eq!(expr_known_bit_width(&Expr::deref(Expr::int(0), 0)), None);
+        let cast0 = Expr {
+            kind: ExprKind::Cast { expr: Box::new(Expr::int(0)), to_size: 0, signed: false },
+        };
+        assert_eq!(expr_known_bit_width(&cast0), None);
+        // BitField arm: width is used directly (not *8), filtered by `> 0`.
+        let bf = |w: u8| Expr {
+            kind: ExprKind::BitField {
+                expr: Box::new(Expr::int(0)),
+                start: 0,
+                width: w,
+            },
+        };
+        assert_eq!(expr_known_bit_width(&bf(5)), Some(5));
+        assert_eq!(expr_known_bit_width(&bf(0)), None);
+    }
+
+    /// Build `cmp esi, 1 ; <mnem> <ops>` and lift the conditional instruction.
+    fn lift_arm_cond(mnem: &str, ops: Vec<Operand>) -> String {
+        let mut block = BasicBlock::new(BasicBlockId::new(0), 0x5000);
+        block.instructions.push(
+            Instruction::new(0x5000, 3, vec![], "cmp")
+                .with_operation(Operation::Compare)
+                .with_operands(vec![
+                    Operand::Register(Register::new(Architecture::Arm64, RegisterClass::General, 1, 64)),
+                    Operand::imm_unsigned(1, 32),
+                ]),
+        );
+        let inst = Instruction::new(0x5003, 4, vec![], mnem)
+            .with_operation(Operation::Move)
+            .with_operands(ops);
+        block.instructions.push(inst.clone());
+        format!("{}", lift_setcc_with_context(&inst, &block))
+    }
+
+    #[test]
+    fn test_lift_setcc_arm64_conditional_select_family() {
+        let x = |id| Operand::Register(Register::new(Architecture::Arm64, RegisterClass::General, id, 64));
+        // csel.eq x0, x1, x2 => x0 = cond ? x1 : x2 (ternary over both sources).
+        let csel = lift_arm_cond("csel.eq", vec![x(0), x(1), x(2)]);
+        assert!(csel.contains('?') && csel.contains("x1") && csel.contains("x2"), "got {csel}");
+        // cinc.eq x0, x1 => x0 = cond ? x1 + 1 : x1.
+        let cinc = lift_arm_cond("cinc.eq", vec![x(0), x(1)]);
+        assert!(cinc.contains("x1 + 1") && cinc.contains("x1"), "cinc adds 1, got {cinc}");
+        // cinv.eq x0, x1 => bitwise-not in the then-branch.
+        let cinv = lift_arm_cond("cinv.eq", vec![x(0), x(1)]);
+        assert!(cinv.contains('~'), "cinv inverts, got {cinv}");
+        // cneg.eq x0, x1 => negate in the then-branch.
+        let cneg = lift_arm_cond("cneg.eq", vec![x(0), x(1)]);
+        assert!(cneg.contains("-x1") || cneg.contains("-(x1"), "cneg negates, got {cneg}");
+        // cset.eq x0 => x0 = cond ? 1 : 0.
+        let cset = lift_arm_cond("cset.eq", vec![x(0)]);
+        assert!(cset.contains('?') && cset.contains('1') && cset.contains('0'), "got {cset}");
+        // csetm.eq x0 => x0 = cond ? -1 : 0 (distinct from cset: pins ==csetm and -1).
+        let csetm = lift_arm_cond("csetm.eq", vec![x(0)]);
+        assert!(csetm.contains("-1") || csetm.contains("-0x1"), "csetm uses -1, got {csetm}");
+    }
+
+    #[test]
+    fn test_lift_setcc_empty_operands_uses_mnemonic() {
+        // No operands => destination falls back to the mnemonic (pins the `!empty`).
+        let block = BasicBlock::new(BasicBlockId::new(0), 0x5000);
+        let inst = Instruction::new(0x5000, 2, vec![], "sete").with_operation(Operation::SetConditional);
+        let r = format!("{}", lift_setcc_with_context(&inst, &block));
+        assert!(r.contains("sete"), "empty-operand setcc uses mnemonic, got {r}");
+    }
+
+    #[test]
+    fn test_lift_cmovcc_arity_guard() {
+        // Fewer than 2 operands must return the mnemonic, never index a missing
+        // operand (pins the `< 2` guard against a `> 2` mutation that would panic).
+        let block = BasicBlock::new(BasicBlockId::new(0), 0x6000);
+        let inst = Instruction::new(0x6000, 2, vec![], "cmovne")
+            .with_operation(Operation::ConditionalMove)
+            .with_operands(vec![Operand::Register(reg32(0))]);
+        let r = format!("{}", lift_cmovcc_with_context(&inst, &block));
+        assert!(r.contains("cmovne"), "1-operand cmovcc returns mnemonic, got {r}");
+    }
+
+    #[test]
+    fn test_lift_x86_multi_output_intrinsic_tsc() {
+        // rdtsc writes edx:eax; the lifter materialises a split read.
+        let rdtsc = Instruction::new(0x1000, 2, vec![0x0f, 0x31], "rdtsc")
+            .with_operation(Operation::ReadTsc);
+        let out = lift_x86_multi_output_intrinsic(&rdtsc).expect("rdtsc lifts");
+        let joined = out.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        assert!(joined.contains("__rdtsc"), "rdtsc read materialised, got {joined}");
+        // rdtscp additionally writes the aux value into ecx.
+        let rdtscp = Instruction::new(0x1000, 3, vec![0x0f, 0x01, 0xf9], "rdtscp")
+            .with_operation(Operation::ReadTscP);
+        let out2 = lift_x86_multi_output_intrinsic(&rdtscp).expect("rdtscp lifts");
+        let joined2 = out2.iter().map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        assert!(joined2.contains("__rdtscp"), "rdtscp read materialised, got {joined2}");
+        // A non-tsc op is not a multi-output intrinsic.
+        let mov = Instruction::new(0x1000, 2, vec![], "mov").with_operation(Operation::Move);
+        assert!(lift_x86_multi_output_intrinsic(&mov).is_none());
+    }
 }
