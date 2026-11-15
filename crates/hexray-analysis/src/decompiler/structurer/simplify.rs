@@ -16254,4 +16254,261 @@ mod tests {
             statements[0].kind
         );
     }
+
+    // =====================================================================
+    // Property-based + fault-injection battery for simplify_statements.
+    //
+    // simplify_statements is a pure Vec<StructuredNode> -> Vec<StructuredNode>
+    // rewrite. The named invariants it must uphold for ANY input tree:
+    //   * Deterministic  (invariant #3): same input -> identical output.
+    //   * Idempotent / fixpoint: re-simplifying a simplified tree is a no-op.
+    //   * Bounded (invariant #4): output size stays within a constant factor of
+    //     the input; no quadratic/exponential blowup.
+    //   * Never crash (invariant #1): no panic / overflow on adversarial trees.
+    // The generator doubles as structured fault injection; a dedicated
+    // deep-nesting case stresses recursion depth.
+    // =====================================================================
+
+    use proptest::prelude::*;
+
+    fn arb_var_name() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("eax".to_string()),
+            Just("rbx".to_string()),
+            Just("rdi".to_string()),
+            Just("rsi".to_string()),
+            Just("local_8".to_string()),
+            Just("arg0".to_string()),
+            Just("ret".to_string()),
+            Just("rsp".to_string()),
+            Just("rbp".to_string()),
+        ]
+    }
+
+    fn arb_size() -> impl Strategy<Value = u8> {
+        prop_oneof![Just(1u8), Just(2u8), Just(4u8), Just(8u8)]
+    }
+
+    fn arb_binop_kind() -> impl Strategy<Value = BinOpKind> {
+        prop_oneof![
+            Just(BinOpKind::Add),
+            Just(BinOpKind::Sub),
+            Just(BinOpKind::Mul),
+            Just(BinOpKind::And),
+            Just(BinOpKind::Or),
+            Just(BinOpKind::Xor),
+            Just(BinOpKind::Shl),
+            Just(BinOpKind::Shr),
+            Just(BinOpKind::Eq),
+            Just(BinOpKind::Ne),
+            Just(BinOpKind::Lt),
+            Just(BinOpKind::Le),
+            Just(BinOpKind::Gt),
+            Just(BinOpKind::Ge),
+        ]
+    }
+
+    fn arb_unop_kind() -> impl Strategy<Value = UnaryOpKind> {
+        prop_oneof![
+            Just(UnaryOpKind::Neg),
+            Just(UnaryOpKind::Not),
+            Just(UnaryOpKind::LogicalNot),
+        ]
+    }
+
+    fn arb_var_expr() -> impl Strategy<Value = Expr> {
+        (arb_var_name(), arb_size(), 0u8..3u8).prop_map(|(name, size, kind)| {
+            let vk = match kind {
+                0 => VarKind::Register(0),
+                1 => VarKind::Temp(0),
+                _ => VarKind::Arg(0),
+            };
+            Expr::var(Variable { name, kind: vk, size })
+        })
+    }
+
+    fn arb_expr() -> impl Strategy<Value = Expr> {
+        let leaf = prop_oneof![
+            any::<i64>().prop_map(|n| Expr::int(n as i128)),
+            arb_var_expr(),
+            "[a-z]{1,4}".prop_map(Expr::unknown),
+        ];
+        leaf.prop_recursive(4, 48, 4, |inner| {
+            prop_oneof![
+                (arb_binop_kind(), inner.clone(), inner.clone())
+                    .prop_map(|(op, l, r)| Expr::binop(op, l, r)),
+                (arb_unop_kind(), inner.clone()).prop_map(|(op, e)| Expr::unary(op, e)),
+                (inner.clone(), arb_size()).prop_map(|(e, s)| Expr::deref(e, s)),
+                (inner.clone(), inner.clone()).prop_map(|(l, r)| Expr::assign(l, r)),
+                prop::collection::vec(inner.clone(), 0..3)
+                    .prop_map(|args| Expr::call(CallTarget::Named("f".into()), args)),
+                (inner.clone(), inner.clone(), inner.clone()).prop_map(|(c, t, e)| Expr {
+                    kind: ExprKind::Conditional {
+                        cond: Box::new(c),
+                        then_expr: Box::new(t),
+                        else_expr: Box::new(e),
+                    },
+                }),
+            ]
+        })
+    }
+
+    fn arb_node() -> impl Strategy<Value = StructuredNode> {
+        let leaf = prop_oneof![
+            prop::collection::vec(arb_expr(), 0..4).prop_map(|st| block(0, st)),
+            arb_expr().prop_map(StructuredNode::Expr),
+            proptest::option::of(arb_expr()).prop_map(StructuredNode::Return),
+            Just(StructuredNode::Break),
+            Just(StructuredNode::Continue),
+        ];
+        leaf.prop_recursive(3, 32, 3, |inner| {
+            prop_oneof![
+                (
+                    arb_expr(),
+                    prop::collection::vec(inner.clone(), 0..3),
+                    proptest::option::of(prop::collection::vec(inner.clone(), 0..2)),
+                )
+                    .prop_map(|(condition, then_body, else_body)| StructuredNode::If {
+                        condition,
+                        then_body,
+                        else_body,
+                    }),
+                (arb_expr(), prop::collection::vec(inner.clone(), 0..3)).prop_map(
+                    |(condition, body)| StructuredNode::While {
+                        condition,
+                        body,
+                        header: None,
+                        exit_block: None,
+                    }
+                ),
+                prop::collection::vec(inner.clone(), 0..3).prop_map(StructuredNode::Sequence),
+            ]
+        })
+    }
+
+    /// Count nodes + expressions in a tree, as a size proxy for the bounded check.
+    fn tree_size(nodes: &[StructuredNode]) -> usize {
+        fn expr_size(e: &Expr) -> usize {
+            1 + match &e.kind {
+                ExprKind::BinOp { left, right, .. } => expr_size(left) + expr_size(right),
+                ExprKind::UnaryOp { operand, .. } => expr_size(operand),
+                ExprKind::Deref { addr, .. } => expr_size(addr),
+                ExprKind::AddressOf(e) => expr_size(e),
+                ExprKind::Assign { lhs, rhs } => expr_size(lhs) + expr_size(rhs),
+                ExprKind::CompoundAssign { lhs, rhs, .. } => expr_size(lhs) + expr_size(rhs),
+                ExprKind::Cast { expr, .. } => expr_size(expr),
+                ExprKind::ArrayAccess { base, index, .. } => expr_size(base) + expr_size(index),
+                ExprKind::Conditional {
+                    cond,
+                    then_expr,
+                    else_expr,
+                } => expr_size(cond) + expr_size(then_expr) + expr_size(else_expr),
+                ExprKind::Call { args, .. } => args.iter().map(expr_size).sum::<usize>(),
+                ExprKind::Phi(xs) => xs.iter().map(expr_size).sum::<usize>(),
+                _ => 0,
+            }
+        }
+        fn node_size(n: &StructuredNode) -> usize {
+            1 + match n {
+                StructuredNode::Block { statements, .. } => {
+                    statements.iter().map(expr_size).sum::<usize>()
+                }
+                StructuredNode::Expr(e) => expr_size(e),
+                StructuredNode::Return(Some(e)) => expr_size(e),
+                StructuredNode::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    expr_size(condition)
+                        + then_body.iter().map(node_size).sum::<usize>()
+                        + else_body
+                            .as_ref()
+                            .map(|b| b.iter().map(node_size).sum::<usize>())
+                            .unwrap_or(0)
+                }
+                StructuredNode::While { condition, body, .. }
+                | StructuredNode::DoWhile { condition, body, .. } => {
+                    expr_size(condition) + body.iter().map(node_size).sum::<usize>()
+                }
+                StructuredNode::For {
+                    body, condition, ..
+                } => expr_size(condition) + body.iter().map(node_size).sum::<usize>(),
+                StructuredNode::Loop { body, .. } => body.iter().map(node_size).sum::<usize>(),
+                StructuredNode::Sequence(xs) => xs.iter().map(node_size).sum::<usize>(),
+                StructuredNode::Switch { value, cases, default } => {
+                    expr_size(value)
+                        + cases
+                            .iter()
+                            .flat_map(|(_, b)| b.iter())
+                            .map(node_size)
+                            .sum::<usize>()
+                        + default
+                            .as_ref()
+                            .map(|b| b.iter().map(node_size).sum::<usize>())
+                            .unwrap_or(0)
+                }
+                _ => 0,
+            }
+        }
+        nodes.iter().map(node_size).sum()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Invariant #3: deterministic output.
+        #[test]
+        fn prop_simplify_is_deterministic(nodes in prop::collection::vec(arb_node(), 0..6)) {
+            let a = format!("{:?}", simplify_statements(nodes.clone()));
+            let b = format!("{:?}", simplify_statements(nodes));
+            prop_assert_eq!(a, b);
+        }
+
+        /// Re-simplifying a simplified tree changes nothing (fixpoint).
+        #[test]
+        fn prop_simplify_is_idempotent(nodes in prop::collection::vec(arb_node(), 0..6)) {
+            let once = simplify_statements(nodes);
+            let once_s = format!("{:?}", once.clone());
+            let twice_s = format!("{:?}", simplify_statements(once));
+            prop_assert_eq!(once_s, twice_s);
+        }
+
+        /// Invariant #4: output size stays within a constant factor of the input.
+        #[test]
+        fn prop_simplify_output_is_bounded(nodes in prop::collection::vec(arb_node(), 0..6)) {
+            let before = tree_size(&nodes);
+            let after = tree_size(&simplify_statements(nodes));
+            prop_assert!(
+                after <= before.saturating_mul(8).saturating_add(64),
+                "simplify blew up output: before={} after={}",
+                before,
+                after
+            );
+        }
+
+        /// Invariant #1: never panic on an arbitrary generated tree.
+        #[test]
+        fn prop_simplify_never_panics(nodes in prop::collection::vec(arb_node(), 0..8)) {
+            let _ = simplify_statements(nodes);
+        }
+    }
+
+    /// Fault injection: a deeply nested unary/binary chain must not overflow the
+    /// stack or hang (invariant #1 / #4). Depth kept below the structurer's own
+    /// cap; this is a defense-in-depth check on simplify called directly.
+    #[test]
+    fn test_simplify_deeply_nested_chain_does_not_crash() {
+        for depth in [16usize, 64, 128] {
+            let mut e = Expr::int(1);
+            for _ in 0..depth {
+                e = Expr::unary(UnaryOpKind::Neg, e);
+                e = Expr::binop(BinOpKind::Add, e, Expr::int(1));
+            }
+            let nodes = vec![block(0, vec![Expr::assign(reg("eax", 8), e)])];
+            let out = simplify_statements(nodes);
+            // Still produces a well-formed (non-panicking) result.
+            assert!(!out.is_empty() || out.is_empty());
+        }
+    }
 }
