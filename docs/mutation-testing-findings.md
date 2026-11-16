@@ -219,10 +219,45 @@ cargo-mutants; a ready-made `.diff` file still works. `ci-local --tier full
 it is heavy. Verified: `--in-diff origin/main` lists exactly the mutants of a changed
 source line and nothing else.
 
-## Remaining work (optional)
+### ✅ Done — structurer/simplify.rs (property battery + top-cluster closure)
+Commits `eff1e2220` (property/fault battery), `2000af668` + `5e72bb3fc` (helper
+clusters). simplify.rs is a 16K-line **pure** `Vec<StructuredNode> -> Vec<…>` pass,
+so it got the full battery, not just example tests:
 
-1. **condition.rs deep tail (28)** — the internal-dataflow functions above. Needs
-   bespoke multi-instruction fixtures; low ROI vs the 48%→91% already gained.
-2. **Other hot-path files** — `emitter/mod.rs`, `structurer/simplify.rs`,
-   `signature/mod.rs` are large and unmeasured; `short_circuit.rs` had only 3
-   crate-local survivors.
+- **Property-based + fault injection** on `simplify_statements` (proptest Strategy
+  generators for `Expr`/`StructuredNode`, which double as structured fault
+  injection), 512 cases each: deterministic (#3), idempotent/fixpoint, bounded
+  (#4, ≤8×+64), never-panics (#1); plus a depth-128 nesting test. **Non-vacuity
+  proven**: an injected duplication fails idempotence, a 20× blowup fails bounded,
+  a panic fails never-panics.
+- **Full-file mutation measure** (c7g.8xlarge aarch64, 1924 mutants, 46 min):
+  **476 missed / 1231 caught / 178 unviable / 39 timeout — ~73% of viable caught**
+  (a *baseline* of the file's existing unit coverage, not the new battery).
+- **Top pure-helper clusters closed**, spot-confirmed 76 → 0 on a scoped re-sweep:
+  `get_register_aliases` (full ARM64 wN/xN + x86 families incl. r8–r11 + fallthrough)
+  and both structural-equality comparators (`exprs_structurally_equal`,
+  `exprs_call_arg_structurally_equal`) over **every** `ExprKind` arm with
+  single-field-difference unequal cases. 148 simplify tests green.
+
+> Process note: the first helper batch was **incomplete** (covered only common arms;
+> committed as "closed" — an overstatement). A targeted spot re-sweep caught it (76
+> still missed), the matrices were extended to every arm, and a fresh re-sweep
+> confirmed 76 → 0. This is mutation testing working as intended: the automated
+> re-measure caught a gap that hand-injection spot-checks had passed.
+
+## Remaining work (deferred, below the value line)
+
+1. **simplify.rs CatchHandler cluster (10)** — `CatchHandler { body: recurse(...),
+   ..handler }` rebuilds across ~10 EH-scaffolding node-walker passes; the "delete
+   field body" mutant skips recursing the catch body. Each needs a bespoke try/catch
+   fixture driven through that specific pass. Pre-existing code, not new work.
+2. **simplify.rs broad tail (~440)** — fine-grained helper gaps across 16K lines.
+3. **condition.rs deep tail (28)** — internal-dataflow functions; bespoke
+   multi-instruction fixtures, low ROI vs the 48%→91% already gained.
+4. **Other hot-path files** — `emitter/mod.rs`, `signature/mod.rs` unmeasured;
+   `short_circuit.rs` had only 3 crate-local survivors.
+
+## Related: Antithesis proposal
+`docs/antithesis-incremental-cache-proposal.md` — a scoped deterministic-simulation
+spike targeting invariant #8 (incremental-cache soundness, the one stateful
+component) via the `antithesis-sdk` Rust crate. Not the stateless decode path.
