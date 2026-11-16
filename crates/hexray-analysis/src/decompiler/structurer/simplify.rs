@@ -16545,15 +16545,16 @@ mod tests {
                 assert_eq!(get_register_aliases(m), want, "member {m}");
             }
         }
-        // r8/r9 have full sub-register families (rNb/rNw/rNd/rN).
-        for n in 8..=9u32 {
+        // r8..r11 have full sub-register families (rNb/rNw/rNd/rN).
+        for n in 8..=11u32 {
             let want = fam(&[&format!("r{n}b"), &format!("r{n}w"), &format!("r{n}d"), &format!("r{n}")]);
             for m in [format!("r{n}b"), format!("r{n}w"), format!("r{n}d"), format!("r{n}")] {
                 assert_eq!(get_register_aliases(&m), want, "member {m}");
             }
         }
-        // r10..r15 are not in the table and fall through to just themselves.
+        // r12..r15 are not in the table and fall through to just themselves.
         assert_eq!(get_register_aliases("r12"), vec!["r12".to_string()]);
+        assert_eq!(get_register_aliases("r15"), vec!["r15".to_string()]);
         // An unknown name maps to just itself (the `_ => vec![name]` arm).
         assert_eq!(get_register_aliases("zmm3"), vec!["zmm3".to_string()]);
         assert_eq!(get_register_aliases("not_a_reg"), vec!["not_a_reg".to_string()]);
@@ -16619,6 +16620,38 @@ mod tests {
         assert!(exprs_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(0), 4)));
         assert!(!exprs_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(0), 8)));
         assert!(!exprs_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(1), 4)));
+        // FieldAccess: offset + field_name + base.
+        let fa = |base: Expr, field: &str, off: usize| Expr {
+            kind: ExprKind::FieldAccess { base: Box::new(base), field_name: field.to_string(), offset: off },
+        };
+        assert!(exprs_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("p", 8), "f", 8)));
+        assert!(!exprs_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("p", 8), "f", 16)));
+        assert!(!exprs_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("p", 8), "g", 8)));
+        assert!(!exprs_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("q", 8), "f", 8)));
+        // Cast: to_size + signed + expr.
+        let cast = |e: Expr, ts: u8, sgn: bool| Expr {
+            kind: ExprKind::Cast { expr: Box::new(e), to_size: ts, signed: sgn },
+        };
+        assert!(exprs_structurally_equal(&cast(v("eax", 4), 8, true), &cast(v("eax", 4), 8, true)));
+        assert!(!exprs_structurally_equal(&cast(v("eax", 4), 8, true), &cast(v("eax", 4), 4, true)));
+        assert!(!exprs_structurally_equal(&cast(v("eax", 4), 8, true), &cast(v("eax", 4), 8, false)));
+        assert!(!exprs_structurally_equal(&cast(v("eax", 4), 8, true), &cast(v("ebx", 4), 8, true)));
+        // BitField: start + width + expr.
+        let bf = |e: Expr, start: u8, width: u8| Expr {
+            kind: ExprKind::BitField { expr: Box::new(e), start, width },
+        };
+        assert!(exprs_structurally_equal(&bf(v("eax", 4), 2, 5), &bf(v("eax", 4), 2, 5)));
+        assert!(!exprs_structurally_equal(&bf(v("eax", 4), 2, 5), &bf(v("eax", 4), 3, 5)));
+        assert!(!exprs_structurally_equal(&bf(v("eax", 4), 2, 5), &bf(v("eax", 4), 2, 6)));
+        assert!(!exprs_structurally_equal(&bf(v("eax", 4), 2, 5), &bf(v("ebx", 4), 2, 5)));
+        // GotRef: address + size (ignores instruction_address/display).
+        let gr = |addr: u64, size: u8| Expr::got_ref(addr, 0x10, size, v("g", 8));
+        assert!(exprs_structurally_equal(&gr(0x1000, 8), &gr(0x1000, 8)));
+        assert!(!exprs_structurally_equal(&gr(0x1000, 8), &gr(0x2000, 8)));
+        assert!(!exprs_structurally_equal(&gr(0x1000, 8), &gr(0x1000, 4)));
+        // Unknown.
+        assert!(exprs_structurally_equal(&Expr::unknown("x"), &Expr::unknown("x")));
+        assert!(!exprs_structurally_equal(&Expr::unknown("x"), &Expr::unknown("y")));
         // Cross-variant: different kinds are never equal.
         assert!(!exprs_structurally_equal(&Expr::int(0), &v("eax", 4)));
     }
@@ -16663,6 +16696,70 @@ mod tests {
         assert!(exprs_call_arg_structurally_equal(&Expr::deref(v("rdi", 8), 8), &Expr::deref(v("rdi", 8), 8)));
         assert!(!exprs_call_arg_structurally_equal(&Expr::deref(v("rdi", 8), 8), &Expr::deref(v("rdi", 8), 4)));
         assert!(!exprs_call_arg_structurally_equal(&Expr::deref(v("rdi", 8), 8), &Expr::deref(v("rsi", 8), 8)));
+        // ArrayAccess: element_size + base + index.
+        let aa = |b: Expr, i: Expr, e| Expr::array_access(b, i, e);
+        assert!(exprs_call_arg_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(0), 4)));
+        assert!(!exprs_call_arg_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(0), 8)));
+        assert!(!exprs_call_arg_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(1), 4)));
+        // FieldAccess: offset + field_name + base.
+        let fa = |base: Expr, field: &str, off: usize| Expr {
+            kind: ExprKind::FieldAccess { base: Box::new(base), field_name: field.to_string(), offset: off },
+        };
+        assert!(exprs_call_arg_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("p", 8), "f", 8)));
+        assert!(!exprs_call_arg_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("p", 8), "f", 16)));
+        assert!(!exprs_call_arg_structurally_equal(&fa(v("p", 8), "f", 8), &fa(v("p", 8), "g", 8)));
+        // AddressOf recurses.
+        assert!(exprs_call_arg_structurally_equal(&Expr::address_of(v("rdi", 8)), &Expr::address_of(v("rdi", 8))));
+        assert!(!exprs_call_arg_structurally_equal(&Expr::address_of(v("rdi", 8)), &Expr::address_of(v("rsi", 8))));
+        // Cast: to_size + signed + expr.
+        let cast = |e: Expr, ts: u8, sgn: bool| Expr {
+            kind: ExprKind::Cast { expr: Box::new(e), to_size: ts, signed: sgn },
+        };
+        assert!(exprs_call_arg_structurally_equal(&cast(v("rdi", 8), 8, true), &cast(v("rdi", 8), 8, true)));
+        assert!(!exprs_call_arg_structurally_equal(&cast(v("rdi", 8), 8, true), &cast(v("rdi", 8), 4, true)));
+        assert!(!exprs_call_arg_structurally_equal(&cast(v("rdi", 8), 8, true), &cast(v("rdi", 8), 8, false)));
+        // BitField: start + width + expr.
+        let bf = |e: Expr, start: u8, width: u8| Expr {
+            kind: ExprKind::BitField { expr: Box::new(e), start, width },
+        };
+        assert!(exprs_call_arg_structurally_equal(&bf(v("rdi", 8), 2, 5), &bf(v("rdi", 8), 2, 5)));
+        assert!(!exprs_call_arg_structurally_equal(&bf(v("rdi", 8), 2, 5), &bf(v("rdi", 8), 3, 5)));
+        assert!(!exprs_call_arg_structurally_equal(&bf(v("rdi", 8), 2, 5), &bf(v("rdi", 8), 2, 6)));
+        // Assign: lhs + rhs.
+        let asn = |l: Expr, r: Expr| Expr::assign(l, r);
+        assert!(exprs_call_arg_structurally_equal(&asn(v("rdi", 8), Expr::int(1)), &asn(v("rdi", 8), Expr::int(1))));
+        assert!(!exprs_call_arg_structurally_equal(&asn(v("rdi", 8), Expr::int(1)), &asn(v("rsi", 8), Expr::int(1))));
+        assert!(!exprs_call_arg_structurally_equal(&asn(v("rdi", 8), Expr::int(1)), &asn(v("rdi", 8), Expr::int(2))));
+        // CompoundAssign: op + lhs + rhs.
+        let ca = |op, l: Expr, r: Expr| Expr {
+            kind: ExprKind::CompoundAssign { op, lhs: Box::new(l), rhs: Box::new(r) },
+        };
+        assert!(exprs_call_arg_structurally_equal(&ca(BinOpKind::Add, v("rdi", 8), Expr::int(1)), &ca(BinOpKind::Add, v("rdi", 8), Expr::int(1))));
+        assert!(!exprs_call_arg_structurally_equal(&ca(BinOpKind::Add, v("rdi", 8), Expr::int(1)), &ca(BinOpKind::Sub, v("rdi", 8), Expr::int(1))));
+        // Call: target name + args.
+        let call = |name: &str, args: Vec<Expr>| Expr::call(CallTarget::Named(name.to_string()), args);
+        assert!(exprs_call_arg_structurally_equal(&call("f", vec![Expr::int(1)]), &call("f", vec![Expr::int(1)])));
+        assert!(!exprs_call_arg_structurally_equal(&call("f", vec![Expr::int(1)]), &call("g", vec![Expr::int(1)])));
+        assert!(!exprs_call_arg_structurally_equal(&call("f", vec![Expr::int(1)]), &call("f", vec![Expr::int(2)])));
+        assert!(!exprs_call_arg_structurally_equal(&call("f", vec![Expr::int(1)]), &call("f", vec![])));
+        // Conditional: cond + then + else.
+        let cond = |c: Expr, t: Expr, e: Expr| Expr {
+            kind: ExprKind::Conditional { cond: Box::new(c), then_expr: Box::new(t), else_expr: Box::new(e) },
+        };
+        assert!(exprs_call_arg_structurally_equal(&cond(v("rdi", 8), Expr::int(1), Expr::int(0)), &cond(v("rdi", 8), Expr::int(1), Expr::int(0))));
+        assert!(!exprs_call_arg_structurally_equal(&cond(v("rdi", 8), Expr::int(1), Expr::int(0)), &cond(v("rsi", 8), Expr::int(1), Expr::int(0))));
+        assert!(!exprs_call_arg_structurally_equal(&cond(v("rdi", 8), Expr::int(1), Expr::int(0)), &cond(v("rdi", 8), Expr::int(2), Expr::int(0))));
+        assert!(!exprs_call_arg_structurally_equal(&cond(v("rdi", 8), Expr::int(1), Expr::int(0)), &cond(v("rdi", 8), Expr::int(1), Expr::int(9))));
+        // GotRef: address + size + is_deref.
+        let gr = |addr: u64, size: u8| Expr::got_ref(addr, 0x10, size, v("g", 8));
+        assert!(exprs_call_arg_structurally_equal(&gr(0x1000, 8), &gr(0x1000, 8)));
+        assert!(!exprs_call_arg_structurally_equal(&gr(0x1000, 8), &gr(0x2000, 8)));
+        assert!(!exprs_call_arg_structurally_equal(&gr(0x1000, 8), &gr(0x1000, 4)));
+        // Phi: element-wise.
+        let phi = |xs: Vec<Expr>| Expr { kind: ExprKind::Phi(xs) };
+        assert!(exprs_call_arg_structurally_equal(&phi(vec![v("rdi", 8), Expr::int(1)]), &phi(vec![v("rdi", 8), Expr::int(1)])));
+        assert!(!exprs_call_arg_structurally_equal(&phi(vec![v("rdi", 8), Expr::int(1)]), &phi(vec![v("rdi", 8), Expr::int(2)])));
+        assert!(!exprs_call_arg_structurally_equal(&phi(vec![v("rdi", 8)]), &phi(vec![v("rdi", 8), Expr::int(1)])));
         // Cross-variant and mismatched.
         assert!(!exprs_call_arg_structurally_equal(&Expr::int(0), &v("rdi", 8)));
     }
