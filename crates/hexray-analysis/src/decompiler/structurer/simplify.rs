@@ -16511,4 +16511,159 @@ mod tests {
             assert!(!out.is_empty() || out.is_empty());
         }
     }
+
+    // =====================================================================
+    // Pure helper coverage (top mutation-survivor clusters in this file):
+    // the register-alias table and the two structural-equality comparators.
+    // =====================================================================
+
+    #[test]
+    fn test_get_register_aliases_arm64_pairs() {
+        // Every wN / xN (0..=18) maps to exactly {wN, xN}; deleting or altering any
+        // arm changes this. A loop pins all 38 arms at once.
+        for n in 0..=18u32 {
+            let want = vec![format!("w{n}"), format!("x{n}")];
+            assert_eq!(get_register_aliases(&format!("w{n}")), want, "w{n}");
+            assert_eq!(get_register_aliases(&format!("x{n}")), want, "x{n}");
+        }
+    }
+
+    #[test]
+    fn test_get_register_aliases_x86_families() {
+        let fam = |members: &[&str]| members.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Each 8/16/32/64-bit family maps to the full 4-member alias set.
+        for members in [
+            ["al", "ax", "eax", "rax"],
+            ["bl", "bx", "ebx", "rbx"],
+            ["cl", "cx", "ecx", "rcx"],
+            ["dl", "dx", "edx", "rdx"],
+            ["sil", "si", "esi", "rsi"],
+            ["dil", "di", "edi", "rdi"],
+        ] {
+            let want = fam(&members);
+            for m in members {
+                assert_eq!(get_register_aliases(m), want, "member {m}");
+            }
+        }
+        // r8/r9 have full sub-register families (rNb/rNw/rNd/rN).
+        for n in 8..=9u32 {
+            let want = fam(&[&format!("r{n}b"), &format!("r{n}w"), &format!("r{n}d"), &format!("r{n}")]);
+            for m in [format!("r{n}b"), format!("r{n}w"), format!("r{n}d"), format!("r{n}")] {
+                assert_eq!(get_register_aliases(&m), want, "member {m}");
+            }
+        }
+        // r10..r15 are not in the table and fall through to just themselves.
+        assert_eq!(get_register_aliases("r12"), vec!["r12".to_string()]);
+        // An unknown name maps to just itself (the `_ => vec![name]` arm).
+        assert_eq!(get_register_aliases("zmm3"), vec!["zmm3".to_string()]);
+        assert_eq!(get_register_aliases("not_a_reg"), vec!["not_a_reg".to_string()]);
+    }
+
+    /// Variables differing only in the named field, for equality matrices.
+    fn v(name: &str, size: u8) -> Expr {
+        Expr::var(Variable::reg(name, size))
+    }
+
+    #[test]
+    fn test_exprs_structurally_equal_matrix() {
+        // Reflexive equality on each ExprKind, plus a single-field difference that
+        // must break it — pinning every arm's field `==` and recursive compare.
+        let a = v("eax", 4);
+        assert!(exprs_structurally_equal(&a, &a.clone()));
+        // Var: differing name or size => not equal.
+        assert!(!exprs_structurally_equal(&v("eax", 4), &v("ebx", 4)));
+        assert!(!exprs_structurally_equal(&v("eax", 4), &v("eax", 8)));
+        // IntLit value.
+        assert!(exprs_structurally_equal(&Expr::int(7), &Expr::int(7)));
+        assert!(!exprs_structurally_equal(&Expr::int(7), &Expr::int(8)));
+        // BinOp: op, left, right each discriminate.
+        let bo = |op, l: Expr, r: Expr| Expr::binop(op, l, r);
+        assert!(exprs_structurally_equal(
+            &bo(BinOpKind::Add, v("eax", 4), Expr::int(1)),
+            &bo(BinOpKind::Add, v("eax", 4), Expr::int(1))
+        ));
+        assert!(!exprs_structurally_equal(
+            &bo(BinOpKind::Add, v("eax", 4), Expr::int(1)),
+            &bo(BinOpKind::Sub, v("eax", 4), Expr::int(1))
+        ));
+        assert!(!exprs_structurally_equal(
+            &bo(BinOpKind::Add, v("eax", 4), Expr::int(1)),
+            &bo(BinOpKind::Add, v("ebx", 4), Expr::int(1))
+        ));
+        assert!(!exprs_structurally_equal(
+            &bo(BinOpKind::Add, v("eax", 4), Expr::int(1)),
+            &bo(BinOpKind::Add, v("eax", 4), Expr::int(2))
+        ));
+        // UnaryOp: op + operand.
+        assert!(exprs_structurally_equal(
+            &Expr::unary(UnaryOpKind::Neg, v("eax", 4)),
+            &Expr::unary(UnaryOpKind::Neg, v("eax", 4))
+        ));
+        assert!(!exprs_structurally_equal(
+            &Expr::unary(UnaryOpKind::Neg, v("eax", 4)),
+            &Expr::unary(UnaryOpKind::Not, v("eax", 4))
+        ));
+        assert!(!exprs_structurally_equal(
+            &Expr::unary(UnaryOpKind::Neg, v("eax", 4)),
+            &Expr::unary(UnaryOpKind::Neg, v("ebx", 4))
+        ));
+        // Deref: size + addr.
+        assert!(exprs_structurally_equal(&Expr::deref(v("eax", 4), 4), &Expr::deref(v("eax", 4), 4)));
+        assert!(!exprs_structurally_equal(&Expr::deref(v("eax", 4), 4), &Expr::deref(v("eax", 4), 8)));
+        assert!(!exprs_structurally_equal(&Expr::deref(v("eax", 4), 4), &Expr::deref(v("ebx", 4), 4)));
+        // AddressOf recurses.
+        assert!(exprs_structurally_equal(&Expr::address_of(v("eax", 4)), &Expr::address_of(v("eax", 4))));
+        assert!(!exprs_structurally_equal(&Expr::address_of(v("eax", 4)), &Expr::address_of(v("ebx", 4))));
+        // ArrayAccess: element_size + base + index.
+        let aa = |b: Expr, i: Expr, e| Expr::array_access(b, i, e);
+        assert!(exprs_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(0), 4)));
+        assert!(!exprs_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(0), 8)));
+        assert!(!exprs_structurally_equal(&aa(v("p", 8), Expr::int(0), 4), &aa(v("p", 8), Expr::int(1), 4)));
+        // Cross-variant: different kinds are never equal.
+        assert!(!exprs_structurally_equal(&Expr::int(0), &v("eax", 4)));
+    }
+
+    #[test]
+    fn test_exprs_call_arg_structurally_equal_matrix() {
+        assert!(exprs_call_arg_structurally_equal(&v("rdi", 8), &v("rdi", 8)));
+        assert!(!exprs_call_arg_structurally_equal(&v("rdi", 8), &v("rsi", 8)));
+        assert!(exprs_call_arg_structurally_equal(&Expr::int(5), &Expr::int(5)));
+        assert!(!exprs_call_arg_structurally_equal(&Expr::int(5), &Expr::int(6)));
+        // Unknown arm.
+        assert!(exprs_call_arg_structurally_equal(&Expr::unknown("x"), &Expr::unknown("x")));
+        assert!(!exprs_call_arg_structurally_equal(&Expr::unknown("x"), &Expr::unknown("y")));
+        // BinOp op/left/right.
+        let bo = |op, l: Expr, r: Expr| Expr::binop(op, l, r);
+        assert!(exprs_call_arg_structurally_equal(
+            &bo(BinOpKind::Mul, v("rdi", 8), Expr::int(4)),
+            &bo(BinOpKind::Mul, v("rdi", 8), Expr::int(4))
+        ));
+        assert!(!exprs_call_arg_structurally_equal(
+            &bo(BinOpKind::Mul, v("rdi", 8), Expr::int(4)),
+            &bo(BinOpKind::Add, v("rdi", 8), Expr::int(4))
+        ));
+        assert!(!exprs_call_arg_structurally_equal(
+            &bo(BinOpKind::Mul, v("rdi", 8), Expr::int(4)),
+            &bo(BinOpKind::Mul, v("rsi", 8), Expr::int(4))
+        ));
+        assert!(!exprs_call_arg_structurally_equal(
+            &bo(BinOpKind::Mul, v("rdi", 8), Expr::int(4)),
+            &bo(BinOpKind::Mul, v("rdi", 8), Expr::int(8))
+        ));
+        // UnaryOp op + operand.
+        assert!(exprs_call_arg_structurally_equal(
+            &Expr::unary(UnaryOpKind::Neg, v("rdi", 8)),
+            &Expr::unary(UnaryOpKind::Neg, v("rdi", 8))
+        ));
+        assert!(!exprs_call_arg_structurally_equal(
+            &Expr::unary(UnaryOpKind::Neg, v("rdi", 8)),
+            &Expr::unary(UnaryOpKind::Not, v("rdi", 8))
+        ));
+        // Deref size + addr.
+        assert!(exprs_call_arg_structurally_equal(&Expr::deref(v("rdi", 8), 8), &Expr::deref(v("rdi", 8), 8)));
+        assert!(!exprs_call_arg_structurally_equal(&Expr::deref(v("rdi", 8), 8), &Expr::deref(v("rdi", 8), 4)));
+        assert!(!exprs_call_arg_structurally_equal(&Expr::deref(v("rdi", 8), 8), &Expr::deref(v("rsi", 8), 8)));
+        // Cross-variant and mismatched.
+        assert!(!exprs_call_arg_structurally_equal(&Expr::int(0), &v("rdi", 8)));
+    }
 }
